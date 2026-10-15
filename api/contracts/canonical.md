@@ -1,6 +1,6 @@
 # Canonical objects and byte paths
 
-**Candidate status:** director-approved v1 proposal for independent review. This is a proposed contract, not an accepted freeze or implemented capability. Ratification remains open under ADR-003/004 and the FND-03 review gate.
+**Candidate status:** director-ratified v1 proposal, pending independent review and acceptance. This is a proposed contract, not an accepted freeze or implemented capability. Ratification remains open under ADR-003/004 and the FND-03 review gate.
 
 This contract defines immutable logical objects and repository path semantics. It does not define RPC serialization, storage envelopes, authorization, signatures as part of the object, or persistent tree pages.
 
