@@ -1,0 +1,470 @@
+syntax = "proto3";
+
+// Canopy control-v1 wire contract. Protobuf is a transport encoding only;
+// it is never the canonical encoding used to compute native object IDs.
+// Compatibility: field numbers and wire types are permanent within v1. New
+// fields are additive; removed numbers and names must be reserved. A breaking
+// semantic or wire change requires a new package/API version. Unknown fields
+// may be ignored only when they do not affect authorization or identity.
+// Every mutating request MUST carry a nonempty idempotency_key. An
+// expected_policy_version and any applicable expected_base_generation or
+// expected_target_generation MUST be present; zero is a valid supplied value.
+// Protobuf optional presence is intentional and servers reject absence.
+package canopy.control.v1;
+
+import "api/proto/grants.proto";
+
+option go_package = "canopy.local/canopy/api/gen/control/v1;controlv1";
+
+// Credentials MUST be supplied as authenticated transport metadata and MUST
+// NOT be represented in RequestContext or trusted principal claims in bodies.
+// RPC cancellation uses transport cancellation; the deadline is also explicit
+// so intermediaries can enforce it. Servers must not log credentials/deadlines.
+message RequestContext {
+  uint32 api_version = 1; // exactly 1
+  bytes request_id = 2;   // opaque caller correlation bytes
+  bytes repository_id = 3; // exactly 16 bytes
+  optional uint64 deadline_unix_nanos = 4;
+  uint32 max_work_units = 5;
+  uint64 max_response_bytes = 6;
+}
+
+// Every cursor is opaque and authenticated by the server. It MUST bind the
+// source revision, authorized view, policy version, selection and query mode;
+// cursors from another binding fail with FAILED_PRECONDITION. Limits are hard
+// work/byte/page bounds. Exhaustion returns RESOURCE_EXHAUSTED, never partial
+// approximate ancestry, merge-base, history or blame answers.
+
+message ResponseContext {
+  uint32 api_version = 1;
+  bytes request_id = 2;
+  bytes trace_id = 3;
+  Error error = 4; // absent on success; present on every failure
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  UNAUTHENTICATED = 1;
+  PERMISSION_DENIED = 2;
+  NOT_FOUND = 3; // use consistent non-enumeration policy
+  INVALID_ARGUMENT = 4;
+  CONFLICT = 5;
+  FAILED_PRECONDITION = 6;
+  RESOURCE_EXHAUSTED = 7;
+  UNAVAILABLE = 8;
+  DEADLINE_EXCEEDED = 9;
+  CORRUPT_DATA = 10;
+  UNKNOWN_WRITE_STATUS = 11; // outcome uncertain; never imply committed success
+}
+message Error {
+  ErrorCode code = 1;
+  bytes safe_message = 2; // opaque, redacted text; no hidden names or credentials
+  bool retryable = 3;
+  bytes operation_id = 4;
+}
+
+// Native v1 IDs are opaque 35-byte values with the canonical version/kind
+// prefix. Projected/view IDs below are separate opaque identities, never TIDs.
+message ChangesetId { bytes value = 1; } // value is exactly 35 bytes and kind 02
+message BlobId { bytes value = 1; } // value is exactly 35 bytes and kind 01
+message ProjectionId { bytes value = 1; } // exactly 32 bytes; never a canonical TID
+message PublicationId { bytes value = 1; }
+message FileOperation {
+  bytes path = 1; // raw relative path bytes; never Unicode-normalized
+  enum Tag {
+    DELETE = 0; // canonical operation tag 00
+    SET_REGULAR = 1; // canonical operation tag 01
+    SET_EXECUTABLE = 2; // canonical operation tag 02
+    SET_SYMLINK = 3; // canonical operation tag 03
+  }
+  optional Tag tag = 2; // distinguish omitted tag from canonical DELETE=00
+  optional BlobId target = 3; // required for SET; forbidden for DELETE
+}
+message AuthorMetadata {
+  bytes author_identity = 1; // declared object metadata, not authenticated principal
+  int64 author_unix_seconds = 2;
+  sint32 author_offset_minutes = 3;
+  optional bytes committer_identity = 4;
+  optional int64 committer_unix_seconds = 5;
+  optional sint32 committer_offset_minutes = 6;
+  bytes message = 7;
+  optional bytes declared_message_encoding = 8;
+}
+message CanonicalChangeset {
+  bytes repository_id = 1; // exactly 16 bytes
+  repeated ChangesetId ordered_parent_ids = 2; // preserve order; no sorting/dedup
+  AuthorMetadata author = 3;
+  repeated FileOperation operations = 4; // canonical byte-path ordering
+}
+message ProjectedChangeset {
+  ProjectionId projection_id = 1;
+  optional ChangesetId source_changeset_id = 2; // disclose only when independently authorized
+  optional uint32 visible_parent_count = 3;
+  repeated ProjectionId visible_parent_ids = 4;
+  optional bytes visible_message = 5;
+  optional bytes visible_author = 6;
+  repeated FileOperation visible_operations = 7;
+}
+
+message CreateChangesetRequest {
+  RequestContext context = 1;
+  repeated ChangesetId ordered_parent_ids = 2;
+  repeated FileOperation file_operations = 3;
+  AuthorMetadata author_metadata = 4;
+  bytes idempotency_key = 5; // mandatory, nonempty
+  optional uint64 expected_policy_version = 6; // presence required by v1; zero is valid
+  optional uint64 expected_base_generation = 7; // when a base alias participates; zero is valid
+}
+message CreateChangesetResponse {
+  ResponseContext context = 1;
+  ChangesetId changeset_id = 2;
+  PublicationId publication_id = 3;
+  // Detached creation never moves a ref.
+}
+// Exactly one explicit mode is required. source_read must be true and requires
+// changeset_id. It authorizes under current policy and may produce an initial
+// projection identity. Raw bytes require full-object-read over every disclosed
+// path, referenced object, identity, metadata field and required history; a
+// reachable blob or one visible path never authorizes a raw changeset.
+// projection_read requires changeset_id to be absent. Its exact projection,
+// issued context and READ grant must match protected state and this result type.
+// It consumes the existing read ledger and returns only projected, never raw.
+message GetChangesetRequest {
+  RequestContext context = 1;
+  ChangesetId changeset_id = 2;
+  oneof authorized_selection {
+    bool source_read = 3;
+    canopy.common.v1.ProjectionReadInput projection_read = 4;
+  }
+}
+message GetChangesetResponse {
+  ResponseContext context = 1;
+  oneof authorized_representation {
+    bytes fully_authorized_canonical_bytes = 2; // complete canonical frame, after full object/field authorization
+    ProjectedChangeset projected = 3;
+  }
+}
+enum WriteOperationState {
+  WRITE_OPERATION_STATE_UNSPECIFIED = 0;
+  PENDING = 1;
+  COMMITTED = 2;
+  FAILED = 3;
+  OUTCOME_UNKNOWN = 4;
+}
+message GetOperationStatusRequest { RequestContext context = 1; bytes idempotency_key = 2; }
+message GetOperationStatusResponse {
+  ResponseContext context = 1;
+  WriteOperationState state = 2;
+  oneof result_identity {
+    ChangesetId changeset_id = 3;
+    PublicationId publication_id = 4;
+    bytes operation_id = 5;
+  }
+}
+message ApplyPathEditsRequest {
+  RequestContext context = 1;
+  ChangesetId base_changeset = 2;
+  repeated FileOperation file_operations = 3;
+  bytes idempotency_key = 4; // mandatory, nonempty
+  optional uint64 expected_policy_version = 5; // presence required by v1; zero is valid
+  optional uint64 expected_base_generation = 6; // presence required by v1; zero is valid
+}
+message ApplyPathEditsResponse { ResponseContext context = 1; ChangesetId changeset_id = 2; }
+
+service ChangesetService {
+  rpc CreateChangeset(CreateChangesetRequest) returns (CreateChangesetResponse);
+  rpc GetChangeset(GetChangesetRequest) returns (GetChangesetResponse);
+  rpc GetOperationStatus(GetOperationStatusRequest) returns (GetOperationStatusResponse);
+  rpc ApplyPathEdits(ApplyPathEditsRequest) returns (ApplyPathEditsResponse);
+}
+
+// Existing-ref expectations require BOTH fields. An omitted/empty/invalid
+// target or omitted generation is INVALID_ARGUMENT; supplied generation 0 is
+// valid. Message and scalar presence must survive every client/adapter hop.
+message RefValue { optional ChangesetId target = 1; optional uint64 generation = 2; }
+message GetRefRequest { RequestContext context = 1; bytes name = 2; }
+message GetRefResponse { ResponseContext context = 1; RefValue ref = 2; }
+message CompareAndSwapRefRequest {
+  RequestContext context = 1;
+  bytes name = 2;
+  oneof expected_state {
+    RefValue expected_ref = 3; // compare target AND generation
+    bool expect_absent = 4; // must be true for creation; false is invalid; presence is explicit
+  }
+  // Exactly one expected_state is required. No case is INVALID_ARGUMENT,
+  // never an unconditional write. expected_ref means existing, even at zero;
+  // expect_absent=true means create only. A state/value mismatch is CONFLICT.
+  ChangesetId new_target = 5;
+  bytes idempotency_key = 6; // mandatory, nonempty
+  optional uint64 expected_policy_version = 7; // presence required by v1; zero is valid
+}
+message CompareAndSwapRefResponse { ResponseContext context = 1; uint64 new_generation = 2; }
+service RefService {
+  rpc GetRef(GetRefRequest) returns (GetRefResponse);
+  rpc CompareAndSwapRef(CompareAndSwapRefRequest) returns (CompareAndSwapRefResponse);
+}
+
+// Read grants are exclusively canopy.common.v1.ObjectGrant, as specified by
+// accepted grants-v1. The pre-acceptance local ScopedGrant is retired, not an
+// alias. Each grant binds exactly ONE canonical object OR ONE projection and
+// READ only. No set grant, implicit child/history rights or write/upload rights.
+// All public context/grant mirrors must match authenticated protected state;
+// handles and digests alone confer no rights. Never parse opaque tokens.
+// Every projection delivery charges the original shared read ledger, including
+// retries. A fresh correlation ID, grant or audience cannot reset consumption.
+// Grants and independent freshness leases each expire within 30000ms of their
+// authoritative issue/check; the approved maximum 30-second revocation target
+// applies to caches, streams and daemons. Account for bounded clock error and
+// fail closed on unknown/stale freshness. Schema fixtures prove no enforcement.
+
+// Shared by policy resources and root-view selections. Exactly one selection
+// is required. Only root=ROOT selects the repository root; root=UNSPECIFIED,
+// unknown root values, no selection, or path="" are INVALID_ARGUMENT.
+// path is a nonempty canonical relative byte path (canonical.md), including
+// its bounds. Literal path bytes "ROOT" are a normal path, never the root.
+// Reject invalid syntax; never normalize UTF-8, case, percent or backslash.
+message PathSelector {
+  enum Root { ROOT_UNSPECIFIED = 0; ROOT = 1; }
+  oneof selection {
+    Root root = 1;
+    bytes path = 2;
+  }
+}
+
+// API-v1 reference to an authorized projected manifest, not a canonical
+// object/payload or raw tree ID. format_version MUST be 1; projection_id and
+// its exactly32-byte opaque value are required. It carries no authority itself.
+// Authority binds this identity to (repository, source revision, effective
+// view, policy version, exact selection, projection algorithm version,
+// projected entries); a change to any binding yields a distinct identity,
+// even if visible bytes are equal. These bindings remain protected, not
+// public fields. Resolution/delivery requires a current exact projection
+// grant; it never substitutes a canonical TID or a grant for hidden children.
+// A resolved manifest contains only list/traverse-authorized entries in
+// unsigned byte-path order, without hidden counts/names/IDs/page boundaries.
+message AuthorizedManifestReference {
+  uint32 format_version = 1;
+  ProjectionId projection_id = 2;
+}
+message GetRootViewRequest {
+  RequestContext context = 1;
+  ChangesetId changeset_id = 2;
+  repeated PathSelector path_selection = 3;
+  // In source mode at least one valid selector is required; an absent/empty
+  // list rejects with INVALID_ARGUMENT. Each uses exactly PathSelector rules.
+  optional uint64 expected_policy_version = 4; // required in source mode; zero is valid
+  bytes view_selection_id = 5;
+  // Exactly one mode is required. source_read must be true and uses fields
+  // 2..5 above under current policy, producing only an authorized manifest ID.
+  // projection_read requires ALL source fields 2..5 absent/empty, including
+  // expected_policy_version. It consumes the exact issued projection grant
+  // and ledger, and must match the protected AuthorizedManifestReference type.
+  // No projection ID authorizes its source, hidden children or a raw tree.
+  oneof authorized_selection {
+    bool source_read = 6;
+    canopy.common.v1.ProjectionReadInput projection_read = 7;
+  }
+}
+message GetRootViewResponse {
+  ResponseContext context = 1;
+  // Required on success. Catalog authorized_manifest_id maps exactly to
+  // authorized_manifest.projection_id.value; format_version selects this
+  // reference contract. The reference alone confers no rights. The caller uses
+  // IssueObjectGrants with an explicit initial selection/budget to obtain a
+  // separately authorized exact projection or child-object grant and ledger.
+  AuthorizedManifestReference authorized_manifest = 2;
+  // Retired flat grants had no ordered outcomes or read ledger. This method
+  // issues no grants. Only IssueObjectGrants produces IssuedReadBatch; a
+  // projection-mode response consumes its supplied ledger, never creates one.
+  reserved 3;
+  reserved "object_grants";
+}
+message IsAncestorRequest { RequestContext context = 1; ChangesetId ancestor = 2; ChangesetId descendant = 3; }
+message IsAncestorResponse { ResponseContext context = 1; bool is_ancestor = 2; uint64 work_units = 3; }
+message MergeBasesRequest { RequestContext context = 1; ChangesetId left = 2; ChangesetId right = 3; }
+// All best common ancestors, ordered lexicographically by unsigned TID bytes;
+// never choose an arbitrary single base or silently truncate on exhaustion.
+message MergeBasesResponse { ResponseContext context = 1; repeated ChangesetId all_best_common_ancestors = 2; uint64 work_units = 3; }
+message DiffOptions {
+  bool include_binary_content = 1;
+  bool detect_renames = 2;
+  bool detect_copies = 3;
+  uint32 context_lines = 4;
+  uint32 max_hunks = 5;
+}
+message DiffRequest {
+  RequestContext context = 1; ChangesetId old_changeset = 2; ChangesetId new_changeset = 3;
+  repeated bytes paths = 4; DiffOptions options = 5; bytes cursor = 6;
+  optional uint64 expected_policy_version = 7; // presence required by v1; zero is valid
+  bytes view_selection_id = 8;
+}
+message DiffEntry {
+  bytes path = 1; bytes old_path = 2; FileOperation.Tag old_mode = 3; FileOperation.Tag new_mode = 4;
+  bytes old_bytes = 5; bytes new_bytes = 6; // exact bytes; never UTF-8 decode or normalize
+  bool binary = 7; bool has_final_newline = 8; // preserve binary and trailing-newline distinctions
+  repeated bytes hunks = 9; // each hunk is a bounded opaque unified-diff fragment
+  bool truncated = 10;
+}
+message DiffResponse { ResponseContext context = 1; repeated DiffEntry entries = 2; bytes next_cursor = 3; uint64 work_units = 4; }
+// UNSPECIFIED selects FIRST_PARENT. Unknown policy values reject.
+enum HistoryPolicy { HISTORY_POLICY_UNSPECIFIED = 0; FIRST_PARENT = 1; ALL_PARENTS = 2; }
+message PathHistoryRequest {
+  RequestContext context = 1; ChangesetId changeset_id = 2; bytes path = 3;
+  HistoryPolicy history_policy = 4; bytes cursor = 5;
+  optional uint64 expected_policy_version = 6; // presence required by v1; zero is valid
+  bytes view_selection_id = 7; uint32 max_entries = 8;
+}
+message HistoryEntry {
+  ChangesetId changeset_id = 1;
+  optional uint32 visible_parent_count = 2;
+  optional bytes visible_author = 3;
+  optional bytes visible_message = 4;
+  optional bytes path = 5;
+}
+message PathHistoryResponse { ResponseContext context = 1; repeated HistoryEntry entries = 2; bytes next_cursor = 3; uint64 work_units = 4; }
+// UNSPECIFIED selects BLAME_FIRST_PARENT. Unknown policy values reject.
+enum BlamePolicy { BLAME_POLICY_UNSPECIFIED = 0; BLAME_FIRST_PARENT = 1; BLAME_ALL_PARENTS = 2; }
+message LineRange { uint64 start_line = 1; uint64 end_line_exclusive = 2; }
+message BlameRequest {
+  RequestContext context = 1; ChangesetId changeset_id = 2; bytes path = 3;
+  LineRange line_range = 4; BlamePolicy blame_policy = 5;
+  optional uint64 expected_policy_version = 6; // presence required by v1; zero is valid
+  bytes view_selection_id = 7; uint32 max_lines = 8;
+}
+message LineOrigin { uint64 line_number = 1; ChangesetId changeset_id = 2; optional bytes visible_author = 3; }
+message BlameResponse { ResponseContext context = 1; repeated LineOrigin line_origins = 2; BlamePolicy policy = 3; uint64 work_units = 4; }
+message FindCopiesRequest {
+  RequestContext context = 1; ChangesetId changeset_id = 2; bytes path = 3; uint32 candidate_budget = 4;
+  optional uint64 expected_policy_version = 5; // presence required by v1; zero is valid
+  bytes view_selection_id = 6;
+}
+message CopyCandidate { bytes path = 1; ChangesetId source_changeset = 2; }
+message FindCopiesResponse { ResponseContext context = 1; repeated CopyCandidate authorized_candidates = 2; uint64 work_units = 3; }
+service QueryService {
+  rpc GetRootView(GetRootViewRequest) returns (GetRootViewResponse);
+  rpc IsAncestor(IsAncestorRequest) returns (IsAncestorResponse);
+  rpc MergeBases(MergeBasesRequest) returns (MergeBasesResponse);
+  rpc Diff(DiffRequest) returns (DiffResponse);
+  rpc PathHistory(PathHistoryRequest) returns (PathHistoryResponse);
+  rpc Blame(BlameRequest) returns (BlameResponse);
+  rpc FindCopies(FindCopiesRequest) returns (FindCopiesResponse);
+}
+
+// Conflicts preserve exact byte inputs and path; unresolved conflicts remain
+// explicit and cannot be reported as a committed changeset.
+message ConflictSide {
+  message PresentFile {
+    enum Mode {
+      MODE_UNSPECIFIED = 0; // invalid, not a deletion
+      REGULAR = 1; // canonical SET_REGULAR; native mode 100644 octal
+      EXECUTABLE = 2; // canonical SET_EXECUTABLE; native mode 100755 octal
+      SYMLINK = 3; // canonical SET_SYMLINK; native mode 120000 octal
+    }
+    optional Mode mode = 1; // required; only 1, 2, 3 are valid
+    optional bytes content = 2; // required; present-empty is an empty file
+  }
+  // Exactly one state is required. absent must be true and has no content
+  // or mode. present requires both mode and exact content, including empty,
+  // binary and symlink target bytes; never decode, normalize or resolve them.
+  // Missing state, absent=false, or incomplete present is INVALID_ARGUMENT.
+  oneof state {
+    bool absent = 1;
+    PresentFile present = 2;
+  }
+}
+message Conflict {
+  bytes path = 1; // canonical raw path; disclose only after authorization
+  bytes kind = 2; // redacted diagnostic only; carries no side state or mode
+  ConflictSide base = 3; // all three sides required, including explicit absence
+  ConflictSide left = 4;
+  ConflictSide right = 5;
+}
+message Resolution { bytes path = 1; FileOperation operation = 2; }
+message MergeRequest {
+  RequestContext context = 1; ChangesetId left = 2; ChangesetId right = 3; bytes base_policy = 4;
+  repeated Resolution resolutions = 5; bytes idempotency_key = 6;
+  optional uint64 expected_policy_version = 7; // presence required by v1; zero is valid
+  optional uint64 expected_target_generation = 8; // when target is a ref; zero is valid
+}
+message MergeResponse { ResponseContext context = 1; bytes operation_id = 2; repeated Conflict conflicts = 3; optional ChangesetId changeset_id = 4; }
+message CherryPickRequest {
+  RequestContext context = 1; ChangesetId change = 2; ChangesetId target = 3; repeated Resolution resolutions = 4;
+  bytes idempotency_key = 5; optional uint64 expected_policy_version = 6; // presence required by v1; zero is valid
+  optional uint64 expected_target_generation = 7; // when target is a ref; zero is valid
+}
+message CherryPickResponse { ResponseContext context = 1; bytes operation_id = 2; repeated Conflict conflicts = 3; optional ChangesetId changeset_id = 4; }
+message RebaseRequest {
+  RequestContext context = 1; repeated ChangesetId ordered_changes = 2; ChangesetId target = 3;
+  repeated Resolution resolutions = 4; bytes idempotency_key = 5;
+  optional uint64 expected_policy_version = 6; // presence required by v1; zero is valid
+  optional uint64 expected_target_generation = 7; // when target is a ref; zero is valid
+}
+message RebaseMapEntry { ChangesetId old_changeset = 1; ChangesetId new_changeset = 2; }
+message RebaseResponse { ResponseContext context = 1; bytes operation_id = 2; repeated RebaseMapEntry old_to_new_map = 3; repeated Conflict conflicts = 4; }
+message RevertRequest {
+  RequestContext context = 1; ChangesetId change = 2; ChangesetId target = 3; uint32 mainline_parent = 4;
+  bytes idempotency_key = 5; optional uint64 expected_policy_version = 6; // presence required by v1; zero is valid
+  optional uint64 expected_target_generation = 7; // when target is a ref; zero is valid
+}
+message RevertResponse { ResponseContext context = 1; bytes operation_id = 2; repeated Conflict conflicts = 3; optional ChangesetId changeset_id = 4; }
+service EditService {
+  rpc Merge(MergeRequest) returns (MergeResponse);
+  rpc CherryPick(CherryPickRequest) returns (CherryPickResponse);
+  rpc Rebase(RebaseRequest) returns (RebaseResponse);
+  rpc Revert(RevertRequest) returns (RevertResponse);
+}
+
+message PolicyScope { bytes scope = 1; }
+message PolicyRule {
+  bytes subject = 1;
+  PathSelector resource_path = 2; // required; same ROOT/path rules as GetRootView
+  bytes action = 3;
+  bool allow = 4;
+}
+message GetPolicyRequest { RequestContext context = 1; PolicyScope authorized_policy_scope = 2; }
+message GetPolicyResponse { ResponseContext context = 1; uint64 policy_version = 2; repeated PolicyRule visible_rules = 3; }
+message PolicyRuleChange { PolicyRule rule = 1; bool delete = 2; }
+message UpdatePolicyRequest {
+  RequestContext context = 1; optional uint64 expected_policy_version = 2; // presence required by v1; zero is valid
+  repeated PolicyRuleChange rule_changes = 3; bytes idempotency_key = 4;
+}
+message UpdatePolicyResponse { ResponseContext context = 1; uint64 new_policy_version = 2; }
+message IssueObjectGrantsRequest {
+  RequestContext context = 1;
+  reserved 2, 3, 4, 5;
+  reserved "source_view", "requested_objects", "audience", "expected_policy_version";
+  // Required. initial/renew is explicit; initial policy expectation may be
+  // absent, renewal requires its own expected policy (including explicit 0)
+  // and forbids a top-level initial expectation. Never infer an exchange.
+  // input.context API version/repository/request correlation MUST equal the
+  // outer context. Deadlines and per-call work/response limits remain outer
+  // RequestContext responsibilities; none are issuer or accounting identities.
+  canopy.common.v1.IssueObjectGrantsInput input = 6;
+}
+message IssueObjectGrantsResponse {
+  ResponseContext context = 1;
+  reserved 2;
+  reserved "scoped_expiring_grants";
+  // Required after successful transport processing. result is exactly one
+  // batch or shared typed failure. A batch exposes issuer-produced ReadContext,
+  // ordered indexed grant-or-denial outcomes, absolute stream expiry, immutable
+  // logical budget and current consumed snapshot. Denials contain no item echo.
+  // Renewal retains the EXACT original ordered selection, stream/batch IDs,
+  // budget, absolute expiry and ledger; it cannot narrow, widen or reset it.
+  // A completed mixed-outcome batch is RPC success even with item denials.
+  // A whole-exchange failure also carries the consistent typed outer Error:
+  // INVALID_INPUT -> INVALID_ARGUMENT; NOT_AVAILABLE -> NOT_FOUND;
+  // RESOURCE_EXHAUSTED/UNAVAILABLE/CONFLICT map to the same-named outer code;
+  // RESTART_REQUIRED -> FAILED_PRECONDITION. Transport/authentication failures
+  // use ResponseContext.error and may omit output. Never emit a success batch
+  // alongside an outer error. Echo outer correlation; server generates trace.
+  canopy.common.v1.IssueObjectGrantsOutput output = 3;
+}
+message PolicyFreshnessRequest { RequestContext context = 1; uint64 known_version = 2; }
+message PolicyFreshnessResponse { ResponseContext context = 1; uint64 current_version = 2; uint64 valid_until_unix_nanos = 3; }
+service IdentityPolicyService {
+  rpc GetPolicy(GetPolicyRequest) returns (GetPolicyResponse);
+  rpc UpdatePolicy(UpdatePolicyRequest) returns (UpdatePolicyResponse);
+  rpc IssueObjectGrants(IssueObjectGrantsRequest) returns (IssueObjectGrantsResponse);
+  rpc PolicyFreshness(PolicyFreshnessRequest) returns (PolicyFreshnessResponse);
+}
