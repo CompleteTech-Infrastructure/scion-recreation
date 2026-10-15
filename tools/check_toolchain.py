@@ -7,6 +7,7 @@ selected action are checked. Override executable paths through Make variables.
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -385,13 +386,16 @@ def test(go):
     failed = False
     pending = bytearray()
 
+    def reject_constant(value):
+        raise ValueError(f"invalid JSON constant: {value}")
+
     def event_line(line):
         nonlocal passed, failed
         if len(line) > MAX_EVENT_BYTES:
             raise BuildError("test JSON output exceeded its byte limit")
         emit('stdout', line)
         try:
-            event = json.loads(line)
+            event = json.loads(line, parse_constant=reject_constant)
             if not isinstance(event, dict):
                 raise ValueError("event must be an object")
             # go test interleaves TestEvents (Package) and compiler
@@ -400,15 +404,22 @@ def test(go):
             build_event = action in ('build-output', 'build-fail')
             identifier = 'ImportPath' if build_event else 'Package'
             if (not build_event and action not in (
-                'start', 'run', 'pause', 'cont', 'pass', 'bench', 'fail', 'output', 'skip'
+                'start', 'run', 'pause', 'cont', 'pass', 'bench', 'fail', 'output',
+                'skip', 'attr', 'artifacts'
             )) or not isinstance(event.get(identifier), str) or (
                 not build_event and not event['Package']
             ) or any(
                 key in event and not isinstance(event[key], str)
-                for key in ('Test', 'Output', 'OutputType', 'FailedBuild', 'Time', 'ImportPath')
+                for key in ('Test', 'Output', 'OutputType', 'FailedBuild', 'Time',
+                            'ImportPath', 'Key', 'Value', 'Path')
             ):
                 raise ValueError("invalid event field type")
-        except (ValueError, UnicodeError, RecursionError) as exc:
+            if 'Elapsed' in event and (
+                type(event['Elapsed']) not in (int, float) or event['Elapsed'] < 0
+                or not math.isfinite(event['Elapsed'])
+            ):
+                raise ValueError("invalid elapsed time")
+        except (ValueError, UnicodeError, RecursionError, OverflowError) as exc:
             raise BuildError("invalid JSON in go test output") from exc
         action = event.get("Action")
         name = event.get("Test")
