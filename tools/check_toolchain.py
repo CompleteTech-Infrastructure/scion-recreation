@@ -12,7 +12,6 @@ from pathlib import Path
 import re
 import subprocess
 import sys
-import tempfile
 import threading
 
 
@@ -175,9 +174,9 @@ def main():
         return
     packages(args.go)
     if args.action == "build":
-        # Even a lone main package must never create a binary in the source tree.
-        with tempfile.TemporaryDirectory(prefix="canopy-build-") as output:
-            run([args.go, "build", "-trimpath", "-buildvcs=false", "-o", output + os.sep, "./..."])
+        # Compile libraries and commands without writing binaries into the tree.
+        # Go treats the platform's null device as a discard target for all packages.
+        run([args.go, "build", "-trimpath", "-buildvcs=false", "-o", os.devnull, "./..."])
     else:
         test(args.go)
 
