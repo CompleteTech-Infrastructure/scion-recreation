@@ -24,7 +24,7 @@ The bootstrap Go/Python/package validation records describe environment checks, 
 |---|---|
 | Director | Root director session observed working in Herdr at the probe; model identity is unexposed. The earlier direct get/UI observation is preserved in `evidence/bootstrap/herdr-working.json`. |
 | Assigned workers | Three native Herdr sessions: `canopy-canonical` (done), `canopy-runtime` (working; this FND-02 worker), and `canopy-security` (done) at 2026-10-15 01:54:56 UTC. This reports assigned sessions and observed states, not a slot estimate. |
-| Sol reviewers | `canopy-review` and `canopy-security-review`, both observed working at the probe; assigned model `gpt-6.1-sol`. Their reviews are in progress, not approvals. |
+| Sol reviewers | `canopy-review` and `canopy-security-review`, both observed working at the probe; assigned model `gpt-6.1-sol`. Their terminal titles show FND-03 work; this is not an FND-02 review or approval. |
 | Dispatch | Herdr state is time-specific; use fresh observations before relying on it. Do not infer activity from theoretical capacity. Raw list and targeted get outputs: `evidence/FND-02/attempt-2/herdr-agents.json`, `evidence/FND-02/attempt-2/herdr-working.ndjson`; probe time/commands: `evidence/FND-02/attempt-2/herdr-probe-meta.txt`. |
 
 ## Shared build and contract ownership
