@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "build_owner": "luna-build",
+  "module": "canopy.local/canopy",
+  "observed_at": "2026-10-15",
+  "tools": {
+    "go": {
+      "version": "1.27.2",
+      "required_for": ["check", "build", "test"],
+      "override": "GO"
+    },
+    "python": {
+      "version": "3.14.4",
+      "required_for": ["check", "build", "test"],
+      "override": "PYTHON"
+    },
+    "protoc": {
+      "version": "35.1",
+      "required_for": ["check"],
+      "override": "PROTOC",
+      "note": "Check the observed code-generation baseline explicitly. No generation or protobuf dependency is implemented; build/test do not consume protoc yet."
+    }
+  },
+  "optional_future_tools": {
+    "node": {
+      "observed_version": "24.15.0",
+      "note": "No UI build exists yet; informational, not an enforced build/test dependency."
+    },
+    "git": {
+      "observed_version": "2.54.0",
+      "observed_variant": "Apple Git-157 in the root tool shell; native shells may resolve another 2.54.0 build",
+      "note": "Development/migration context only. Never invoked by these entrypoints or native operations."
+    }
+  },
+  "policy": {
+    "toolchain_downloads": false,
+    "module_downloads": false,
+    "module_updates": false,
+    "note": "Supply installed executables through portable Make overrides. Future dependencies, providers, generators and harnesses require separate ownership and review."
+  }
+}
