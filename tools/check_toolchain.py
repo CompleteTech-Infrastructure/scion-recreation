@@ -394,13 +394,18 @@ def test(go):
             event = json.loads(line)
             if not isinstance(event, dict):
                 raise ValueError("event must be an object")
-            # This entrypoint consumes `go test -json ./...`, whose events
-            # identify their package (unlike standalone test2json input).
-            if event.get('Action') not in (
+            # go test interleaves TestEvents (Package) and compiler
+            # BuildEvents (ImportPath). Neither stream may fake named passes.
+            action = event.get('Action')
+            build_event = action in ('build-output', 'build-fail')
+            identifier = 'ImportPath' if build_event else 'Package'
+            if (not build_event and action not in (
                 'start', 'run', 'pause', 'cont', 'pass', 'bench', 'fail', 'output', 'skip'
-            ) or not isinstance(event.get('Package'), str) or not event['Package'] or any(
+            )) or not isinstance(event.get(identifier), str) or (
+                not build_event and not event['Package']
+            ) or any(
                 key in event and not isinstance(event[key], str)
-                for key in ('Test', 'Output', 'OutputType', 'FailedBuild', 'Time')
+                for key in ('Test', 'Output', 'OutputType', 'FailedBuild', 'Time', 'ImportPath')
             ):
                 raise ValueError("invalid event field type")
         except (ValueError, UnicodeError, RecursionError) as exc:
@@ -408,7 +413,7 @@ def test(go):
         action = event.get("Action")
         name = event.get("Test")
         key = (event.get("Package"), name)
-        if action == "fail":
+        if action in ("fail", "build-fail"):
             failed = True
         if name and action == "run":
             active.add(key)
