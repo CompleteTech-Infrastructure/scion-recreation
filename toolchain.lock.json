@@ -1,41 +1,1316 @@
 {
-  "schema_version": 1,
   "build_owner": "luna-build",
+  "go_dependencies": {
+    "direct_runtime_modules": [
+      "github.com/jackc/pgx/v5",
+      "google.golang.org/grpc",
+      "google.golang.org/protobuf"
+    ],
+    "generator_modules": [
+      "google.golang.org/protobuf",
+      "google.golang.org/grpc/cmd/protoc-gen-go-grpc"
+    ],
+    "module_edges_sha256": "15ac535c0500b6dd52eded36ef9cde7da31ee38f4095579e9268693ff6ed6092",
+    "module_files_sha256": {
+      "go.mod": "5508576f16381b7d382fee9d8ff8c33aaefbcdd644ccfd74697092fe46474705",
+      "go.sum": "deb03f885abbefb2d8007d1c4fbc23d02f267d23d97a666e845241058191e87e"
+    },
+    "offline_environment": {
+      "GOENV": "off",
+      "GOFLAGS": "-mod=readonly",
+      "GOPROXY": "off",
+      "GOSUMDB": "off",
+      "GOTOOLCHAIN": "local",
+      "GOVCS": "*:off",
+      "GOWORK": "off"
+    },
+    "owner": "sol-herdr-deps-builder",
+    "provenance": [
+      {
+        "go_mod_sha256": "67452750d57eccae2633b174e66468b72632ede744addb4de2c0b26ddd38a8e1",
+        "info_sha256": "5b84bf5683190a9c4485a8ce5cfc1cfad8825f4724e63a13e92f1ba4887d0e6f",
+        "origin": {
+          "Hash": "cb51b4176013ad19bd00df94be273c322916a620",
+          "Ref": "refs/tags/v0.25.2",
+          "URL": "https://github.com/google/cel-spec",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "cel.dev/expr",
+        "version": "v0.25.2",
+        "zip_sha256": "c39e70b056124141413ba8c80cfca8a5f6becd0c870a4c48788cd15d625db975"
+      },
+      {
+        "go_mod_sha256": "14eb1a5904f9b2def6d3e3f02e81fed679165140e6ca958570f36bb29a3f4755",
+        "info_sha256": "4f546e7fd37910c65d45fcb1985885ca989b596f7116f3ddbbe1209caea0e2e5",
+        "origin": {
+          "Hash": "9886dcff5240f37ff21e26c7462325f3c1cfafc8",
+          "Ref": "refs/tags/auth/v0.20.0",
+          "Subdir": "auth",
+          "URL": "https://github.com/googleapis/google-cloud-go",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "cloud.google.com/go/auth",
+        "version": "v0.20.0",
+        "zip_sha256": "06371584193bbb88a8f2c2931d85efaf45666cc52643be5b8aada6b053672f3a"
+      },
+      {
+        "go_mod_sha256": "80aefcb99e7ffca922974c5ebae6cc480e6be8845b9f4b28e7a1d3055525df08",
+        "info_sha256": "fb86a592b1225ec0b51ae675f79bad2b86ca6e27cab73c7041c96f650b661cde",
+        "origin": {
+          "Hash": "7b2365446764b0bba37198a55644954b437bddd0",
+          "Ref": "refs/tags/compute/metadata/v0.9.0",
+          "Subdir": "compute/metadata",
+          "URL": "https://github.com/googleapis/google-cloud-go",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "cloud.google.com/go/compute/metadata",
+        "version": "v0.9.0",
+        "zip_sha256": "f97e35d1c96239b8574054a77e312c95d2c82a89c21daf46ffeaea6d5fc59eca"
+      },
+      {
+        "go_mod_sha256": "ad4ae93e27e351152492d6660bb2a25822773979de564fb6a3f01abdd59902e2",
+        "info_sha256": "e6b745ded2eda83e0940c88ac04e858b7e3c5d34adf8478d42ce8b0852892978",
+        "origin": {
+          "Hash": "53b33be6921d6552613c3f985deb68187b7c210d",
+          "Ref": "refs/tags/detectors/gcp/v1.34.0",
+          "Subdir": "detectors/gcp",
+          "URL": "https://github.com/GoogleCloudPlatform/opentelemetry-operations-go",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "github.com/GoogleCloudPlatform/opentelemetry-operations-go/detectors/gcp",
+        "version": "v1.34.0",
+        "zip_sha256": "015c095ef37f71a767379525ec16cd7d4f11aa249f0e9cc8aa5f5726d04e4b85"
+      },
+      {
+        "go_mod_sha256": "a090f8eaaf59cc2adf163299ebefe797e1dca3f6add2c8e88a6a3b90ba538b02",
+        "info_sha256": "3430177c73d37fcd2771ca178514a2eb723c84430e275dd31f1cb116a5547c74",
+        "origin": {
+          "Hash": "998dce232f17418a7a5721ecf87ca714025a3243",
+          "Ref": "refs/tags/v2.3.0",
+          "URL": "https://github.com/cespare/xxhash",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "github.com/cespare/xxhash/v2",
+        "version": "v2.3.0",
+        "zip_sha256": "145a26cdc7c49db566017b807c4989ee7f7ddeb569423e9cb99f995fac3621d3"
+      },
+      {
+        "go_mod_sha256": "6ca3a45f07732c4a65537a01eee4f8907d951bd7506401c693fca5eadb709e1b",
+        "info_sha256": "7ff13494344df7e7ee94ba96964a9870a73bfc87c2ef82fabaefa4cd13011d72",
+        "origin": {
+          "Hash": "dba9d589def2cd10099a3a64887d859188c2f57a",
+          "Subdir": "go",
+          "URL": "https://github.com/cncf/xds",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "github.com/cncf/xds/go",
+        "version": "v0.0.0-20260202195803-dba9d589def2",
+        "zip_sha256": "6f1b8ceaaa6e773dba2595bfe7b75f54d98f901c8f1340d420138095b36778fa"
+      },
+      {
+        "go_mod_sha256": "bcb29393251237b79a17b6c19bf29134f43e8f438c3198988fcd461a1cdf05cc",
+        "info_sha256": "73de263267a4545708302d807be60fdb649c5c7b981d25302a638145fba0ec47",
+        "origin": null,
+        "origin_note": "Legacy proxy .info has no VCS origin; exact module version, authenticated h1 checksums and artifact SHA-256 are retained.",
+        "path": "github.com/davecgh/go-spew",
+        "version": "v1.1.1",
+        "zip_sha256": "6b44a843951f371b7010c754ecc3cabefe815d5ced1c5b9409fb2d697e8a890d"
+      },
+      {
+        "go_mod_sha256": "d8a4b948f183dbf5c98a8e589a6e6bc164b09514674538e1dbe3d64869f43a90",
+        "info_sha256": "4cc83bf3e5d8c8a2f6555d0fa779798ec12efc2da3754de5075dd70b6bc2b11e",
+        "origin": {
+          "Hash": "71637ad69bbc5f51fbb2562e612a4365292804a5",
+          "Ref": "refs/tags/v0.14.0",
+          "URL": "https://github.com/envoyproxy/go-control-plane",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "github.com/envoyproxy/go-control-plane",
+        "version": "v0.14.0",
+        "zip_sha256": "79424a75c005ee0981601e44449347c62a3f35b3b2ea57af79a89c1f31d80906"
+      },
+      {
+        "go_mod_sha256": "ff5016c87ec3a93b80826deecc7b71c216e97fa4a946525fd938c6b2fb1f5cac",
+        "info_sha256": "7560c4129e0bf1081a225b4aad0c14d98a5239010c24ca6caad7e524157c8c1e",
+        "origin": {
+          "Hash": "004b9ec70a4696c9fac559adea646dab4ebf62b7",
+          "Ref": "refs/tags/envoy/v1.37.0",
+          "Subdir": "envoy",
+          "URL": "https://github.com/envoyproxy/go-control-plane",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "github.com/envoyproxy/go-control-plane/envoy",
+        "version": "v1.37.0",
+        "zip_sha256": "dea96dd46aa4480f6f5dad6b52b9059d088d06a090968557dafa8cd633f629a2"
+      },
+      {
+        "go_mod_sha256": "c64805e312c68210f504ec5c4ba69be9af8dc99d9d31a0be8c1d1fd7f0902dbb",
+        "info_sha256": "c2eb8ef9bff7970e462ffee3294db8c23181285f23ce536173051dcf216a816a",
+        "origin": {
+          "Hash": "2cdf9fc1e8a104e69a6487721514041c335d86f6",
+          "Ref": "refs/tags/ratelimit/v0.1.0",
+          "Subdir": "ratelimit",
+          "URL": "https://github.com/envoyproxy/go-control-plane",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "github.com/envoyproxy/go-control-plane/ratelimit",
+        "version": "v0.1.0",
+        "zip_sha256": "1165c3cf1efb096a04a3d65b345f3780adce78f126583f7b98465c413a440766"
+      },
+      {
+        "go_mod_sha256": "a6d1c9cd0c0384f119901637ace30d175f6c0a59b99035494f23ebef1ac0d03a",
+        "info_sha256": "3233fbd4779b66d4e6ccb4d6dd8a9c382706f20d205eb5c18d639f7b9ce2753f",
+        "origin": {
+          "Hash": "92b9a7df69ca9f71bfc492f7a90adf4d36eab569",
+          "Ref": "refs/tags/v1.3.3",
+          "URL": "https://github.com/envoyproxy/protoc-gen-validate",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "github.com/envoyproxy/protoc-gen-validate",
+        "version": "v1.3.3",
+        "zip_sha256": "83a909ec95b94609da1f610a866e0553dd4ac3a7b485f7dc5c734692fa326754"
+      },
+      {
+        "go_mod_sha256": "e6c8e044418c809ceea7acbc002c297bd433ea635e0ac9e4fc2019c9bf895b6e",
+        "info_sha256": "9af00a05d48f440706800715cb7a1cd2c8129f8fe23973c0e52adf6ecb588b44",
+        "origin": {
+          "Hash": "0fc9006be0bfd68ee14bc3db0d58f7c7241892e0",
+          "Ref": "refs/tags/v1.1.0",
+          "URL": "https://github.com/felixge/httpsnoop",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "github.com/felixge/httpsnoop",
+        "version": "v1.1.0",
+        "zip_sha256": "e3405a361843f8e69f64e41b523512925cd50fd5ea108b7912534922c31b00e7"
+      },
+      {
+        "go_mod_sha256": "e069e6002d29495b8c2dc6cf0d3b56a075ec5be7abb6c2eb1a1c0845cb66b8b3",
+        "info_sha256": "f59ee3435959b9a02b8581417e0f9d41e7af42fe297a69cb5f4b62720204a2ec",
+        "origin": {
+          "Hash": "0e59876635f3dbf46d7b5e97b52bb75a3f96e7d9",
+          "Ref": "refs/tags/v4.1.4",
+          "URL": "https://github.com/go-jose/go-jose",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "github.com/go-jose/go-jose/v4",
+        "version": "v4.1.4",
+        "zip_sha256": "06a37b6668012a2dd109a5f71f6ae15387dc808b35d3cf73f5e406e78a17b027"
+      },
+      {
+        "go_mod_sha256": "c496f30d700f02b49a1b50bc2486a27c2f74df3dce75d9db6d2d43975b381727",
+        "info_sha256": "49e5a9cbaf5847edf504cc818dad527b6a7135fbc38622aa227df79b256cc0da",
+        "origin": {
+          "Hash": "38a1c47ef633fa6b2eee6b8f2e1371ba8626e557",
+          "Ref": "refs/tags/v1.4.3",
+          "URL": "https://github.com/go-logr/logr",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "github.com/go-logr/logr",
+        "version": "v1.4.3",
+        "zip_sha256": "523d7a3587fe73f61ef41c8bc627f7d7f38de8104d46278154b307e60770ad70"
+      },
+      {
+        "go_mod_sha256": "0812160f77474d8dbf692b7caaee7fd5508448c705d9b54b5a3496ac44468c2c",
+        "info_sha256": "feaeb4f7f13498ebd0af44d8a5c123ea0f82dee42c9b8f8a24e5dec57446f259",
+        "origin": null,
+        "origin_note": "Legacy proxy .info has no VCS origin; exact module version, authenticated h1 checksums and artifact SHA-256 are retained.",
+        "path": "github.com/go-logr/stdr",
+        "version": "v1.2.2",
+        "zip_sha256": "9dd6893bf700198485ae699640b49bc1efbc6c73b37cb5792a0476e1fd8f7fef"
+      },
+      {
+        "go_mod_sha256": "6e86cbe37163d5e14017888a82c32bbe29e732e9bd66bbe9da8e42e08f6bfdcc",
+        "info_sha256": "a2670b82d414ddd13cced64753f68eed754c37b78741461ab1cc227d9e5c2c96",
+        "origin": {
+          "Hash": "2b790ef78571cd58d29ce909a8d4e3f71cc4c47e",
+          "Ref": "refs/tags/v1.2.5",
+          "URL": "https://github.com/golang/glog",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "github.com/golang/glog",
+        "version": "v1.2.5",
+        "zip_sha256": "99f5736dc4fd976a0691361b57ed853cb459070ba4c42ace6e3f5ebd0d154f8e"
+      },
+      {
+        "go_mod_sha256": "c5f873c621cfaaf563f8b66a0501a5be14390cb0859e5187ce616d0312a6c8f8",
+        "info_sha256": "724770b5dd45877bd2061c9821bcff28f31cd2efecee1cbb032fd987b84a162e",
+        "origin": {
+          "Hash": "75de7c059e36b64f01d0dd234ff2fff404ec3374",
+          "Ref": "refs/tags/v1.5.4",
+          "URL": "https://github.com/golang/protobuf",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "github.com/golang/protobuf",
+        "version": "v1.5.4",
+        "zip_sha256": "9a2f43d3eac8ceda506ebbeb4f229254b87235ce90346692a0e233614182190b"
+      },
+      {
+        "go_mod_sha256": "31c874a1d2a18e62b0550f823ce7a575c8dec7f8fd9d4fa1959bb12d7f7c0f14",
+        "info_sha256": "635bbe64cceaad0e5bbd897a78cac24ca184ea8c91394443cc30ee35be33f649",
+        "origin": {
+          "Hash": "9b12f366a942ebc7254abc7f32ca05068b455fb7",
+          "Ref": "refs/tags/v0.7.0",
+          "URL": "https://github.com/google/go-cmp",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "github.com/google/go-cmp",
+        "version": "v0.7.0",
+        "zip_sha256": "64a9ce046f2c320e3783fba0d1f4a15f8a18f0b009b67bf27f7630919db3f539"
+      },
+      {
+        "go_mod_sha256": "47d4257200a74c3210f4bf07264f3a27eb39817ff01e24d92cc069dfb421325b",
+        "info_sha256": "7ad34d7e0e3009d2045d366ea88b7d7b2ed82611141f18d8dcbe88d83f5e7188",
+        "origin": {
+          "Hash": "b293be1aa7a6e6e4565f9967c093dd412253b267",
+          "Ref": "refs/tags/v0.1.9",
+          "URL": "https://github.com/google/s2a-go",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "github.com/google/s2a-go",
+        "version": "v0.1.9",
+        "zip_sha256": "bf8f4b159d3fc201477822ed2514e4f05f58c764b78ffed73ec0accce5fb7f07"
+      },
+      {
+        "go_mod_sha256": "73da47b6338b00a082fd451aa35a3273d3adc09b8e9bba98dab01091e402af6e",
+        "info_sha256": "3703c19d7d948a8bc5354b7e515d5297d3c5a8316958bcdd69eec2a7629513d7",
+        "origin": {
+          "Hash": "0f11ee6918f41a04c201eceeadf612a377bc7fbc",
+          "Ref": "refs/tags/v1.6.0",
+          "URL": "https://github.com/google/uuid",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "github.com/google/uuid",
+        "version": "v1.6.0",
+        "zip_sha256": "d0f02f377217f42702e259684e06441edbf5140dddcc34ba9bea56038b38a6ed"
+      },
+      {
+        "go_mod_sha256": "a64a708f52a6801bc842e4ec3ab58a42c2e9761518bfb5f1740a0828d60560c9",
+        "info_sha256": "bf8af8802a6a1b31e32f3ced88aa61067a9cce530de10f99ba2873d4416e4e49",
+        "origin": {
+          "Hash": "6964da16bfdce018ff1041134b2508988e0d994d",
+          "Ref": "refs/tags/v0.3.15",
+          "URL": "https://github.com/googleapis/enterprise-certificate-proxy",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "github.com/googleapis/enterprise-certificate-proxy",
+        "version": "v0.3.15",
+        "zip_sha256": "46f0c9d792bb68316c31f33f246b38dd45e3805db89cad11232099e7cb861417"
+      },
+      {
+        "go_mod_sha256": "61083dba57672bbbbeea784489af6aca1a94a97f488efe4a135e5726460c9c76",
+        "info_sha256": "b535315226418ef740fa76cb97170c59b2320d03399482e81766d48a6aa0212b",
+        "origin": {
+          "Hash": "1cdb1c1716745c77ec8538923d1c5b9ff0c1a02c",
+          "Ref": "refs/tags/v2.22.0",
+          "URL": "https://github.com/googleapis/gax-go",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "github.com/googleapis/gax-go/v2",
+        "version": "v2.22.0",
+        "zip_sha256": "800a18188bf1222e7ce7b4a31c22ab807136e6d194507aa8cd822ba9dff00696"
+      },
+      {
+        "go_mod_sha256": "8ea95fa2499f4c600f7fd1f0afe745ecc0ae25121a3c823408f4a2961a05ee48",
+        "info_sha256": "7f5536522658ebd12ee9d61ce69ebff420a3f6e45eb54f18654a2224a035bbbf",
+        "origin": null,
+        "origin_note": "Legacy proxy .info has no VCS origin; exact module version, authenticated h1 checksums and artifact SHA-256 are retained.",
+        "path": "github.com/jackc/pgpassfile",
+        "version": "v1.0.0",
+        "zip_sha256": "1cc79fb0b80f54b568afd3f4648dd1c349f746ad7c379df8d7f9e0eb1cac938b"
+      },
+      {
+        "go_mod_sha256": "5f70111b892c17eecec6f97e0cd961cc3922b5daece59c099c855e1062ed0277",
+        "info_sha256": "b5e138a345fa66472bc5ecaf38e7df56f94ece8d760bd20d0525a317609edfba",
+        "origin": {
+          "Hash": "5a60cdf6a76120dc3d5152b95f3b5fd8aa7cc9eb",
+          "URL": "https://github.com/jackc/pgservicefile",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "github.com/jackc/pgservicefile",
+        "version": "v0.0.0-20240606120523-5a60cdf6a761",
+        "zip_sha256": "c9e31c91aebf96eb246bd410d1849cc7666d955a1e20ca2eba1c30b4eb89335f"
+      },
+      {
+        "go_mod_sha256": "5bb85082d4aef07908c0ea914a1603ab40454968a95bf569cd89eb0c4df03d74",
+        "info_sha256": "4c76a02e712c2801bb83ee49ed15acf432667e2f6365cb591e852adb59dee40f",
+        "origin": {
+          "Hash": "5e583fa7aabfa88b796292f849fc9d7d75ac159d",
+          "Ref": "refs/tags/v5.11.0",
+          "URL": "https://github.com/jackc/pgx",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "github.com/jackc/pgx/v5",
+        "version": "v5.11.0",
+        "zip_sha256": "ada62e95244336484f86c274e04a6845f0c494c93b69d24f2ac4181b7c58b11d"
+      },
+      {
+        "go_mod_sha256": "b2be8f437fdf5c550522c8bca62194c2c1afb221b29bbf984db0599d33c55224",
+        "info_sha256": "06637095b1ce744cb5fbfad0a78246d209a30f730604b7654cc94439db277e71",
+        "origin": {
+          "Hash": "bd09d14bd4018b6d65a9d7770e2f3ddf8b00af1c",
+          "Ref": "refs/tags/v2.2.2",
+          "URL": "https://github.com/jackc/puddle",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "github.com/jackc/puddle/v2",
+        "version": "v2.2.2",
+        "zip_sha256": "f1f0789098a0bcb5ff3c7024f9ee387a6748446e1bc6713b13a63d763a9fb11e"
+      },
+      {
+        "go_mod_sha256": "42e7784e04b9652586b5f9dedff6f9518376b745761a9fd1a0c2178eb86dc97a",
+        "info_sha256": "3bf6a1fe078e86e6c7790d958479da05f9f573581064dfc222f9d6512ff5272c",
+        "origin": null,
+        "origin_note": "Legacy proxy .info has no VCS origin; exact module version, authenticated h1 checksums and artifact SHA-256 are retained.",
+        "path": "github.com/kr/pretty",
+        "version": "v0.3.0",
+        "zip_sha256": "3ac65e185f956d889d77485173fadcc30e959b6bcfdaa8acafaec5f4dac5cd48"
+      },
+      {
+        "go_mod_sha256": "e94bb181f3ef78dec16609d3c2d276c75c5668694bdc97b72bac22c84528debb",
+        "info_sha256": "c0e5f5146e8160835922c9f36f37f5b744b61cbbe701a7850f27b06950c46e33",
+        "origin": {
+          "Hash": "0393e58bdf106fe0347e554d272a8f2c84d12461",
+          "URL": "https://github.com/planetscale/vtprotobuf",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "github.com/planetscale/vtprotobuf",
+        "version": "v0.6.1-0.20240319094008-0393e58bdf10",
+        "zip_sha256": "6fdbac53c6ace58d732be8ec29c1aae928639eb12960cc4c52a9f7a25395ca05"
+      },
+      {
+        "go_mod_sha256": "74b2e766eb215377864d587badf57e95521f692d2a7860b3c7759093f9c9bec2",
+        "info_sha256": "97cbb0239d80e5221efd1f0aa645d120272bd3ee7975bd654f07a8ed0c2c2adc",
+        "origin": null,
+        "origin_note": "Legacy proxy .info has no VCS origin; exact module version, authenticated h1 checksums and artifact SHA-256 are retained.",
+        "path": "github.com/pmezard/go-difflib",
+        "version": "v1.0.0",
+        "zip_sha256": "de04cecc1a4b8d53e4357051026794bcbc54f2e6a260cfac508ce69d5d6457a0"
+      },
+      {
+        "go_mod_sha256": "f37ce8ffb796dae0df025ad6ad6f1bf6e36e6c202aaeccd6b040c865f80c4cd0",
+        "info_sha256": "41d82749176085fe58c5829a5ac74ccfe1dede873ed97ad01b512e4a56a78f03",
+        "origin": {
+          "Hash": "e9973f6314a3fa0e36eb1f00fbfe37bdc1554b96",
+          "Ref": "refs/tags/v2.8.1",
+          "URL": "https://github.com/spiffe/go-spiffe",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "github.com/spiffe/go-spiffe/v2",
+        "version": "v2.8.1",
+        "zip_sha256": "df34d070c935ee4e5fa9f66ea5d82eaeb28f130be69b87805bf5a4ce6e2763ce"
+      },
+      {
+        "go_mod_sha256": "1350354d52d2287a62336ecc0d56232d4c47699af9bba49c67c2b48254da98f1",
+        "info_sha256": "19ad4819bfbeab02ec818929de05dfe80d54de44d13d26df995be359ce504c1f",
+        "origin": null,
+        "origin_note": "Legacy proxy .info has no VCS origin; exact module version, authenticated h1 checksums and artifact SHA-256 are retained.",
+        "path": "github.com/stretchr/objx",
+        "version": "v0.1.0",
+        "zip_sha256": "1fa10dab404ed7fc8ed2a033f8784187d5df3513ced3841ce39e46d37850eb1d"
+      },
+      {
+        "go_mod_sha256": "5846af204043f29df285026109bf32db6519c3d7e1d5c3a65fefb174f9d81d33",
+        "info_sha256": "7441e645d8c2dfa05c19b8804129ff51c7df268b09de4c44bbcb2bdcfd959888",
+        "origin": {
+          "Hash": "2a57335dc9cd6833daa820bc94d9b40c26a7917d",
+          "Ref": "refs/tags/v1.11.1",
+          "URL": "https://github.com/stretchr/testify",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "github.com/stretchr/testify",
+        "version": "v1.11.1",
+        "zip_sha256": "b7325b561ead5304b72b9f32aebc871ff49b3823667d530a49fd6c8f3adfc96e"
+      },
+      {
+        "go_mod_sha256": "6c4d2df014d59fd6555897fd4e5bbc0316e8df4c737fbfdde5cd119fdefeeea9",
+        "info_sha256": "57299bdae0a8f70f6013277d1c3b8088147b81161ff1bcc74e9bf7c58a37ac74",
+        "origin": {
+          "Hash": "715f58ce2f17e2176b8e53b871e47531a259cc1d",
+          "Ref": "refs/tags/sdk/v1.2.1",
+          "Subdir": "sdk",
+          "URL": "https://github.com/open-telemetry/opentelemetry-go-instrumentation",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "go.opentelemetry.io/auto/sdk",
+        "version": "v1.2.1",
+        "zip_sha256": "a08a16fc0a7041cdb875f47a260a56000632212c85f65a302a043c76380c8335"
+      },
+      {
+        "go_mod_sha256": "e2ac99000466308cb9b22cd0c177caabdaf363366e2428d5fb3ac50aeac6d5aa",
+        "info_sha256": "4d17cd5bcfa64915a4931313ffa43b5cf01a3c83cd8f05a9d99b98e10be396e0",
+        "origin": {
+          "Hash": "03b2bcdb54b3dde73c9ff91ae216aec262f6c8f5",
+          "Ref": "refs/tags/detectors/gcp/v1.44.0",
+          "Subdir": "detectors/gcp",
+          "URL": "https://github.com/open-telemetry/opentelemetry-go-contrib",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "go.opentelemetry.io/contrib/detectors/gcp",
+        "version": "v1.44.0",
+        "zip_sha256": "5d071282c30ae2ba273984315615de34bf670216d2adac37137b346f52ac2cb2"
+      },
+      {
+        "go_mod_sha256": "ce012052121f2983f6631fd43560c02f82f4911b79b8a1f72fb622a948c6f341",
+        "info_sha256": "d0a34b4d0d8f85874ddf2eb00e7ef60fc34a7d95d332a8fc17df22f945c85116",
+        "origin": {
+          "Hash": "03b2bcdb54b3dde73c9ff91ae216aec262f6c8f5",
+          "Ref": "refs/tags/instrumentation/net/http/otelhttp/v0.69.0",
+          "Subdir": "instrumentation/net/http/otelhttp",
+          "URL": "https://github.com/open-telemetry/opentelemetry-go-contrib",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp",
+        "version": "v0.69.0",
+        "zip_sha256": "6f2e1d300fe09d55ef13886efa33b06e9bcbd4d5f04f0014b0a2871402a28a28"
+      },
+      {
+        "go_mod_sha256": "f466441934839f12a009415b4c16a77d221e1aa5d767f878e2af5888f1ad839f",
+        "info_sha256": "11c81234ccfb0528043ec5a8184309be4cf892bf7837c9d94b4d81674b4af4d0",
+        "origin": {
+          "Hash": "b62d92831b2dd142f5a0cc89c828270274196877",
+          "Ref": "refs/tags/v1.44.0",
+          "URL": "https://github.com/open-telemetry/opentelemetry-go",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "go.opentelemetry.io/otel",
+        "version": "v1.44.0",
+        "zip_sha256": "4b7ef50caaf3dc6fc1a058f9ce2ccda6aad2ab3e8657acc4c8bb3102f79c53bc"
+      },
+      {
+        "go_mod_sha256": "328a1fe2bc702b8c26765f18a9a26fc08748283bdbba26d538d4037b0fcb6afb",
+        "info_sha256": "aa05b63561fbb844cf7d87e956796906020a7c7ff3dcd314f2524caff95c1541",
+        "origin": {
+          "Hash": "b62d92831b2dd142f5a0cc89c828270274196877",
+          "Ref": "refs/tags/metric/v1.44.0",
+          "Subdir": "metric",
+          "URL": "https://github.com/open-telemetry/opentelemetry-go",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "go.opentelemetry.io/otel/metric",
+        "version": "v1.44.0",
+        "zip_sha256": "4442ba5f269f81251f549acb14ac16176f23967f4a0706163440b0df91592f96"
+      },
+      {
+        "go_mod_sha256": "1ed05d21feab2b3bf987b687ca7343fe7b695bc53b9326a8a40d31ca6d1a0844",
+        "info_sha256": "82036161ae5b85956ae070dc92629e93eab8933eefd13ffe1e6ba544b78d9b7b",
+        "origin": {
+          "Hash": "b62d92831b2dd142f5a0cc89c828270274196877",
+          "Ref": "refs/tags/sdk/v1.44.0",
+          "Subdir": "sdk",
+          "URL": "https://github.com/open-telemetry/opentelemetry-go",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "go.opentelemetry.io/otel/sdk",
+        "version": "v1.44.0",
+        "zip_sha256": "36533893b3f21a777f89620bac33557e42cd2d608176979f2d1bafe71b75c2fd"
+      },
+      {
+        "go_mod_sha256": "5f52df5d5f791931de752c32f98795cde604edf12f668c9000babd0e2602938a",
+        "info_sha256": "0e9e2ef10669380831f53ba1406a2e5dd8fa9b14407f76a5eacb25e41251993b",
+        "origin": {
+          "Hash": "b62d92831b2dd142f5a0cc89c828270274196877",
+          "Ref": "refs/tags/sdk/metric/v1.44.0",
+          "Subdir": "sdk/metric",
+          "URL": "https://github.com/open-telemetry/opentelemetry-go",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "go.opentelemetry.io/otel/sdk/metric",
+        "version": "v1.44.0",
+        "zip_sha256": "86fa30d460efc36ed8d5e47f680ffb8af4c5a1bdad96edd21a40a95b0971a65e"
+      },
+      {
+        "go_mod_sha256": "24b803fb358fb3456f788a98a7c18fb391685bc5a708a118f02116b8969a03c4",
+        "info_sha256": "997138a118c66ac4cc4e08ce286332598b8c37760efad5d48550954873d914d6",
+        "origin": {
+          "Hash": "b62d92831b2dd142f5a0cc89c828270274196877",
+          "Ref": "refs/tags/trace/v1.44.0",
+          "Subdir": "trace",
+          "URL": "https://github.com/open-telemetry/opentelemetry-go",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "go.opentelemetry.io/otel/trace",
+        "version": "v1.44.0",
+        "zip_sha256": "cd1abf8dcec62fe9788fae9105760db1711e6e994d2e31cdda57ccb467e7ceec"
+      },
+      {
+        "go_mod_sha256": "d852b93b93f9cd911708ffd45409439956d4e9c8497c5b87f348fc83d0adc577",
+        "info_sha256": "a2a08976bc05ffe33a35c0bf13d9557bdc954dda54f7404fdaa8bdcc8b125e84",
+        "origin": {
+          "Hash": "cdce021fa6c7d9c7eb2743bfbe551f0a98fd5d62",
+          "Ref": "refs/tags/v0.54.0",
+          "URL": "https://go.googlesource.com/crypto",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "golang.org/x/crypto",
+        "version": "v0.54.0",
+        "zip_sha256": "ecf4030c1c6b55b897826b95f01d7416cf2785b4675b0f9ac218ddf754a03abb"
+      },
+      {
+        "go_mod_sha256": "538472fdf094dd5e49dc40e70468fa931a93c241eba07fb946a98747c94ab4df",
+        "info_sha256": "4e3c092050646db6a64f7c42c2538fc0323ec7d7e4ffb04bcc1f76141d640e6a",
+        "origin": {
+          "Hash": "deb1dfcdb7c7fd98fb5afddc3e95dd36d5880874",
+          "Ref": "refs/tags/v0.37.0",
+          "URL": "https://go.googlesource.com/mod",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "golang.org/x/mod",
+        "version": "v0.37.0",
+        "zip_sha256": "91e8e4e9b74a8706dae808b66538d4ab22befd00c11f34134eb97ff572d52e85"
+      },
+      {
+        "go_mod_sha256": "bfc4c34b9fa5d70e4837542577560e92f743e24f584a39877850650c19a444a1",
+        "info_sha256": "ae325f3eb85c75802b692f8f83ae358e93f19a7671215b6f8d5845db86f5acef",
+        "origin": {
+          "Hash": "b8f09f6f062ceb4531b7af4bd17a5c8fe9c4b2b5",
+          "Ref": "refs/tags/v0.57.0",
+          "URL": "https://go.googlesource.com/net",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "golang.org/x/net",
+        "version": "v0.57.0",
+        "zip_sha256": "f8d652c629374b43846ef4f2efd419e8d1c81779eb728306d09f0de1cc1bab80"
+      },
+      {
+        "go_mod_sha256": "90ff0f4a036bc1c24e6c006fe18d97d6d11683431f8f197b7ad48a341da72682",
+        "info_sha256": "61d5b2b9cf0de3c5bad7717c19d06ffd492a333f830e7b1035cbf330c90b0775",
+        "origin": {
+          "Hash": "4d954e69a88d9e1ccb8439f8d5b6cbef230c4ef9",
+          "Ref": "refs/tags/v0.36.0",
+          "URL": "https://go.googlesource.com/oauth2",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "golang.org/x/oauth2",
+        "version": "v0.36.0",
+        "zip_sha256": "15bf65ff103e5dafc809d78cd037a1d1e88ccb8451824e851156002a13304504"
+      },
+      {
+        "go_mod_sha256": "a3e29e76060bd561060454b1fa2bdcd66674f60c9ca93833b8106355e34c603c",
+        "info_sha256": "14c94a5f031afb49c81ce00b342ca7f6befc7a2ee6c1114507ca518c92fdbf1d",
+        "origin": {
+          "Hash": "1eb64d4bc0cde6da1bb8ebc7f178bb577508e5d0",
+          "Ref": "refs/tags/v0.22.0",
+          "URL": "https://go.googlesource.com/sync",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "golang.org/x/sync",
+        "version": "v0.22.0",
+        "zip_sha256": "4bc67d258ce7867cfc1a43765c43d98b4c49b90c46dd0b86f896a5a4909fade0"
+      },
+      {
+        "go_mod_sha256": "57f4393ea18d5446a12363b35c23a616d843fa1669c7121a70a2bc3a9677d665",
+        "info_sha256": "2f567627966f180616deee8874e9547fe34b2271f17ce14901979890510fc959",
+        "origin": {
+          "Hash": "9e7e939dcafac07e8ab4cffa6e5fc74908413f00",
+          "Ref": "refs/tags/v0.47.0",
+          "URL": "https://go.googlesource.com/sys",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "golang.org/x/sys",
+        "version": "v0.47.0",
+        "zip_sha256": "cdac013ddced0262926ec29ffcda645da39670e61c7e5b761e572b6b1809bb1b"
+      },
+      {
+        "go_mod_sha256": "62c3f9d1a5ae12264ab48e2c8acc08c9f201bda9619de171544eb5714b74aec5",
+        "info_sha256": "ae4c0e1046e4e4df7d773ae0cdcbebc308ac88659ea765ddcbe3af226cee13d3",
+        "origin": {
+          "Hash": "9f69229da31ca6a34b522f59dbe07cad5ea21587",
+          "Ref": "refs/tags/v0.45.0",
+          "URL": "https://go.googlesource.com/term",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "golang.org/x/term",
+        "version": "v0.45.0",
+        "zip_sha256": "b3a3af689728b43012ae1b21482571a35c033c545e98e021606bd4fcf1f79108"
+      },
+      {
+        "go_mod_sha256": "e69fb09b14637cab6245a1253c22d80121b79d9fe3ddd19b558629e15baadaf3",
+        "info_sha256": "fc11b65b2ba549dd6031a1ae6b39c2f22885800167138fdb8b83c6ae65e2c384",
+        "origin": {
+          "Hash": "724af9c35838492dcaacc1ac51a8a0187c994c54",
+          "Ref": "refs/tags/v0.40.0",
+          "URL": "https://go.googlesource.com/text",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "golang.org/x/text",
+        "version": "v0.40.0",
+        "zip_sha256": "07757384728d0f52dd85c1f3f163405e6396b2b0fb7eb7d6b610f2a711d69ee3"
+      },
+      {
+        "go_mod_sha256": "eb46e44850fb4dca48f7b680cac5177682cb0e302b307d4d3dbd7ed9df05fc0f",
+        "info_sha256": "bf7788aab8383cb677c6a98fea7c4f9606257a2b4a2f9a2b4a6fe93c1e8d8c3a",
+        "origin": {
+          "Hash": "fbf9f2e2c8124fbe1877f5ed2857111038d9fe12",
+          "Ref": "refs/tags/v0.47.0",
+          "URL": "https://go.googlesource.com/tools",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "golang.org/x/tools",
+        "version": "v0.47.0",
+        "zip_sha256": "143d132b519da1454db967febb65241796805d7c9d4752034341c1376fd3d7f1"
+      },
+      {
+        "go_mod_sha256": "8a17681ea0d86cd2de00b2a87745287f5a8d7a0ad55ec0c26c5b52f3552d30e7",
+        "info_sha256": "fabbd17827b588a017f077dd0d15245fc30e0d86ad2a49ee0efea45b1762e4ee",
+        "origin": {
+          "Hash": "fc402bc485e3a92f8d4f1f0ee5a49e2edf232ed2",
+          "Ref": "refs/tags/v0.17.0",
+          "URL": "https://github.com/gonum/gonum",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "gonum.org/v1/gonum",
+        "version": "v0.17.0",
+        "zip_sha256": "dadeb3d260548de27375f7188bdfd5a175110120fd8ee8085a63b0dff2cae501"
+      },
+      {
+        "go_mod_sha256": "0d3ddd902b76432fe0997a35474d2d178b05e35457eb2dbf9209dbe6d1073691",
+        "info_sha256": "9df220a0d274305ebd19418405e01f5ce45cf23347904603d425c398529ddad4",
+        "origin": {
+          "Hash": "07c758daacbc24e32753c3f1b537c7f6cce626f0",
+          "Ref": "refs/tags/v0.278.0",
+          "URL": "https://github.com/googleapis/google-api-go-client",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "google.golang.org/api",
+        "version": "v0.278.0",
+        "zip_sha256": "31f652a8ae7c76047eb657c8f41a9872b19d9073788ba08fd47f3988f20fef3e"
+      },
+      {
+        "go_mod_sha256": "7e012a5e7d5bc69a2fa84a197bc1829a7685827040f72ad6d9ec927c3bc6126f",
+        "info_sha256": "2c6cfb8083661bc4f7f61aa29148fe3f8ddec13a4455cda706dd358a3acbb7fc",
+        "origin": {
+          "Hash": "f0a921348800c1b988ad896643ff4c959afa1864",
+          "Subdir": "googleapis/api",
+          "URL": "https://github.com/googleapis/go-genproto",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "google.golang.org/genproto/googleapis/api",
+        "version": "v0.0.0-20260706201446-f0a921348800",
+        "zip_sha256": "2a15e6eff7b8ce4f5780f5e324334f238c27fab9db4c51b92b72312ed147a5b0"
+      },
+      {
+        "go_mod_sha256": "67711b6f9adde7cd2d23ba3512bf371ddc628709a4b7ff598794e638607e9987",
+        "info_sha256": "9a80c8f75149eb79b3ecee2f6426c032123e9bda01e71d70ee8fabdee426992f",
+        "origin": {
+          "Hash": "f0a921348800c1b988ad896643ff4c959afa1864",
+          "Subdir": "googleapis/rpc",
+          "URL": "https://github.com/googleapis/go-genproto",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "google.golang.org/genproto/googleapis/rpc",
+        "version": "v0.0.0-20260706201446-f0a921348800",
+        "zip_sha256": "42a0902eda416f038ae29a247e12a8932a566d8b18682ca8cd2d333a40c0f407"
+      },
+      {
+        "go_mod_sha256": "69aa2c57344f551512cc2e3d0d9eac8ca364334963f952ca4fb152e07239b1c4",
+        "info_sha256": "5697cd27e2597e6c42f66a16355de6061d83799ec55bcb57d0e8691b78d82a5d",
+        "origin": {
+          "Hash": "e84aa5ab15d1d2b29d54f838312ad490cb7551a8",
+          "Ref": "refs/tags/v1.84.0",
+          "URL": "https://github.com/grpc/grpc-go",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "google.golang.org/grpc",
+        "version": "v1.84.0",
+        "zip_sha256": "a14bebefbac1ec115d9e1f8042006c185d65adf43a91644f3e58df0688831b95"
+      },
+      {
+        "go_mod_sha256": "13b3495a0a9343b656ea5b3468824a6bfab4c2c46e10413b8126a3b9810f1ab7",
+        "info_sha256": "df6683761bc9054b269021e140b75c54371522805d4acfd15ab614d39f6f3dae",
+        "origin": {
+          "Hash": "1c63fa5f5492fb6cb4cabf9847999ce469505f49",
+          "Ref": "refs/tags/cmd/protoc-gen-go-grpc/v1.6.2",
+          "Subdir": "cmd/protoc-gen-go-grpc",
+          "URL": "https://github.com/grpc/grpc-go",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "google.golang.org/grpc/cmd/protoc-gen-go-grpc",
+        "version": "v1.6.2",
+        "zip_sha256": "6c79e1f21272c7b841b9640164482fd741cf4e5a4636039a4f0594d9743222c6"
+      },
+      {
+        "go_mod_sha256": "a75c105a852fbd8da8d8cfac09c2eab9a206cfd27ed37c973737e23f632ca96e",
+        "info_sha256": "adcdfa99465b9d87edd7d05d540d6e0ce94a04824fe283552410f2c50188f51d",
+        "origin": {
+          "Hash": "cdd4c5f7406e82462949c7a65defa9f3029c162d",
+          "Ref": "refs/tags/v1.36.12",
+          "URL": "https://go.googlesource.com/protobuf",
+          "VCS": "git"
+        },
+        "origin_note": "Origin reported by official proxy .info metadata.",
+        "path": "google.golang.org/protobuf",
+        "version": "v1.36.12",
+        "zip_sha256": "68f8a3174aff42950fd9bd02c11b45c6986eb8060508d124d1c3dd6bf86b9be6"
+      },
+      {
+        "go_mod_sha256": "6e6e2fca40eb8fe1455e6a08cd39833c7c2e9a2341a81fb181b89d0b1c725f48",
+        "info_sha256": "9c410ddc8753b257045f2d6a25835f73a37ec16e58d2dec05af7f89b501c98ee",
+        "origin": null,
+        "origin_note": "Legacy proxy .info has no VCS origin; exact module version, authenticated h1 checksums and artifact SHA-256 are retained.",
+        "path": "gopkg.in/check.v1",
+        "version": "v1.0.0-20201130134442-10cb98267c6c",
+        "zip_sha256": "f555684e5c5dacc2850dddb345fef1b8f93f546b72685589789da6d2b062710e"
+      },
+      {
+        "go_mod_sha256": "21579860a20306fcf43b1bd234d1fba319499c77611b71c05f9bf3ba90dab939",
+        "info_sha256": "0cdb0c9ac8c3b25dbd420a86ab27debfa469a8b48ee10560224704c2852ac6c0",
+        "origin": null,
+        "origin_note": "Legacy proxy .info has no VCS origin; exact module version, authenticated h1 checksums and artifact SHA-256 are retained.",
+        "path": "gopkg.in/yaml.v3",
+        "version": "v3.0.1",
+        "zip_sha256": "aab8fbc4e6300ea08e6afe1caea18a21c90c79f489f52c53e2f20431f1a9a015"
+      }
+    ],
+    "schema_version": 1,
+    "selected_graph": [
+      {
+        "go_mod_sum": "h1:hrXvqGP6G6gyx8UAHSHJ5RGk//1Oj5nXQ2NI02Nrsg4=",
+        "go_version": "1.23.0",
+        "path": "cel.dev/expr",
+        "sum": "h1:K6j46C81hXtZQfuX60cVWQFBJahKSE2gfRbNuvr5bFs=",
+        "version": "v0.25.2"
+      },
+      {
+        "go_mod_sum": "h1:942/yi/itH1SsmpyrbnTMDgGfdy2BUqIKyd0cyYLc5Q=",
+        "go_version": "1.25.0",
+        "path": "cloud.google.com/go/auth",
+        "sum": "h1:kXTssoVb4azsVDoUiF8KvxAqrsQcQtB53DcSgta74CA=",
+        "version": "v0.20.0"
+      },
+      {
+        "go_mod_sum": "h1:E0bWwX5wTnLPedCKqk3pJmVgCBSM6qQI1yTBdEb3C10=",
+        "go_version": "1.24.0",
+        "path": "cloud.google.com/go/compute/metadata",
+        "sum": "h1:pDUj4QMoPejqq20dK0Pg2N4yG9zIkYGdBtwLoEkH9Zs=",
+        "version": "v0.9.0"
+      },
+      {
+        "go_mod_sum": "h1:pJTkW8hEUIIi3Pf65lPZOnn4Y81yCllX6IWk2jNXdkM=",
+        "go_version": "1.25.0",
+        "path": "github.com/GoogleCloudPlatform/opentelemetry-operations-go/detectors/gcp",
+        "sum": "h1:yzIYdwuro811Z27D3T80Wkd3rqZzb0K43nner7Eh1yE=",
+        "version": "v1.34.0"
+      },
+      {
+        "go_mod_sum": "h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=",
+        "go_version": "1.11",
+        "path": "github.com/cespare/xxhash/v2",
+        "sum": "h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=",
+        "version": "v2.3.0"
+      },
+      {
+        "go_mod_sum": "h1:qwXFYgsP6T7XnJtbKlf1HP8AjxZZyzxMmc+Lq5GjlU4=",
+        "go_version": "1.24.6",
+        "path": "github.com/cncf/xds/go",
+        "sum": "h1:aBangftG7EVZoUb69Os8IaYg++6uMOdKK83QtkkvJik=",
+        "version": "v0.0.0-20260202195803-dba9d589def2"
+      },
+      {
+        "go_mod_sum": "h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=",
+        "go_version": null,
+        "path": "github.com/davecgh/go-spew",
+        "sum": "h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=",
+        "version": "v1.1.1"
+      },
+      {
+        "go_mod_sum": "h1:NcS5X47pLl/hfqxU70yPwL9ZMkUlwlKxtAohpi2wBEU=",
+        "go_version": "1.23.0",
+        "path": "github.com/envoyproxy/go-control-plane",
+        "sum": "h1:hbG2kr4RuFj222B6+7T83thSPqLjwBIfQawTkC++2HA=",
+        "version": "v0.14.0"
+      },
+      {
+        "go_mod_sum": "h1:DReE9MMrmecPy+YvQOAOHNYMALuowAnbjjEMkkWOi6A=",
+        "go_version": "1.24.0",
+        "path": "github.com/envoyproxy/go-control-plane/envoy",
+        "sum": "h1:u3riX6BoYRfF4Dr7dwSOroNfdSbEPe9Yyl09/B6wBrQ=",
+        "version": "v1.37.0"
+      },
+      {
+        "go_mod_sum": "h1:Wk+tMFAFbCXaJPzVVHnPgRKdUdwW/KdbRt94AzgRee4=",
+        "go_version": "1.21",
+        "path": "github.com/envoyproxy/go-control-plane/ratelimit",
+        "sum": "h1:/G9QYbddjL25KvtKTv3an9lx6VBE2cnb8wp1vEGNYGI=",
+        "version": "v0.1.0"
+      },
+      {
+        "go_mod_sum": "h1:TsndJ/ngyIdQRhMcVVGDDHINPLWB7C82oDArY51KfB0=",
+        "go_version": "1.24.1",
+        "path": "github.com/envoyproxy/protoc-gen-validate",
+        "sum": "h1:MVQghNeW+LZcmXe7SY1V36Z+WFMDjpqGAGacLe2T0ds=",
+        "version": "v1.3.3"
+      },
+      {
+        "go_mod_sum": "h1:Zqxgdd+1Rkcz8euOqdr7lqgCRJztwr5hp9vDSi5UZCE=",
+        "go_version": "1.25",
+        "path": "github.com/felixge/httpsnoop",
+        "sum": "h1:3YtUj32ZZkqZtt3sZZsClsymw/QDuVfpNhoA31zeORc=",
+        "version": "v1.1.0"
+      },
+      {
+        "go_mod_sum": "h1:x4oUasVrzR7071A4TnHLGSPpNOm2a21K9Kf04k1rs08=",
+        "go_version": "1.24.0",
+        "path": "github.com/go-jose/go-jose/v4",
+        "sum": "h1:moDMcTHmvE6Groj34emNPLs/qtYXRVcd6S7NHbHz3kA=",
+        "version": "v4.1.4"
+      },
+      {
+        "go_mod_sum": "h1:9T104GzyrTigFIr8wt5mBrctHMim0Nb2HLGrmQ40KvY=",
+        "go_version": "1.18",
+        "path": "github.com/go-logr/logr",
+        "sum": "h1:CjnDlHq8ikf6E492q6eKboGOC0T8CDaOvkHCIg8idEI=",
+        "version": "v1.4.3"
+      },
+      {
+        "go_mod_sum": "h1:mMo/vtBO5dYbehREoey6XUKy/eSumjCCveDpRre4VKE=",
+        "go_version": "1.16",
+        "path": "github.com/go-logr/stdr",
+        "sum": "h1:hSWxHoqTgW2S2qGc0LTAI563KZ5YKYRhT3MFKZMbjag=",
+        "version": "v1.2.2"
+      },
+      {
+        "go_mod_sum": "h1:6AhwSGph0fcJtXVM/PEHPqZlFeoLxhs7/t5UDAwmO+w=",
+        "go_version": "1.19",
+        "path": "github.com/golang/glog",
+        "sum": "h1:DrW6hGnjIhtvhOIiAKT6Psh/Kd/ldepEa81DKeiRJ5I=",
+        "version": "v1.2.5"
+      },
+      {
+        "go_mod_sum": "h1:lnTiLA8Wa4RWRcIUkrtSVa5nRhsEGBg48fD6rSs7xps=",
+        "go_version": "1.17",
+        "path": "github.com/golang/protobuf",
+        "sum": "h1:i7eJL8qZTpSEXOPTxNKhASYpMn+8e5Q6AdndVa1dWek=",
+        "version": "v1.5.4"
+      },
+      {
+        "go_mod_sum": "h1:pXiqmnSA92OHEEa9HXL2W4E7lf9JzCmGVUdgjX3N/iU=",
+        "go_version": "1.21",
+        "path": "github.com/google/go-cmp",
+        "sum": "h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=",
+        "version": "v0.7.0"
+      },
+      {
+        "go_mod_sum": "h1:YA0Ei2ZQL3acow2O62kdp9UlnvMmU7kA6Eutn0dXayM=",
+        "go_version": "1.20",
+        "path": "github.com/google/s2a-go",
+        "sum": "h1:LGD7gtMgezd8a/Xak7mEWL0PjoTQFvpRudN895yqKW0=",
+        "version": "v0.1.9"
+      },
+      {
+        "go_mod_sum": "h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=",
+        "go_version": null,
+        "path": "github.com/google/uuid",
+        "sum": "h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=",
+        "version": "v1.6.0"
+      },
+      {
+        "go_mod_sum": "h1:vqVt9yG9480NtzREnTlmGSBmFrA+bzb0yl0TxoBQXOg=",
+        "go_version": "1.24.11",
+        "path": "github.com/googleapis/enterprise-certificate-proxy",
+        "sum": "h1:xolVQTEXusUcAA5UgtyRLjelpFFHWlPQ4XfWGc7MBas=",
+        "version": "v0.3.15"
+      },
+      {
+        "go_mod_sum": "h1:irWBbALSr0Sk3qlqb9SyJ1h68WjgeFuiOzI4Rqw5+aY=",
+        "go_version": "1.25.0",
+        "path": "github.com/googleapis/gax-go/v2",
+        "sum": "h1:PjIWBpgGIVKGoCXuiCoP64altEJCj3/Ei+kSU5vlZD4=",
+        "version": "v2.22.0"
+      },
+      {
+        "go_mod_sum": "h1:CEx0iS5ambNFdcRtxPj5JhEz+xB6uRky5eyVu/W2HEg=",
+        "go_version": "1.12",
+        "path": "github.com/jackc/pgpassfile",
+        "sum": "h1:/6Hmqy13Ss2zCq62VdNG8tM1wchn8zjSGOBJ6icpsIM=",
+        "version": "v1.0.0"
+      },
+      {
+        "go_mod_sum": "h1:5TJZWKEWniPve33vlWYSoGYefn3gLQRzjfDlhSJ9ZKM=",
+        "go_version": "1.14",
+        "path": "github.com/jackc/pgservicefile",
+        "sum": "h1:iCEnooe7UlwOQYpKFhBabPMi4aNAfoODPEFNiAnClxo=",
+        "version": "v0.0.0-20240606120523-5a60cdf6a761"
+      },
+      {
+        "go_mod_sum": "h1:mal1tBGAFfLHvZzaYh77YS/eC6IX9OWbRV1QIIM0Jn4=",
+        "go_version": "1.25.0",
+        "path": "github.com/jackc/pgx/v5",
+        "sum": "h1:IzBBtyK9AHqf98cctWFifYSci2hgQR/cd56wB4p+ogg=",
+        "version": "v5.11.0"
+      },
+      {
+        "go_mod_sum": "h1:vriiEXHvEE654aYKXXjOvZM39qJ0q+azkZFrfEOc3H4=",
+        "go_version": "1.19",
+        "path": "github.com/jackc/puddle/v2",
+        "sum": "h1:PR8nw+E/1w0GLuRFSmiioY6UooMp6KJv0/61nB7icHo=",
+        "version": "v2.2.2"
+      },
+      {
+        "go_mod_sum": "h1:640gp4NfQd8pI5XOwp5fnNeVWj67G7CFk/SaSQn7NBk=",
+        "go_version": "1.12",
+        "path": "github.com/kr/pretty",
+        "sum": "h1:WgNl7dwNpEZ6jJ9k1snq4pZsg7DOEN8hP9Xw0Tsjwk0=",
+        "version": "v0.3.0"
+      },
+      {
+        "go_mod_sum": "h1:t/avpk3KcrXxUnYOhZhMXJlSEyie6gQbtLq5NM3loB8=",
+        "go_version": "1.20",
+        "path": "github.com/planetscale/vtprotobuf",
+        "sum": "h1:GFCKgmp0tecUJ0sJuv4pzYCqS9+RGSn52M3FUwPs+uo=",
+        "version": "v0.6.1-0.20240319094008-0393e58bdf10"
+      },
+      {
+        "go_mod_sum": "h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=",
+        "go_version": null,
+        "path": "github.com/pmezard/go-difflib",
+        "sum": "h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=",
+        "version": "v1.0.0"
+      },
+      {
+        "go_mod_sum": "h1:47Q0Q9/AqGha8QLHp+kxpH4Wca7X7EnOtlIJy3mxZ3U=",
+        "go_version": "1.24.0",
+        "path": "github.com/spiffe/go-spiffe/v2",
+        "sum": "h1:eXZMLsu+3MLEPJyGJkolqtVrteZfQdUpOWj6LTiDl/E=",
+        "version": "v2.8.1"
+      },
+      {
+        "go_mod_sum": "h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+wExME=",
+        "go_version": null,
+        "path": "github.com/stretchr/objx",
+        "sum": "h1:4G4v2dO3VZwixGIRoQ5Lfboy6nUhCyYzaqnIAPPhYs4=",
+        "version": "v0.1.0"
+      },
+      {
+        "go_mod_sum": "h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=",
+        "go_version": "1.17",
+        "path": "github.com/stretchr/testify",
+        "sum": "h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=",
+        "version": "v1.11.1"
+      },
+      {
+        "go_mod_sum": "h1:KRTj+aOaElaLi+wW1kO/DZRXwkF4C5xPbEe3ZiIhN7Y=",
+        "go_version": "1.24.0",
+        "path": "go.opentelemetry.io/auto/sdk",
+        "sum": "h1:jXsnJ4Lmnqd11kwkBV2LgLoFMZKizbCi5fNZ/ipaZ64=",
+        "version": "v1.2.1"
+      },
+      {
+        "go_mod_sum": "h1:tNAsgd8avTGke1+MndXlU5Cru4PQ9Ai/cCNWQv/ZJ/s=",
+        "go_version": "1.25.0",
+        "path": "go.opentelemetry.io/contrib/detectors/gcp",
+        "sum": "h1:NmLfL734pJhM0JKaYd2Y28+nY9dPRWYAAbxhRCrKXPw=",
+        "version": "v1.44.0"
+      },
+      {
+        "go_mod_sum": "h1:z9+yiacE0IHRqM4qFfkbt/JYlmYXgss8GY/jXoNuPJI=",
+        "go_version": "1.25.0",
+        "path": "go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp",
+        "sum": "h1:8tvICD4vSTOOsNrsI4Ljf6C+6UKvpTEH5XY3JMoyPoo=",
+        "version": "v0.69.0"
+      },
+      {
+        "go_mod_sum": "h1:BMgjTHL9WPRlRjL2oZCBTL4whCGtXch2H4BhOPIAyYc=",
+        "go_version": "1.25.0",
+        "path": "go.opentelemetry.io/otel",
+        "sum": "h1:JjwHmHpA4iZ3wBxluu2fbbE7j4kqlE8jXyAyPXH7HqU=",
+        "version": "v1.44.0"
+      },
+      {
+        "go_mod_sum": "h1:8O7hanEPBNgEMmybD3s2VBKcgWOCsA6tzHBPODAiquo=",
+        "go_version": "1.25.0",
+        "path": "go.opentelemetry.io/otel/metric",
+        "sum": "h1:1w0gILTcHdr3YI+ixLyjemwrVnsMURbTZFrSYCdDdmc=",
+        "version": "v1.44.0"
+      },
+      {
+        "go_mod_sum": "h1:Osuydd3Se74nqjAKxid74N5eC+jfEqfTegHRnq58oK0=",
+        "go_version": "1.25.0",
+        "path": "go.opentelemetry.io/otel/sdk",
+        "sum": "h1:nHYwb9lK+fJPU/dnT6s7W7Z8itMWyqrnVfbheVYrZ58=",
+        "version": "v1.44.0"
+      },
+      {
+        "go_mod_sum": "h1:5B5pMARnXxKhltooO4xUuCBorl65a4EpnTalObqOigA=",
+        "go_version": "1.25.0",
+        "path": "go.opentelemetry.io/otel/sdk/metric",
+        "sum": "h1:3LlKgI+VjbVsjNRFZJZAJ30WjXC5VkNRks6si09iEfI=",
+        "version": "v1.44.0"
+      },
+      {
+        "go_mod_sum": "h1:oLl1jrMQAVo6v3GAggN+1VH9VIz9iUSvW53sW1Q8PIE=",
+        "go_version": "1.25.0",
+        "path": "go.opentelemetry.io/otel/trace",
+        "sum": "h1:jxF5CsGYCe74MCRx2X4g7WsY/VBKRqqpNvXlX/6gtIk=",
+        "version": "v1.44.0"
+      },
+      {
+        "go_mod_sum": "h1:KWL8ny2AZdGR2cWmzeHrp2azQPGogOv+HeQaVEXC2dk=",
+        "go_version": "1.25.0",
+        "path": "golang.org/x/crypto",
+        "sum": "h1:YLIA59K4fiNzHzjnZt2tUJQjQtUWfWbeHBqKtk3eScw=",
+        "version": "v0.54.0"
+      },
+      {
+        "go_mod_sum": "h1:m8S8VeM9r4dzDwjrKO0a1sZP3YjeMamRRlD+fmR2Q/0=",
+        "go_version": "1.25.0",
+        "path": "golang.org/x/mod",
+        "sum": "h1:vF1DjpVEshcIqoEaauuHebaLk1O1forxjxBaVn884JQ=",
+        "version": "v0.37.0"
+      },
+      {
+        "go_mod_sum": "h1:KpXc8iv+r3XplLAG/f7Jsf9RPszJzdR0f58q9vGOuEU=",
+        "go_version": "1.25.0",
+        "path": "golang.org/x/net",
+        "sum": "h1:K5+3DljvIuDG9/Jv9rvyMywYNFCQ9RSUY6OOTTkT+tE=",
+        "version": "v0.57.0"
+      },
+      {
+        "go_mod_sum": "h1:YDBUJMTkDnJS+A4BP4eZBjCqtokkg1hODuPjwiGPO7Q=",
+        "go_version": "1.25.0",
+        "path": "golang.org/x/oauth2",
+        "sum": "h1:peZ/1z27fi9hUOFCAZaHyrpWG5lwe0RJEEEeH0ThlIs=",
+        "version": "v0.36.0"
+      },
+      {
+        "go_mod_sum": "h1:9xrNwdLfx4jkKbNva9FpL6vEN7evnE43NNNJQ2LF3+0=",
+        "go_version": "1.25.0",
+        "path": "golang.org/x/sync",
+        "sum": "h1:SZjpbeLmrCk4xhRSZFNZW5gFUeCeFgjekvI/+gfScek=",
+        "version": "v0.22.0"
+      },
+      {
+        "go_mod_sum": "h1:4GL1E5IUh+htKOUEOaiffhrAeqysfVGipDYzABqnCmw=",
+        "go_version": "1.25.0",
+        "path": "golang.org/x/sys",
+        "sum": "h1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=",
+        "version": "v0.47.0"
+      },
+      {
+        "go_mod_sum": "h1:9aqxs0blBcrm/n0L9QW0aRVD+ktan8ssZromtqJC43w=",
+        "go_version": "1.25.0",
+        "path": "golang.org/x/term",
+        "sum": "h1:NwWyBmoJCbfTHpxrWoZ9C6/VxOf7ic219I8xZZFdrf0=",
+        "version": "v0.45.0"
+      },
+      {
+        "go_mod_sum": "h1:hpnzDAfGV753zIKo+wk3u1bVKCGPbrnF7+7LBF/UHVY=",
+        "go_version": "1.25.0",
+        "path": "golang.org/x/text",
+        "sum": "h1:Ub2Z6/xjgF1WrYQz2nuITOEegKFtiIy+rieRJ5lHZKs=",
+        "version": "v0.40.0"
+      },
+      {
+        "go_mod_sum": "h1:dFHnyTvFWY212G+h7ZY4Vsp/K3U4/7W9TyVaAul8uCA=",
+        "go_version": "1.25.0",
+        "path": "golang.org/x/tools",
+        "sum": "h1:7Kn5x/d1svx/PzryTsqeoZN4TZwqeH5pGWjefhLi/1Q=",
+        "version": "v0.47.0"
+      },
+      {
+        "go_mod_sum": "h1:El3tOrEuMpv2UdMrbNlKEh9vd86bmQ6vqIcDwxEOc1E=",
+        "go_version": "1.24.0",
+        "path": "gonum.org/v1/gonum",
+        "sum": "h1:VbpOemQlsSMrYmn7T2OUvQ4dqxQXU+ouZFQsZOx50z4=",
+        "version": "v0.17.0"
+      },
+      {
+        "go_mod_sum": "h1:B9TqLBwJqVjp1mtt7WeoQwWRwvu/400y5lETOql+giQ=",
+        "go_version": "1.25.0",
+        "path": "google.golang.org/api",
+        "sum": "h1:W7jiRvRi53VYFfZ/HoZjQBtJk7gOFbHD8ot1RzVZU6E=",
+        "version": "v0.278.0"
+      },
+      {
+        "go_mod_sum": "h1:FPk7EXUKMtImne7AmknoYjT4QXqKIzzRbeQIXzLk6fQ=",
+        "go_version": "1.25.0",
+        "path": "google.golang.org/genproto/googleapis/api",
+        "sum": "h1:admdQBe8jR3VWhBsUrAOaF2Qw6K/+p5pSm1GN8+6Fw4=",
+        "version": "v0.0.0-20260706201446-f0a921348800"
+      },
+      {
+        "go_mod_sum": "h1:4Hqkh8ycfw05ld/3BWL7rJOSfebL2Q+DVDeRgYgxUU8=",
+        "go_version": "1.25.0",
+        "path": "google.golang.org/genproto/googleapis/rpc",
+        "sum": "h1:qEHAMpSaUhtD0p3NbEEI83HwNGFxEwaSJ1G9PLnCBZE=",
+        "version": "v0.0.0-20260706201446-f0a921348800"
+      },
+      {
+        "go_mod_sum": "h1:ljCht0DrxQrXBDRTZp52Qxh3Ffk8CdYm2sj4O2QN2C0=",
+        "go_version": "1.25.0",
+        "path": "google.golang.org/grpc",
+        "sum": "h1:soMyaPJ8pAak5PIQ0DGBUir0XRo2fRoMqhNWMLlLxO0=",
+        "version": "v1.84.0"
+      },
+      {
+        "go_mod_sum": "h1:iMEtFwDlAhjDU9L5mY6U1XLwlIId/G3h+QcBHDIvrJ8=",
+        "go_version": "1.25.0",
+        "path": "google.golang.org/grpc/cmd/protoc-gen-go-grpc",
+        "sum": "h1:rgSNvqscFZ1JgV/4wH5GOsZFSFkR2Eua9As3KIr2LlM=",
+        "version": "v1.6.2"
+      },
+      {
+        "go_mod_sum": "h1:HTf+CrKn2C3g5S8VImy6tdcUvCska2kB7j23XfzDpco=",
+        "go_version": "1.23",
+        "path": "google.golang.org/protobuf",
+        "sum": "h1:pJOKDDOyeXErUroCihFAd5LQuwXBSpVnKGrj5o/fwxc=",
+        "version": "v1.36.12"
+      },
+      {
+        "go_mod_sum": "h1:JHkPIbrfpd72SG/EVd6muEfDQjcINNoR0C8j2r3qZ4Q=",
+        "go_version": "1.11",
+        "path": "gopkg.in/check.v1",
+        "sum": "h1:Hei/4ADfdWqJk1ZMxUNpqntNwaWcugrBjAiHlqqRiVk=",
+        "version": "v1.0.0-20201130134442-10cb98267c6c"
+      },
+      {
+        "go_mod_sum": "h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=",
+        "go_version": null,
+        "path": "gopkg.in/yaml.v3",
+        "sum": "h1:fxVm/GzAzEWqLHuvctI91KS9hhNmmWOoWu0XTYJS7CA=",
+        "version": "v3.0.1"
+      }
+    ],
+    "selected_graph_sha256": "190f25bb4ad7d5ed807eaeebebb5ced5f38162863b291bdbd89037b206ad2b68",
+    "setup": {
+      "authentication": "Go module authentication enabled with GONOSUMDB=none; complete download records and checksum database lookup proofs retained in task evidence.",
+      "checksum_database": "sum.golang.org",
+      "proxy": "https://proxy.golang.org"
+    },
+    "transitive_policy": "All remaining selected modules are upstream dependencies of the three runtime modules or the two generator packages. Cloud/auth, xDS and OpenTelemetry nodes originate in grpc; no additional direct framework or cloud-provider root is selected."
+  },
   "module": "canopy.local/canopy",
   "observed_at": "2026-10-15",
-  "tools": {
-    "go": {
-      "version": "1.27.2",
-      "required_for": ["check", "build", "test"],
-      "override": "GO"
-    },
-    "python": {
-      "version": "3.14.4",
-      "required_for": ["check", "build", "test"],
-      "override": "PYTHON"
-    },
-    "protoc": {
-      "version": "35.1",
-      "required_for": ["check"],
-      "override": "PROTOC",
-      "note": "Check the observed code-generation baseline explicitly. No generation or protobuf dependency is implemented; build/test do not consume protoc yet."
-    }
-  },
   "optional_future_tools": {
-    "node": {
-      "observed_version": "24.15.0",
-      "note": "No UI build exists yet; informational, not an enforced build/test dependency."
-    },
     "git": {
-      "observed_version": "2.54.0",
+      "note": "Development/migration context only. Never invoked by these entrypoints or native operations.",
       "observed_variant": "Apple Git-157 in the root tool shell; native shells may resolve another 2.54.0 build",
-      "note": "Development/migration context only. Never invoked by these entrypoints or native operations."
+      "observed_version": "2.54.0"
+    },
+    "node": {
+      "note": "No UI build exists yet; informational, not an enforced build/test dependency.",
+      "observed_version": "24.15.0"
     }
   },
   "policy": {
-    "toolchain_downloads": false,
     "module_downloads": false,
     "module_updates": false,
-    "note": "Supply installed executables through portable Make overrides. Future dependencies, providers, generators and harnesses require separate ownership and review."
+    "note": "Ordinary check/build/test/generation must remain offline with read-only modules and a local toolchain. Cache population is a separate explicitly authorized setup operation. Future providers and harnesses require separate ownership and review.",
+    "toolchain_downloads": false
+  },
+  "schema_version": 1,
+  "tools": {
+    "go": {
+      "override": "GO",
+      "required_for": [
+        "check",
+        "build",
+        "test"
+      ],
+      "version": "1.27.2"
+    },
+    "protoc": {
+      "note": "Installed code-generation baseline. Product generation is not implemented by this dependency-only change.",
+      "override": "PROTOC",
+      "required_for": [
+        "check"
+      ],
+      "version": "35.1"
+    },
+    "protoc-gen-go": {
+      "command": [
+        "go",
+        "tool",
+        "google.golang.org/protobuf/cmd/protoc-gen-go"
+      ],
+      "expected_version_output": "protoc-gen-go v1.36.12\n",
+      "module": "google.golang.org/protobuf",
+      "module_version": "v1.36.12",
+      "note": "Pinned by the go.mod tool directive and selected module graph. Future generation must use this command and compare exact version output; tools/check_toolchain.py does not validate generator fields.",
+      "package": "google.golang.org/protobuf/cmd/protoc-gen-go",
+      "required_for": [
+        "generate"
+      ],
+      "version": "1.36.12",
+      "version_args": [
+        "--version"
+      ]
+    },
+    "protoc-gen-go-grpc": {
+      "command": [
+        "go",
+        "tool",
+        "google.golang.org/grpc/cmd/protoc-gen-go-grpc"
+      ],
+      "expected_version_output": "protoc-gen-go-grpc 1.6.2\n",
+      "module": "google.golang.org/grpc/cmd/protoc-gen-go-grpc",
+      "module_version": "v1.6.2",
+      "note": "Pinned by the go.mod tool directive and selected module graph. Future generation must use this command and compare exact version output; tools/check_toolchain.py does not validate generator fields.",
+      "package": "google.golang.org/grpc/cmd/protoc-gen-go-grpc",
+      "required_for": [
+        "generate"
+      ],
+      "version": "1.6.2",
+      "version_args": [
+        "--version"
+      ]
+    },
+    "python": {
+      "override": "PYTHON",
+      "required_for": [
+        "check",
+        "build",
+        "test"
+      ],
+      "version": "3.14.4"
+    }
   }
 }
