@@ -1,6 +1,6 @@
 # Runtime, toolchain, ownership, and permission matrix
 
-**Snapshot:** 2026-10-15 01:52 UTC. **Task:** FND-02 attempt 2, base `a970fe113f4ad0dfb88f407d1109fcd4841ac75d`, contract SHA-256 `9b058e21b28263db98f9bfbf9e5661ba98517aef2d369c61ae501dd2d6fcaaf0`.
+**Snapshot:** 2026-10-15 01:54:56 UTC. **Task:** FND-02 attempt 2, base `a970fe113f4ad0dfb88f407d1109fcd4841ac75d`, contract SHA-256 `9b058e21b28263db98f9bfbf9e5661ba98517aef2d369c61ae501dd2d6fcaaf0`.
 
 This records observed local runtime and authority, not product verification. Tool versions and host/bootstrap details are retained from attempt 1 and linked below; this attempt updates the actor/runtime snapshot. Evidence paths are relative to `/Users/completetech/github/.scion-run/`.
 
@@ -14,7 +14,7 @@ This records observed local runtime and authority, not product verification. Too
 | Node.js | v24.15.0. | `evidence/FND-02/attempt-1/runtime_probe.json` |
 | Git | 2.54.0, Apple Git 157. | `evidence/FND-02/attempt-1/runtime_probe.json` |
 | Docker | 29.8.2, running Linux/aarch64 engine. This does not establish FUSE availability or authorize privileged containers. | `evidence/FND-02/attempt-1/runtime_probe.json`; `evidence/bootstrap/docker-ready.json` |
-| CLI/runtime binding | Native CLI invocation uses `-m gpt-6-luna` for the Luna worker session. Sol reviewer sessions use `gpt-6.1-sol`. Director root model identity is not exposed. | Current native Herdr session/task packet; `evidence/FND-02/attempt-1/agent_snapshot.json` |
+| CLI/runtime binding | Native CLI invocation uses `-m gpt-6-luna` for the Luna worker session. Sol reviewer sessions are assigned `gpt-6.1-sol`. Director root model identity is not exposed. | Current task/session binding; `evidence/bootstrap/herdr-working.json`; `evidence/FND-02/attempt-2/herdr-agents.json` |
 
 The bootstrap Go/Python/package validation records describe environment checks, not tests of product behavior. No product test is claimed here.
 
@@ -22,10 +22,10 @@ The bootstrap Go/Python/package validation records describe environment checks, 
 
 | Role | Current observation |
 |---|---|
-| Director | One root director session; model identity unexposed. |
-| Active builders | Three native Herdr worker sessions: `canonical`, `runtime` (this FND-02 worker), and `security`. Count is the observed active builder set, not a slot estimate. |
-| Reviewers | Sol reviewers are bound to `gpt-6.1-sol`; no reviewer session is counted as active in this snapshot. Reviews remain pending until actually run. |
-| Dispatch | Run serially if a required worker/reviewer or runtime is unavailable. Do not infer active work from panes, configured targets, or theoretical capacity. |
+| Director | Root director session observed working in Herdr at the probe; model identity is unexposed. The earlier direct get/UI observation is preserved in `evidence/bootstrap/herdr-working.json`. |
+| Assigned workers | Three native Herdr sessions: `canopy-canonical` (done), `canopy-runtime` (working; this FND-02 worker), and `canopy-security` (done) at 2026-10-15 01:54:56 UTC. This reports assigned sessions and observed states, not a slot estimate. |
+| Sol reviewers | `canopy-review` and `canopy-security-review`, both observed working at the probe; assigned model `gpt-6.1-sol`. Their reviews are in progress, not approvals. |
+| Dispatch | Herdr state is time-specific; use fresh observations before relying on it. Do not infer activity from theoretical capacity. Raw list and targeted get outputs: `evidence/FND-02/attempt-2/herdr-agents.json`, `evidence/FND-02/attempt-2/herdr-working.ndjson`; probe time/commands: `evidence/FND-02/attempt-2/herdr-probe-meta.txt`. |
 
 ## Shared build and contract ownership
 
@@ -38,7 +38,7 @@ Shared dependencies and generated protobuf files have one named owner at a time.
 | Action or environment | Current authority/status |
 |---|---|
 | Local edits and commits | Only the assigned isolated worktree and exact packet write paths. The director alone writes board state and shared build files. |
-| Push, merge, publish | Disabled. All commits remain local. |
+| Remote push, remote merge, publication | Disabled. Local exact-reviewed integration is authorized and required, and may be performed only by the director after independent review. All commits remain local. |
 | Cloud tests/spend | No cloud verification; spend ceiling is $0. Do not provision resources. |
 | Production, credentials, permissions | No production mutation, credential rotation, or permission broadening. |
 | Containers | Ordinary local Docker use only; privileged containers are not authorized. |
