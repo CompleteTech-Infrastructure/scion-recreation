@@ -14,7 +14,7 @@ This records observed local runtime and authority, not product verification. Too
 | Node.js | v24.15.0. | `evidence/FND-02/attempt-1/runtime_probe.json` |
 | Git | 2.54.0, Apple Git 157. | `evidence/FND-02/attempt-1/runtime_probe.json` |
 | Docker | 29.8.2, running Linux/aarch64 engine. This does not establish FUSE availability or authorize privileged containers. | `evidence/FND-02/attempt-1/runtime_probe.json`; `evidence/bootstrap/docker-ready.json` |
-| CLI/runtime binding | Native CLI invocation uses `-m gpt-6-luna` for the Luna worker session. Sol reviewer sessions are assigned `gpt-6.1-sol`. Director root model identity is not exposed. | Current task/session binding; `evidence/bootstrap/herdr-working.json`; `evidence/FND-02/attempt-2/herdr-agents.json` |
+| CLI/runtime binding | Native CLI invocation uses `-m gpt-6-luna` for the Luna worker session. Sol reviewer sessions are assigned `gpt-6.1-sol`. The director root UI footer showed `GPT-6.1-Sol medium` at 2026-10-15 01:56:49 UTC; earlier tool-only Herdr metadata did not expose the root model. | Current task/session binding; `evidence/bootstrap/director-model-ui.json`; `evidence/bootstrap/herdr-working.json`; `evidence/FND-02/attempt-2/herdr-agents.json` |
 
 The bootstrap Go/Python/package validation records describe environment checks, not tests of product behavior. No product test is claimed here.
 
@@ -22,7 +22,7 @@ The bootstrap Go/Python/package validation records describe environment checks, 
 
 | Role | Current observation |
 |---|---|
-| Director | Root director session observed working in Herdr at the probe; model identity is unexposed. The earlier direct get/UI observation is preserved in `evidence/bootstrap/herdr-working.json`. |
+| Director | Root director session was observed working in Herdr. Its native UI footer showed `GPT-6.1-Sol medium`; the captured command, output, and timestamp are in `evidence/bootstrap/director-model-ui.json`. Earlier tool-only Herdr metadata lacked model identity. |
 | Assigned workers | Three native Herdr sessions: `canopy-canonical` (done), `canopy-runtime` (working; this FND-02 worker), and `canopy-security` (done) at 2026-10-15 01:54:56 UTC. This reports assigned sessions and observed states, not a slot estimate. |
 | Sol reviewers | `canopy-review` and `canopy-security-review`, both observed working at the probe; assigned model `gpt-6.1-sol`. Their terminal titles show FND-03 work; this is not an FND-02 review or approval. |
 | Dispatch | Herdr state is time-specific; use fresh observations before relying on it. Do not infer activity from theoretical capacity. Raw list and targeted get outputs: `evidence/FND-02/attempt-2/herdr-agents.json`, `evidence/FND-02/attempt-2/herdr-working.ndjson`; probe time/commands: `evidence/FND-02/attempt-2/herdr-probe-meta.txt`. |
