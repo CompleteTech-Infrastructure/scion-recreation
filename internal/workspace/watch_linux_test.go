@@ -50,6 +50,11 @@ func TestLinuxNativeKernelEvents(t *testing.T) {
 			case "new-descendant":
 				watchOK(t, os.MkdirAll(filepath.Join(root, "sub/new/deep"), 0700))
 				watchOK(t, n.Barrier(context.Background())) // synchronous new coverage
+				scan := watchScan(t, w)
+				watchCheck(t, scan.Progress.Complete, "directory inventory incomplete")
+				watchOK(t, w.Finish(context.Background(), scan, watchProof(w, scan)))
+				_, before, _ = w.Snapshot()
+				watchOK(t, n.call(context.Background(), func() error { n.masks = 0; return nil }))
 				watchFile(t, filepath.Join(root, "sub/new/deep/child"), "child")
 				want, mask = []string{"sub/new/deep/child"}, syscall.IN_CREATE
 			case "rename":
@@ -73,8 +78,14 @@ func TestLinuxNativeKernelEvents(t *testing.T) {
 			}
 			m, after, _ := w.Snapshot()
 			watchCheck(t, after > before, "native event did not advance generation")
-			for _, p := range want {
-				requirePathBytes(t, m.DirtyPaths, []byte(p))
+			if kind == "rename" {
+				watchCheck(t, len(m.DirtyPaths) == 2, "rename path count = %d, want 2", len(m.DirtyPaths))
+				first, second := string(m.DirtyPaths[0].Bytes()), string(m.DirtyPaths[1].Bytes())
+				watchCheck(t, first == want[0] && second == want[1] || first == want[1] && second == want[0], "rename paths = %q, %q", first, second)
+			} else {
+				for _, p := range want {
+					requirePathBytes(t, m.DirtyPaths, []byte(p))
+				}
 			}
 			var observed uint32
 			watchOK(t, n.call(context.Background(), func() error { observed = n.masks; return nil }))
