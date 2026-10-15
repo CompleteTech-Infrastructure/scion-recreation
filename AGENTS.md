@@ -32,4 +32,4 @@ Report `implemented`, `verified-local`, `verified-cloud`, and `verified-scale` s
 
 ## Local execution
 
-Product root: /Users/completetech/github/src. Package: /Users/completetech/github/prompts/scion-agent-prompt-package. Board/evidence: /Users/completetech/github/.scion-run. All commits remain local. Never push or publish. The director alone writes the board and shared build files.
+Product root: /Users/completetech/github/src. Package: /Users/completetech/github/prompts/scion-agent-prompt-package. Board/evidence: /Users/completetech/github/.scion-run. All commits remain local. Never push or publish. The director alone writes the board; shared build files, dependency locks, generated registries and shared protobuf definitions remain director-owned unless the director explicitly delegates exact, exclusive write leases to named single owners.
