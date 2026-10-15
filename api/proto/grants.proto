@@ -1,0 +1,226 @@
+syntax = "proto3";
+package canopy.common.v1;
+option go_package = "canopy.local/canopy/api/gen/common/v1;commonv1";
+
+// grants-v1, candidate shared messages ONLY. No service is owned here.
+// Normative bounds, admission, producers, state transitions and accounting:
+// api/contracts/grants.md. Proto decoding alone does not validate authority.
+// All optional scalars below require presence unless explicitly noted otherwise.
+// Authentication is transport/OS-session based; no body field creates identity.
+enum GrantVersion { GRANT_VERSION_UNSPECIFIED = 0; GRANTS_V1 = 1; }
+enum GrantPurpose { GRANT_PURPOSE_UNSPECIFIED = 0; READ = 1; UPLOAD = 2; }
+enum CanonicalKind { CANONICAL_KIND_UNSPECIFIED = 0; BLOB = 1; CHANGESET = 2; }
+enum UploadCodec { UPLOAD_CODEC_UNSPECIFIED = 0; RAW = 1; }
+enum GrantFailure {
+  GRANT_FAILURE_UNSPECIFIED = 0;
+  NOT_AVAILABLE = 1; // identical public hidden/missing/invalid-authority shape
+  INVALID_INPUT = 2;
+  RESOURCE_EXHAUSTED = 3;
+  RESTART_REQUIRED = 4; // expired stream/session or policy/view changed
+  UNAVAILABLE = 5; // freshness/authority uncertainty; no data
+  CONFLICT = 6;
+}
+message Failure { GrantFailure code = 1; }
+message CanonicalObject {
+  CanonicalKind kind = 1;
+  bytes tid = 2; // exactly35: U16BE(1), U8(kind), SHA256[32]
+}
+message ReadScope {
+  oneof identity {
+    CanonicalObject object = 1;
+    bytes projection_id = 2; // exactly32; NOT a canonical TID
+  }
+}
+message PathSelector {
+  oneof selector {
+    bool root = 1; // only true; false is malformed, never empty-path ROOT
+    bytes path = 2; // raw canonical path, 1..65535 bytes, <=1024 components
+  }
+}
+message SourceAnchor {
+  oneof source {
+    bytes revision_tid = 1; // exactly35, canonical CHANGESET
+    bytes projection_id = 2; // exactly32; authority resolves hidden source
+    bool empty_repository = 3; //true, upload only; authority verifies empty base
+  }
+}
+message PayloadInterval {
+  optional uint64 offset = 1;
+  optional uint64 length = 2;
+}
+message IntervalSelection { repeated PayloadInterval intervals = 1; } //1..64
+message ReadSelection {
+  ReadScope scope = 1;
+  SourceAnchor source = 2;
+  PathSelector path = 3;
+  oneof extent {
+    bool full_payload = 4; // only true; mandatory for CHANGESET/projection
+    IntervalSelection ranges = 5; // BLOB only; half-open payload offsets
+  }
+}
+
+// The first eight mirrors retain the earlier field numbers/types. Their values
+// must match authenticated protected state exactly. Purpose/version are explicit
+// domains, not token cryptography. READ grants NEVER authorize upload/write.
+message ObjectGrant {
+  bytes opaque_authority_token = 1; //1..4096
+  bytes exact_scope_binding = 2; //32
+  bytes audience = 3; //1..256 exact bytes, ONE recipient
+  optional uint64 policy_version = 4; //0 legal, absent invalid
+  bytes effective_view_id = 5; //32
+  optional int64 expires_unix_millis = 6; //UTC integer milliseconds
+  bytes repository_id = 7; //16
+  bytes principal_session_binding = 8; //32
+  optional GrantVersion version = 9; //GRANTS_V1
+  optional GrantPurpose purpose = 10; //READ
+}
+message UploadGrant {
+  bytes opaque_authority_token = 1; //1..4096, separate UPLOAD token domain
+  bytes exact_scope_binding = 2; //32, exact immutable UploadIntent + key/session
+  bytes audience = 3; //1..256, authority only
+  optional uint64 policy_version = 4;
+  bytes effective_view_id = 5; //32
+  optional int64 expires_unix_millis = 6;
+  bytes repository_id = 7; //16
+  bytes principal_session_binding = 8; //32
+  optional GrantVersion version = 9; //GRANTS_V1
+  optional GrantPurpose purpose = 10; //UPLOAD
+}
+
+// Available to a freshly authenticated client, without any grant/view/session.
+message DiscoveryContext {
+  optional uint32 api_version = 1; //1
+  bytes repository_id = 2; //16; untrusted requested repository
+  bytes request_id = 3; //16 client correlation ONLY
+}
+// ObjectService.Capabilities consumes DiscoveryContext, not ReadContext.
+message DiscoveryCapabilities {
+  optional uint32 api_version = 1; //1
+  bytes serving_audience = 2; //1..256, this authenticated serving endpoint
+  bytes upload_audience = 3; //1..256, configured authority upload endpoint
+  optional uint64 max_blob_payload_bytes = 4; //2^40
+  optional uint64 max_changeset_payload_bytes = 5; //67108864
+  optional uint32 max_read_items = 6; //128
+  optional uint32 max_request_bytes = 7; //2097152, issuance/discovery/read metadata
+  optional uint32 max_upload_request_bytes = 8; //8388608
+  optional uint32 max_response_bytes = 9; //16777216
+}
+message ReadContext {
+  DiscoveryContext request = 1;
+  bytes stream_session_id = 2; //32, minted ONLY by IssueObjectGrants
+  bytes batch_binding = 3; //32, opaque ordered selection binding, same producer
+  bytes effective_view_id = 4; //32
+  optional uint64 policy_version = 5;
+  bytes principal_session_binding = 6; //32
+  bytes audience = 7; //1..256
+}
+// Existing control projection-read modes consume this complete binding.
+// The method must match the protected projection type; never infer a raw TID.
+message ProjectionReadInput {
+  ReadContext context = 1;
+  bytes projection_id = 2; //32, exactly the granted projection
+  ObjectGrant grant = 3;
+}
+message InitialRead {
+  repeated ReadSelection selection = 1; //1..128 ordered, duplicate scopes invalid
+  optional uint64 requested_logical_byte_budget = 2; //0..2^40; explicit
+  bytes idempotency_key = 3; //16..128, caller uniqueness, not authority
+}
+message RenewRead {
+  bytes stream_session_id = 1; //32 existing, not prior grant token
+  bytes batch_binding = 2; //32 existing
+  repeated ReadSelection selection = 3; //EXACT original ordered selection
+  optional uint64 expected_policy_version = 4; //required incl0
+  bytes effective_view_id = 5; //32 existing
+}
+// Existing IdentityPolicyService.IssueObjectGrants consumes this payload.
+message IssueObjectGrantsInput {
+  DiscoveryContext context = 1;
+  bytes audience = 2; //one exact configured recipient; renewal may reissue it
+  optional uint64 expected_policy_version = 3; //OPTIONAL initial expectation; MUST be absent on renew
+  oneof exchange { InitialRead initial = 4; RenewRead renew = 5; }
+}
+message ReadItemGrant {
+  ReadScope scope = 1; //exact requested identity, never silently substituted
+  ObjectGrant grant = 2;
+  optional uint64 logical_payload_bytes = 3; //authority-verified size, <=2^40
+  repeated PayloadInterval authorized_intervals = 4; //1..64 normalized intervals
+}
+message ReadItemOutcome {
+  optional uint32 index = 1; //0..N-1 in request order, present even at0
+  oneof outcome { ReadItemGrant value = 2; Failure denied = 3; }
+}
+message IssuedReadBatch {
+  ReadContext context = 1; //all issuer-produced fields, request correlation echoed
+  repeated ReadItemOutcome outcomes = 2; //exactly N, one per requested item
+  optional int64 stream_expires_unix_millis = 3; //absolute, creation+<=1h
+  optional uint64 logical_byte_budget = 4; //immutable authorized cap <=2^40
+  optional uint64 consumed_logical_bytes = 5; //snapshot, never a spend authority
+}
+message IssueObjectGrantsOutput {
+  oneof result { IssuedReadBatch batch = 1; Failure failure = 2; }
+}
+
+// A caller supplies intent, not authority. BeginUpload resolves and proves it
+// under current policy. BLOB: exact destination path. CHANGESET: explicit ROOT
+// or prefix covering all operations, proven writable throughout; Finish rechecks
+// every actual operation and all required metadata/history permissions.
+message UploadIntent {
+  CanonicalObject object = 1;
+  SourceAnchor destination_base = 2;
+  PathSelector write_boundary = 3;
+  optional uint32 envelope_version = 4; //1
+  UploadCodec codec = 5; //RAW only
+  optional uint64 canonical_frame_bytes = 6; //payload+22
+  optional uint64 encoded_bytes = 7; //exactly canonical_frame_bytes
+}
+// Existing UploadService.BeginUpload bootstrap AND renewal. No expired token
+// prerequisite: authenticate anew, present SAME key/intent, optionally same ID.
+message BeginUploadInput {
+  DiscoveryContext context = 1;
+  UploadIntent intent = 2;
+  bytes idempotency_key = 3; //16..128
+  bytes audience = 4; //exact authority audience
+  optional uint64 expected_policy_version = 5; //OPTIONAL expectation, checked when present
+  optional bytes existing_upload_id = 6; //32 when present; never identity/authority
+}
+message UploadSession {
+  bytes upload_id = 1; //32 authority-issued public opaque handle
+  UploadGrant grant = 2;
+  optional uint64 accepted_offset = 3; //durable RAW frame offset, initially0
+  optional int64 session_expires_unix_millis = 4; //absolute creation+<=1h
+  optional uint64 max_frame_bytes = 5; //kind cap incl22
+  optional uint32 max_chunk_bytes = 6; //4194304
+  optional bool finished = 7; //false/true explicit
+  CanonicalObject durable_object = 8; //present iff finished
+}
+message BeginUploadOutput {
+  oneof result { UploadSession session = 1; Failure failure = 2; }
+}
+message UploadContext {
+  DiscoveryContext request = 1;
+  bytes upload_id = 2; //copy BeginUploadOutput.session.upload_id
+  UploadGrant grant = 3; //copy latest same-session grant
+}
+// Shared authorization-bearing payloads for existing UploadService methods.
+message UploadChunksInput {
+  UploadContext context = 1;
+  optional uint64 expected_offset = 2;
+  bytes chunk = 3; //1..4194304, fixed-size chunks except last
+}
+message UploadProgress { optional uint64 accepted_offset = 1; }
+message UploadChunksOutput {
+  oneof result { UploadProgress progress = 1; Failure failure = 2; }
+}
+message FinishUploadInput {
+  UploadContext context = 1;
+  CanonicalObject expected_object = 2;
+  bytes expected_logical_sha256 = 3; //32 full canonical frame digest
+}
+message DurableUpload {
+  CanonicalObject object = 1;
+  optional uint64 canonical_frame_bytes = 2;
+}
+message FinishUploadOutput {
+  oneof result { DurableUpload durable = 1; Failure failure = 2; }
+}

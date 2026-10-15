@@ -1,0 +1,626 @@
+{
+  "fixture_version": "grants-v1-model/1",
+  "seed": "FND-GRANT-CONTRACT-attempt-1-model-001",
+  "byte_encoding": "All bytes are lowercase hexadecimal in this JSON. Integers are exact base-10 JSON integers; no floats.",
+  "contract": {
+    "package": "canopy.common.v1",
+    "version": 1,
+    "purpose_read": 1,
+    "purpose_upload": 2
+  },
+  "clock": {
+    "initial_now_unix_millis": 1000000,
+    "clock_error_millis": 250,
+    "maximum_clock_error_millis": 30000,
+    "policy_lease_expires_unix_millis": 1030000,
+    "stream_expires_unix_millis": 4600000
+  },
+  "limits": {
+    "read_items": 128,
+    "intervals_per_item": 64,
+    "read_budget_bytes": 1099511627776,
+    "blob_payload_bytes": 1099511627776,
+    "changeset_payload_bytes": 67108864,
+    "upload_chunk_bytes": 4194304,
+    "max_grant_lifetime_millis": 30000,
+    "max_session_lifetime_millis": 3600000,
+    "read_sessions_per_principal_session": 8,
+    "upload_sessions_per_principal_session": 8
+  },
+  "canonical_vectors": {
+    "public_blob_payload_hex": "7075626c69632d626c6f62",
+    "public_blob_frame_hex": "43414e4f5059004f424a00000101000000000000000b7075626c69632d626c6f62",
+    "public_blob_tid_hex": "000101c2d00ce4081aab173d6faf2d89b1c076ab06e66ec7cf0904680ad3c8b2077475",
+    "upload_blob_payload_hex": "7374616765642d64617461",
+    "upload_blob_frame_hex": "43414e4f5059004f424a00000101000000000000000b7374616765642d64617461",
+    "upload_blob_tid_hex": "00010194f297863e7ae4e02e39fc57bd43be3b9edcad1131e3b652f641abaa840316c2",
+    "empty_repo_id_hex": "00112233445566778899aabbccddeeff",
+    "frame_header_bytes": 22,
+    "full_blob_payload_hex": "636f6d706c6574652d6f626a656374",
+    "full_blob_frame_hex": "43414e4f5059004f424a00000101000000000000000f636f6d706c6574652d6f626a656374",
+    "full_blob_tid_hex": "00010117a40b9e9d930becb4a82a28abe445fcfd5c3bb7e5e8c2656a99089396fe1483",
+    "secret_blob_tid_hex": "000101144fcc74d8700b23a94a33180f026e7deb19120591e5a1bd7d2bd2222103389c"
+  },
+  "authenticated_session": {
+    "principal_id": "issuer:test-subject-7",
+    "principal_session_binding_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+    "repository_id_hex": "00112233445566778899aabbccddeeff",
+    "policy_version": 7,
+    "effective_view_id_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+    "authenticated_transport": true
+  },
+  "discovery": {
+    "request": {
+      "api_version": 1,
+      "repository_id": "00112233445566778899aabbccddeeff",
+      "request_id": "09090909090909090909090909090909"
+    },
+    "capabilities": {
+      "api_version": 1,
+      "serving_audience": "6e6f64652d41",
+      "upload_audience": "617574686f726974792d41",
+      "max_blob_payload_bytes": 1099511627776,
+      "max_changeset_payload_bytes": 67108864,
+      "max_read_items": 128,
+      "max_request_bytes": 2097152,
+      "max_upload_request_bytes": 8388608,
+      "max_response_bytes": 16777216
+    }
+  },
+  "read": {
+    "initial_request": {
+      "context": {
+        "api_version": 1,
+        "repository_id": "00112233445566778899aabbccddeeff",
+        "request_id": "01010101010101010101010101010101"
+      },
+      "audience": "6e6f64652d41",
+      "initial": {
+        "selection": [
+          {
+            "scope": {
+              "object": {
+                "kind": 1,
+                "tid": "000101c2d00ce4081aab173d6faf2d89b1c076ab06e66ec7cf0904680ad3c8b2077475"
+              }
+            },
+            "source": {
+              "revision_tid": "000102eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+            },
+            "path": {
+              "path": "7075626c69632f726561642e747874"
+            },
+            "ranges": {
+              "intervals": [
+                {
+                  "offset": 0,
+                  "length": 6
+                }
+              ]
+            }
+          },
+          {
+            "scope": {
+              "projection_id": "7777777777777777777777777777777777777777777777777777777777777777"
+            },
+            "source": {
+              "projection_id": "7777777777777777777777777777777777777777777777777777777777777777"
+            },
+            "path": {
+              "root": true
+            },
+            "full_payload": true
+          }
+        ],
+        "requested_logical_byte_budget": 100,
+        "idempotency_key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    "expected_public_batch": {
+      "stream_session_id_hex": "3333333333333333333333333333333333333333333333333333333333333333",
+      "batch_binding_hex": "4444444444444444444444444444444444444444444444444444444444444444",
+      "authorized_budget_bytes": 80,
+      "consumed_logical_bytes": 0,
+      "authorized_selection": [
+        {
+          "scope": {
+            "object": {
+              "kind": 1,
+              "tid": "000101c2d00ce4081aab173d6faf2d89b1c076ab06e66ec7cf0904680ad3c8b2077475"
+            }
+          },
+          "source": {
+            "revision_tid": "000102eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+          },
+          "path": {
+            "path": "7075626c69632f726561642e747874"
+          },
+          "ranges": {
+            "intervals": [
+              {
+                "offset": 0,
+                "length": 6
+              }
+            ]
+          }
+        },
+        {
+          "scope": {
+            "projection_id": "7777777777777777777777777777777777777777777777777777777777777777"
+          },
+          "source": {
+            "projection_id": "7777777777777777777777777777777777777777777777777777777777777777"
+          },
+          "path": {
+            "root": true
+          },
+          "full_payload": true
+        }
+      ],
+      "items": [
+        {
+          "index": 0,
+          "scope": {
+            "object": {
+              "kind": 1,
+              "tid": "000101c2d00ce4081aab173d6faf2d89b1c076ab06e66ec7cf0904680ad3c8b2077475"
+            }
+          },
+          "logical_payload_bytes": 11,
+          "authorized_intervals": [
+            {
+              "offset": 0,
+              "length": 6
+            }
+          ],
+          "scope_binding_hex": "5555555555555555555555555555555555555555555555555555555555555555",
+          "authorized_selection": {
+            "scope": {
+              "object": {
+                "kind": 1,
+                "tid": "000101c2d00ce4081aab173d6faf2d89b1c076ab06e66ec7cf0904680ad3c8b2077475"
+              }
+            },
+            "source": {
+              "revision_tid": "000102eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+            },
+            "path": {
+              "path": "7075626c69632f726561642e747874"
+            },
+            "ranges": {
+              "intervals": [
+                {
+                  "offset": 0,
+                  "length": 6
+                }
+              ]
+            }
+          },
+          "resolved_source_revision_tid_hex": "000102eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        },
+        {
+          "index": 1,
+          "scope": {
+            "projection_id": "7777777777777777777777777777777777777777777777777777777777777777"
+          },
+          "logical_payload_bytes": 4,
+          "authorized_intervals": [
+            {
+              "offset": 0,
+              "length": 4
+            }
+          ],
+          "scope_binding_hex": "6666666666666666666666666666666666666666666666666666666666666666",
+          "authorized_selection": {
+            "scope": {
+              "projection_id": "7777777777777777777777777777777777777777777777777777777777777777"
+            },
+            "source": {
+              "projection_id": "7777777777777777777777777777777777777777777777777777777777777777"
+            },
+            "path": {
+              "root": true
+            },
+            "full_payload": true
+          },
+          "resolved_source_revision_tid_hex": "000102eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        }
+      ]
+    },
+    "configured_audiences_hex": [
+      "6e6f64652d41",
+      "726567696f6e2d42"
+    ],
+    "raw_changeset": {
+      "requested_tid_hex": "000102dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "full_object_read": {
+        "all_directory_traverse_and_list": true,
+        "all_disclosed_path_read": false,
+        "all_referenced_object_read": false,
+        "all_disclosed_metadata_read": false,
+        "all_history_identity_read": false
+      },
+      "authorized_projection": {
+        "projection_id_hex": "7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a",
+        "selection_path_hex": "7075626c6963"
+      },
+      "canonical_disclosures": {
+        "directory_paths_hex": [
+          "7075626c6963",
+          "736563726574"
+        ],
+        "operations": [
+          {
+            "path_hex": "7075626c69632f726561642e747874",
+            "tag": 1,
+            "target_tid_hex": "000101c2d00ce4081aab173d6faf2d89b1c076ab06e66ec7cf0904680ad3c8b2077475"
+          },
+          {
+            "path_hex": "7365637265742f706c616e2e747874",
+            "tag": 1,
+            "target_tid_hex": "000101144fcc74d8700b23a94a33180f026e7deb19120591e5a1bd7d2bd2222103389c"
+          }
+        ],
+        "metadata_fields": [
+          "author_identity_bytes",
+          "message_bytes"
+        ],
+        "history_identity_tids_hex": [
+          "000102eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        ]
+      },
+      "protected_authorization": {
+        "traversable_listable_directories_hex": [
+          "7075626c6963"
+        ],
+        "readable_paths_hex": [
+          "7075626c69632f726561642e747874"
+        ],
+        "readable_reference_tids_hex": [
+          "000101c2d00ce4081aab173d6faf2d89b1c076ab06e66ec7cf0904680ad3c8b2077475"
+        ],
+        "readable_metadata_fields": [],
+        "readable_history_identity_tids_hex": []
+      }
+    },
+    "discovery_context_as_read_context": {
+      "context": {
+        "api_version": 1,
+        "repository_id": "00112233445566778899aabbccddeeff",
+        "request_id": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+      }
+    },
+    "malformed_policy_zero_fixture": {
+      "policy_version_present": true,
+      "policy_version": 0,
+      "effective_view_id_hex": "2222222222222222222222222222222222222222222222222222222222222222"
+    },
+    "authorized_logical_byte_budget": 80,
+    "session_handles": [
+      {
+        "stream_session_id_hex": "3333333333333333333333333333333333333333333333333333333333333333",
+        "batch_binding_hex": "4444444444444444444444444444444444444444444444444444444444444444"
+      },
+      {
+        "stream_session_id_hex": "3434343434343434343434343434343434343434343434343434343434343434",
+        "batch_binding_hex": "4545454545454545454545454545454545454545454545454545454545454545"
+      }
+    ],
+    "expected_full_batch": {
+      "stream_session_id_hex": "3434343434343434343434343434343434343434343434343434343434343434",
+      "batch_binding_hex": "4545454545454545454545454545454545454545454545454545454545454545",
+      "authorized_budget_bytes": 80,
+      "consumed_logical_bytes": 0,
+      "authorized_selection": [
+        {
+          "scope": {
+            "object": {
+              "kind": 1,
+              "tid": "00010117a40b9e9d930becb4a82a28abe445fcfd5c3bb7e5e8c2656a99089396fe1483"
+            }
+          },
+          "source": {
+            "revision_tid": "000102eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+          },
+          "path": {
+            "path": "7075626c69632f636f6d706c6574652e62696e"
+          },
+          "full_payload": true
+        }
+      ],
+      "items": [
+        {
+          "index": 0,
+          "scope": {
+            "object": {
+              "kind": 1,
+              "tid": "00010117a40b9e9d930becb4a82a28abe445fcfd5c3bb7e5e8c2656a99089396fe1483"
+            }
+          },
+          "logical_payload_bytes": 15,
+          "authorized_intervals": [
+            {
+              "offset": 0,
+              "length": 15
+            }
+          ],
+          "scope_binding_hex": "6767676767676767676767676767676767676767676767676767676767676767",
+          "authorized_selection": {
+            "scope": {
+              "object": {
+                "kind": 1,
+                "tid": "00010117a40b9e9d930becb4a82a28abe445fcfd5c3bb7e5e8c2656a99089396fe1483"
+              }
+            },
+            "source": {
+              "revision_tid": "000102eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+            },
+            "path": {
+              "path": "7075626c69632f636f6d706c6574652e62696e"
+            },
+            "full_payload": true
+          },
+          "resolved_source_revision_tid_hex": "000102eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        }
+      ]
+    },
+    "whole_object_request": {
+      "context": {
+        "api_version": 1,
+        "repository_id": "00112233445566778899aabbccddeeff",
+        "request_id": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+      },
+      "audience": "6e6f64652d41",
+      "initial": {
+        "selection": [
+          {
+            "scope": {
+              "object": {
+                "kind": 1,
+                "tid": "00010117a40b9e9d930becb4a82a28abe445fcfd5c3bb7e5e8c2656a99089396fe1483"
+              }
+            },
+            "source": {
+              "revision_tid": "000102eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+            },
+            "path": {
+              "path": "7075626c69632f636f6d706c6574652e62696e"
+            },
+            "full_payload": true
+          }
+        ],
+        "requested_logical_byte_budget": 80,
+        "idempotency_key": "cccccccccccccccccccccccccccccccc"
+      }
+    }
+  },
+  "upload": {
+    "initial_begin_request": {
+      "context": {
+        "api_version": 1,
+        "repository_id": "00112233445566778899aabbccddeeff",
+        "request_id": "03030303030303030303030303030303"
+      },
+      "intent": {
+        "object": {
+          "kind": 1,
+          "tid": "00010194f297863e7ae4e02e39fc57bd43be3b9edcad1131e3b652f641abaa840316c2"
+        },
+        "destination_base": {
+          "empty_repository": true
+        },
+        "write_boundary": {
+          "path": "75706c6f6164732f6974656d2e62696e"
+        },
+        "envelope_version": 1,
+        "codec": 1,
+        "canonical_frame_bytes": 33,
+        "encoded_bytes": 33
+      },
+      "idempotency_key": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "audience": "617574686f726974792d41"
+    },
+    "renew_begin_request": {
+      "context": {
+        "api_version": 1,
+        "repository_id": "00112233445566778899aabbccddeeff",
+        "request_id": "04040404040404040404040404040404"
+      },
+      "intent": {
+        "object": {
+          "kind": 1,
+          "tid": "00010194f297863e7ae4e02e39fc57bd43be3b9edcad1131e3b652f641abaa840316c2"
+        },
+        "destination_base": {
+          "empty_repository": true
+        },
+        "write_boundary": {
+          "path": "75706c6f6164732f6974656d2e62696e"
+        },
+        "envelope_version": 1,
+        "codec": 1,
+        "canonical_frame_bytes": 33,
+        "encoded_bytes": 33
+      },
+      "idempotency_key": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "audience": "617574686f726974792d42",
+      "expected_policy_version": 7,
+      "existing_upload_id": "8888888888888888888888888888888888888888888888888888888888888888"
+    },
+    "same_audience_retry_request": {
+      "context": {
+        "api_version": 1,
+        "repository_id": "00112233445566778899aabbccddeeff",
+        "request_id": "05050505050505050505050505050505"
+      },
+      "intent": {
+        "object": {
+          "kind": 1,
+          "tid": "00010194f297863e7ae4e02e39fc57bd43be3b9edcad1131e3b652f641abaa840316c2"
+        },
+        "destination_base": {
+          "empty_repository": true
+        },
+        "write_boundary": {
+          "path": "75706c6f6164732f6974656d2e62696e"
+        },
+        "envelope_version": 1,
+        "codec": 1,
+        "canonical_frame_bytes": 33,
+        "encoded_bytes": 33
+      },
+      "idempotency_key": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "audience": "617574686f726974792d42",
+      "expected_policy_version": 7,
+      "existing_upload_id": "8888888888888888888888888888888888888888888888888888888888888888"
+    },
+    "upload_id_hex": "8888888888888888888888888888888888888888888888888888888888888888",
+    "scope_binding_hex": "9999999999999999999999999999999999999999999999999999999999999999",
+    "frame_hex": "43414e4f5059004f424a00000101000000000000000b7374616765642d64617461",
+    "expected_sha256_hex": "94f297863e7ae4e02e39fc57bd43be3b9edcad1131e3b652f641abaa840316c2",
+    "upload_boundary_write_proved": true,
+    "configured_authority_audiences_hex": [
+      "617574686f726974792d41",
+      "617574686f726974792d42"
+    ]
+  },
+  "negative_cases": [
+    {
+      "id": "wrong-object",
+      "operation": "read-scope-mismatch"
+    },
+    {
+      "id": "wrong-projection",
+      "operation": "projection-scope-mismatch"
+    },
+    {
+      "id": "read-as-write",
+      "operation": "object-grant-in-upload"
+    },
+    {
+      "id": "upload-as-read",
+      "operation": "upload-grant-in-object-read"
+    },
+    {
+      "id": "mixed-public-secret-raw-changeset",
+      "operation": "raw-changeset-full-read"
+    },
+    {
+      "id": "missing-policy-presence",
+      "operation": "grant-field-presence",
+      "field": "policy_version"
+    },
+    {
+      "id": "missing-expiry-presence",
+      "operation": "grant-field-presence",
+      "field": "expires_unix_millis"
+    },
+    {
+      "id": "zero-expiry-invalid",
+      "operation": "grant-zero-value",
+      "field": "expires_unix_millis"
+    },
+    {
+      "id": "empty-required-handle",
+      "operation": "handle-width"
+    },
+    {
+      "id": "unknown-zero-handle",
+      "operation": "handle-lookup"
+    },
+    {
+      "id": "uint64-interval-end-overflow",
+      "operation": "interval-overflow"
+    },
+    {
+      "id": "read-budget-overflow",
+      "operation": "budget-overflow"
+    },
+    {
+      "id": "changed-renewal-selection",
+      "operation": "renewal-selection-mismatch"
+    },
+    {
+      "id": "client-budget-reset-attempt",
+      "operation": "renewal-unknown-field"
+    },
+    {
+      "id": "initial-idempotency-budget-reset",
+      "operation": "initial-key-tuple-conflict"
+    },
+    {
+      "id": "expired-at-equality",
+      "operation": "grant-expired"
+    },
+    {
+      "id": "stale-policy-view",
+      "operation": "policy-view-changed"
+    },
+    {
+      "id": "uncertain-freshness",
+      "operation": "freshness-unknown"
+    },
+    {
+      "id": "clock-error-consumes-window",
+      "operation": "freshness-clock-boundary"
+    },
+    {
+      "id": "expired-read-stream",
+      "operation": "stream-expired"
+    },
+    {
+      "id": "cross-audience-forwarding",
+      "operation": "audience-mismatch"
+    },
+    {
+      "id": "range-grant-used-for-getobjects",
+      "operation": "getobjects-requires-full-payload"
+    },
+    {
+      "id": "read-empty-repository-anchor",
+      "operation": "read-empty-anchor"
+    },
+    {
+      "id": "upload-empty-base-false",
+      "operation": "upload-empty-anchor-false"
+    },
+    {
+      "id": "upload-boundary-includes-denied-descendant",
+      "operation": "upload-write-proof-denied"
+    },
+    {
+      "id": "upload-changed-intent",
+      "operation": "upload-tuple-conflict"
+    },
+    {
+      "id": "upload-policy-changed",
+      "operation": "upload-policy-view-changed"
+    },
+    {
+      "id": "raw-changeset-directory-denied",
+      "operation": "raw-changeset-directory-proof"
+    },
+    {
+      "id": "raw-changeset-path-denied",
+      "operation": "raw-changeset-path-proof"
+    },
+    {
+      "id": "raw-changeset-reference-denied",
+      "operation": "raw-changeset-reference-proof"
+    },
+    {
+      "id": "raw-changeset-metadata-denied",
+      "operation": "raw-changeset-metadata-proof"
+    },
+    {
+      "id": "raw-changeset-history-denied",
+      "operation": "raw-changeset-history-proof"
+    }
+  ],
+  "positive_cases": [
+    {
+      "id": "upload-token-cannot-bootstrap-itself",
+      "operation": "upload-renew-no-old-token"
+    }
+  ]
+}
