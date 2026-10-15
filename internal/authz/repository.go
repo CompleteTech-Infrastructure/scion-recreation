@@ -10,10 +10,12 @@ type RepositoryScope struct{ TenantID, RepositoryID string }
 type RepositoryCapability string
 
 const (
-	RepositoryRead    RepositoryCapability = "read"
-	RepositoryWrite   RepositoryCapability = "write"
-	RepositoryApprove RepositoryCapability = "approve"
-	RepositoryAdmin   RepositoryCapability = "administer-policy"
+	RepositoryRead         RepositoryCapability = "read"
+	RepositoryWrite        RepositoryCapability = "write"
+	RepositoryApprove      RepositoryCapability = "approve"
+	RepositoryAdmin        RepositoryCapability = "administer-policy"
+	RepositoryMetadataRead RepositoryCapability = "metadata-read"
+	RepositoryHistoryRead  RepositoryCapability = "history-read"
 )
 
 type RepositoryRole struct {
@@ -92,11 +94,15 @@ func repositoryBit(c RepositoryCapability) uint8 {
 		return 4
 	case RepositoryAdmin:
 		return 8
+	case RepositoryMetadataRead:
+		return 16
+	case RepositoryHistoryRead:
+		return 32
 	}
 	return 0
 }
 func repositoryBits(caps []RepositoryCapability) (uint8, bool) {
-	if len(caps) > 4 {
+	if len(caps) > 6 {
 		return 0, false
 	}
 	var bits uint8

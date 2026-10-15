@@ -97,9 +97,8 @@ func TestRepositoryPolicyCapabilitiesDefaultDenyAndDenyWins(t *testing.T) {
 }
 
 func TestRepositoryPolicyCapabilitiesAreIndependent(t *testing.T) {
-	caps := []authz.RepositoryCapability{authz.RepositoryRead, authz.RepositoryWrite, authz.RepositoryApprove, authz.RepositoryAdmin}
-	roles := []string{"read-only", "write-only", "approve-only", "admin-only"}
-	want := [4][4]bool{{true, false, false, false}, {false, true, false, false}, {false, false, true, false}, {false, false, false, true}}
+	caps := []authz.RepositoryCapability{authz.RepositoryRead, authz.RepositoryWrite, authz.RepositoryApprove, authz.RepositoryAdmin, authz.RepositoryMetadataRead, authz.RepositoryHistoryRead}
+	roles := []string{"read-only", "write-only", "approve-only", "admin-only", "metadata-only", "history-only"}
 	p := authz.RepositoryPolicy{Scope: repositoryTestScope()}
 	for i, role := range roles {
 		p.Roles = append(p.Roles, authz.RepositoryRole{Name: role, Allow: []authz.RepositoryCapability{caps[i]}})
@@ -108,16 +107,112 @@ func TestRepositoryPolicyCapabilitiesAreIndependent(t *testing.T) {
 	e := repositoryTestEngine(t, p, repositoryTestClock)
 	for i, role := range roles {
 		for j, cap := range caps {
-			id := repositoryTestIdentity("fixture-issuer", role, authz.Human, repositoryTestAudience)
-			got, err := e.Evaluate(context.Background(), id, repositoryTestScope(), 0, cap)
-			if want[i][j] {
-				if err != nil || got != (authz.RepositoryDecision{Allowed: true}) {
-					t.Fatalf("%s on %s = %#v, %v; want allow", cap, role, got, err)
+			t.Run(role+"/"+string(cap), func(t *testing.T) {
+				id := repositoryTestIdentity("fixture-issuer", role, authz.Human, repositoryTestAudience)
+				got, err := e.Evaluate(context.Background(), id, repositoryTestScope(), 0, cap)
+				if i == j {
+					if err != nil || got != (authz.RepositoryDecision{Allowed: true}) {
+						t.Fatalf("%s on %s = %#v, %v; want allow", cap, role, got, err)
+					}
+				} else if !errors.Is(err, authz.ErrRepositoryDenied) || got != (authz.RepositoryDecision{}) {
+					t.Fatalf("%s on %s = %#v, %v; want deny", cap, role, got, err)
 				}
-			} else if !errors.Is(err, authz.ErrRepositoryDenied) || got != (authz.RepositoryDecision{}) {
-				t.Fatalf("%s on %s = %#v, %v; want deny", cap, role, got, err)
-			}
+			})
 		}
+	}
+}
+
+func TestRepositoryPolicyOrdinaryRolesDenyMetadataAndHistory(t *testing.T) {
+	p := repositoryTestPolicy()
+	e := repositoryTestEngine(t, p, repositoryTestClock)
+	for _, member := range p.Members {
+		for _, cap := range []authz.RepositoryCapability{authz.RepositoryMetadataRead, authz.RepositoryHistoryRead} {
+			t.Run(member.Principal.Subject+"/"+string(cap), func(t *testing.T) {
+				id := repositoryTestIdentity("fixture-issuer", member.Principal.Subject, authz.Human, repositoryTestAudience)
+				repositoryTestCheck(t, e, context.Background(), id, p.Scope, 0, cap, false)
+			})
+		}
+	}
+}
+
+func TestRepositoryPolicySixCapabilitiesAndDenyUnions(t *testing.T) {
+	caps := []authz.RepositoryCapability{authz.RepositoryRead, authz.RepositoryWrite, authz.RepositoryApprove, authz.RepositoryAdmin, authz.RepositoryMetadataRead, authz.RepositoryHistoryRead}
+	for _, denied := range append([]authz.RepositoryCapability{""}, caps...) {
+		name := string(denied)
+		if name == "" {
+			name = "all_explicitly_allowed"
+		}
+		t.Run(name, func(t *testing.T) {
+			p := authz.RepositoryPolicy{
+				Scope:   repositoryTestScope(),
+				Roles:   []authz.RepositoryRole{{Name: "all", Allow: caps}, {Name: "barrier"}},
+				Members: []authz.RepositoryMember{{Principal: repositoryTestPrincipal("member"), Active: true, Roles: []string{"all", "barrier"}}},
+			}
+			if denied != "" {
+				p.Roles[1].Deny = []authz.RepositoryCapability{denied}
+			}
+			e := repositoryTestEngine(t, p, repositoryTestClock)
+			id := repositoryTestIdentity("fixture-issuer", "member", authz.Human, repositoryTestAudience)
+			for _, cap := range caps {
+				t.Run(string(cap), func(t *testing.T) {
+					repositoryTestCheck(t, e, context.Background(), id, p.Scope, 0, cap, cap != denied)
+				})
+			}
+			p.Roles[1].Deny = caps // The full six-entry deny list is valid too.
+			e = repositoryTestEngine(t, p, repositoryTestClock)
+			for _, cap := range caps {
+				repositoryTestCheck(t, e, context.Background(), id, p.Scope, 0, cap, false)
+			}
+		})
+	}
+}
+
+func TestRepositoryPolicyInvalidCapabilitySetsFailClosed(t *testing.T) {
+	caps := []authz.RepositoryCapability{authz.RepositoryRead, authz.RepositoryWrite, authz.RepositoryApprove, authz.RepositoryAdmin, authz.RepositoryMetadataRead, authz.RepositoryHistoryRead}
+	sets := []struct {
+		name string
+		caps []authz.RepositoryCapability
+	}{{"over_six", append(append([]authz.RepositoryCapability{}, caps...), authz.RepositoryRead)}}
+	for _, cap := range caps {
+		sets = append(sets, struct {
+			name string
+			caps []authz.RepositoryCapability
+		}{"duplicate_" + string(cap), []authz.RepositoryCapability{cap, cap}})
+	}
+	for i, cap := range []authz.RepositoryCapability{"", "publish", "metadata_read", "history-read ", "Metadata-read", authz.RepositoryCapability(strings.Repeat("x", 4097))} {
+		sets = append(sets, struct {
+			name string
+			caps []authz.RepositoryCapability
+		}{"unknown_" + strconv.Itoa(i), []authz.RepositoryCapability{cap}})
+	}
+	for _, field := range []string{"allow", "deny"} {
+		for _, tc := range sets {
+			t.Run(field+"/"+tc.name, func(t *testing.T) {
+				p := repositoryTestPolicy()
+				if field == "allow" {
+					p.Roles[0].Allow = tc.caps
+				} else {
+					p.Roles[0].Deny = tc.caps
+				}
+				if e, err := authz.NewRepositoryPolicy(p, repositoryTestAudience, repositoryTestClock); e != nil || !errors.Is(err, authz.ErrRepositoryPolicy) {
+					t.Fatalf("invalid %s constructor = %v, %v", field, e, err)
+				}
+				e := repositoryTestEngine(t, repositoryTestPolicy(), repositoryTestClock)
+				p.Version = 1
+				admin := repositoryTestIdentity("fixture-issuer", "administrator", authz.Human, repositoryTestAudience)
+				if err := e.Update(context.Background(), admin, p.Scope, 0, p); !errors.Is(err, authz.ErrRepositoryDenied) {
+					t.Fatalf("invalid %s update = %v; want denied", field, err)
+				}
+				repositoryTestCheck(t, e, context.Background(), admin, p.Scope, 0, authz.RepositoryAdmin, true)
+			})
+		}
+	}
+	e := repositoryTestEngine(t, repositoryTestPolicy(), repositoryTestClock)
+	id := repositoryTestIdentity("fixture-issuer", "administrator", authz.Human, repositoryTestAudience)
+	for _, tc := range sets[7:] { // All malformed/unknown strings also fail at evaluation.
+		t.Run("evaluate/"+tc.name, func(t *testing.T) {
+			repositoryTestCheck(t, e, context.Background(), id, repositoryTestScope(), 0, tc.caps[0], false)
+		})
 	}
 }
 
@@ -134,7 +229,9 @@ func TestRepositoryPolicyRejectsScopeVersionsAndMalformedInputs(t *testing.T) {
 		{"wrong_version", repositoryTestScope(), 1, authz.RepositoryRead}, {"empty_scope", authz.RepositoryScope{}, 0, authz.RepositoryRead},
 		{"unknown_capability", repositoryTestScope(), 0, "publish"},
 	} {
-		t.Run(tc.name, func(t *testing.T) { repositoryTestCheck(t, e, context.Background(), id, tc.scope, tc.ver, tc.cap, false) })
+		t.Run(tc.name, func(t *testing.T) {
+			repositoryTestCheck(t, e, context.Background(), id, tc.scope, tc.ver, tc.cap, false)
+		})
 	}
 	for _, tc := range []struct {
 		name string
@@ -302,7 +399,9 @@ func TestRepositoryPolicyFailsClosedForIdentityContextAndClock(t *testing.T) {
 	}{
 		{"nil_engine", nilEngine, context.Background()}, {"zero_engine", &authz.RepositoryPolicyEngine{}, context.Background()}, {"nil_context", e, nil},
 	} {
-		t.Run(tc.name, func(t *testing.T) { repositoryTestCheck(t, tc.e, tc.ctx, writer, repositoryTestScope(), 0, authz.RepositoryRead, false) })
+		t.Run(tc.name, func(t *testing.T) {
+			repositoryTestCheck(t, tc.e, tc.ctx, writer, repositoryTestScope(), 0, authz.RepositoryRead, false)
+		})
 	}
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
