@@ -1,0 +1,323 @@
+syntax = "proto3";
+
+package canopy.objects.v1;
+option go_package = "canopy.local/canopy/api/gen/objects/v1;objectsv1";
+
+// objects-v1 is transport metadata around canonical logical objects. An object
+// digest identifies bytes and is never authority to read or write them.
+// Authenticated principal/session credentials are transport metadata (for
+// example, an authenticated RPC metadata credential); no body field establishes
+// or overrides the authenticated principal.
+//
+// Every serving tier implements the same ObjectService. The only legal fetch
+// topology is node -> regional -> authority. A tier checks the caller's current
+// principal, session, repository, exact scope, path/reachability proof, policy
+// version, view, its own audience, and expiry before every object/range/cache-hit
+// delivery. A denial is resolved before cache, disk, snapshot, or upstream
+// lookup. A tier may not forward a grant minted for a different audience; the
+// authority reissues a bounded grant for the next tier after authorization.
+// There is no pathless blob grant and no digest-as-capability endpoint.
+// Policy freshness/control refresh is separate authority traffic; it never
+// changes the object topology or permits bypassing a failed cache tier.
+// These messages define a contract, not serving implementation evidence.
+
+// Canonical v1 typed IDs are exactly 35 bytes: U16BE(1), U8(kind), SHA-256 of
+// the canonical frame. Kind 1 is raw blob; kind 2 is changeset. No tree kind is
+// defined in canonical v1. Projected/derived identities are separate opaque
+// identities and MUST NOT be represented as canonical TIDs or raw object
+// payloads. Unknown internal tree kinds fail explicitly and do not imply native
+// v1 support.
+message TypedObjectId {
+  bytes canonical_tid = 1; // exactly 35 bytes, structurally validated
+}
+
+message RepositoryId { bytes value = 1; } // exactly 16 opaque bytes
+
+// Scope is exact and non-widenable. For an object, object_id is the canonical
+// TID and object_kind must agree with its embedded kind. A projected view has
+// its distinct opaque projection_id and is never a raw object grant.
+message ExactReadScope {
+  oneof scope {
+    TypedObjectId object = 1;
+    bytes projection_id = 2;
+  }
+}
+
+enum GrantAudience {
+  GRANT_AUDIENCE_UNSPECIFIED = 0;
+  AUDIENCE_AUTHORITY = 1;
+  AUDIENCE_REGIONAL = 2;
+  AUDIENCE_NODE = 3;
+}
+
+// Opaque authenticated authority token. Semantic claims include version,
+// principal_id, session_id, repository_id, exact scope, read right,
+// policy_version, effective_view_id, audience, issued_at, expires_at, and a
+// bounded authority-verifiable authorization proof. The proof for a blob binds
+// repository, source revision, exact visible path or visible entry, blob TID,
+// view, policy and read right. This token is not transferable, renewable by a
+// cache hit, or usable for another audience. It is not a bearer digest.
+message ObjectGrant {
+  bytes opaque_authority_token = 1;
+  GrantAudience audience = 2;
+  bytes exact_scope_binding = 3; // opaque binding echoed/checked by server
+  uint64 policy_version = 4;
+  bytes effective_view_id = 5;
+  int64 expires_unix_millis = 6;
+}
+
+// Authenticated identity is deliberately absent. Credentials and transport
+// authentication establish principal/session. Repo and view selectors below
+// are request selectors which must exactly match the authenticated grant.
+message RequestContext {
+  RepositoryId repository_id = 1;
+  bytes effective_view_id = 2;
+  uint64 policy_version = 3;
+  uint32 max_response_bytes = 4;
+  uint32 requested_deadline_millis = 5;
+  uint32 retry_budget = 6;
+  uint32 api_version = 7;
+  bytes request_id = 8; // exactly 16 opaque correlation bytes; not identity
+}
+
+enum ObjectKind {
+  OBJECT_KIND_UNSPECIFIED = 0;
+  RAW_BLOB = 1;
+  RAW_CHANGESET = 2;
+}
+
+enum StorageCodec {
+  STORAGE_CODEC_UNSPECIFIED = 0;
+  CODEC_RAW = 1;
+  CODEC_GZIP = 2;
+}
+
+// Every envelope is independently bounded and decodable. Version 1 uses a
+// fixed logical payload length and full 32-byte SHA-256 logical digest. The
+// digest is over the entire canonical object frame (header + payload), never
+// compressed bytes. After decoding, require exact logical length, exactly one
+// complete canonical frame, no trailing data, and recomputed TID/digest match.
+// gzip is exactly one member; reject trailing bytes and concatenated members.
+// Decoder window <= 8 MiB; encoded bytes <= 16 MiB per frame; logical bytes <=
+// 64 MiB per ordinary object; expansion <= 64:1. If valid highly compressible
+// data exceeds that ratio, use CODEC_RAW. Blob range reads are the large-object
+// path and are separately bounded below. Encoded envelope bytes can be retained
+// and reused unchanged on disk/network only after all checks pass.
+message ObjectEnvelope {
+  uint32 envelope_version = 1; // exactly 1
+  StorageCodec codec = 2;     // RAW or single-member GZIP
+  ObjectKind object_kind = 3;
+  TypedObjectId object_id = 4;
+  uint64 logical_frame_bytes = 5;
+  bytes logical_sha256 = 6;    // exactly 32 bytes, full canonical frame digest
+  uint64 encoded_bytes = 7;
+  bytes encoded_payload = 8;
+}
+
+message WantedObject {
+  TypedObjectId object_id = 1;
+  ObjectKind object_kind = 2;
+  ObjectGrant grant = 3;
+  // Optional complete-object resume only. Binds exact object/envelope version,
+  // principal/session, repository, view, policy, audience and expiry. It names
+  // only a previously completed and independently verified object boundary;
+  // partial bytes never count as a completed object.
+  bytes resume_token = 4;
+}
+
+message GetObjectsRequest {
+  RequestContext context = 1;
+  repeated WantedObject wanted = 2; // client asks for desired IDs; no possession list
+  uint32 max_objects = 3;           // <= 128
+  uint32 max_encoded_bytes = 4;     // <= 16 MiB total
+  uint32 max_concurrency = 5;       // <= 8
+}
+
+message ObjectDelivery {
+  ObjectEnvelope envelope = 1;
+  ObjectGrant grant = 2; // exact audience grant authorizing this delivery
+  bytes completed_object_resume_token = 3;
+}
+
+message GetObjectsResponse {
+  repeated ObjectDelivery delivered = 1;
+  repeated TypedObjectId unavailable = 2; // normalized public status; no hidden reason
+  uint32 completed_count = 3;
+  uint32 encoded_bytes = 4;
+}
+
+// Range plans commit to the complete raw blob payload, not to a self-asserted
+// checksum supplied by a range caller. Authority mints only after validating
+// the complete durable canonical blob frame against its full TID. The plan is
+// integrity metadata, never authorization. A valid exact-object grant and
+// current policy are independently checked for every requested chunk.
+//
+// Merkle construction (SHA-256, all lengths/counts unsigned big-endian):
+// leaf(i, chunk) = SHA256(ASCII("CANOPY\0BLOB-RANGE\0LEAF\0") || U64BE(i) ||
+//                         U32BE(len(chunk)) || chunk)
+// node(left,right) = SHA256(ASCII("CANOPY\0BLOB-RANGE\0NODE\0") || left || right)
+// Empty payload root = SHA256(ASCII("CANOPY\0BLOB-RANGE\0EMPTY\0") || U64BE(0)).
+// Pair adjacent leaves at each level; an unpaired last node is promoted
+// unchanged to the next level (never duplicated). One-leaf root is that leaf.
+// Chunk i is payload[i*chunk_size : min((i+1)*chunk_size,payload_size)].
+// Root binds payload_size, chunk_size, leaf_count and the full canonical blob
+// TID in the signed plan transcript below; verifier checks exact final chunk
+// length and index. Plan signing transcript is exactly:
+// ASCII("CANOPY\0BLOB-RANGE\0PLAN\0") || U16BE(plan_version=1) ||
+// TID[35] || U64BE(payload_size) || U32BE(chunk_size) || U64BE(leaf_count) ||
+// root[32] || U64BE(issued_unix_millis) || U64BE(expires_unix_millis) ||
+// U16BE(len(repository_id)) || repository_id[16] ||
+// U16BE(len(policy_version encoding)) || U64BE(policy_version) ||
+// U16BE(len(effective_view_id)) || effective_view_id ||
+// U16BE(len(audience encoding)) || U8(audience).
+// Signature is Ed25519 over the transcript, 64 bytes. Trust keys are selected
+// from bounded local authority configuration by key_id; never from caller URLs.
+// The exact root, full TID, payload size, chunk geometry, expiry, repository,
+// policy, view and audience are signature-bound. Proof has <= 64 sibling hashes
+// and <= 64 KiB serialized. No client buffers the whole blob to verify a range.
+// Literal proof vector: payload bytes 61 62 63 ("abc"), chunk_size=2,
+// payload_size=3, leaf_count=2. Leaf 0 (index 0, bytes 61 62) is
+// e4dbf793a0cdf801ab28b5e1f685f441eb4a27ecec85b15e96639803f7c77c3a.
+// Leaf 1 (index 1, byte 63) is
+// 61c92be82c59d7b7575180eee5fda2031ebb7f35cc25ff8eb5540c52aff78ede.
+// Root is 8a9d5e3047e61143a3be8a1fd0e4626f02ba281dd38708e9aa8d42b8aa7e60a4.
+// Chunk 0 proof: sibling=leaf1, sibling_is_left=false. Chunk 1 proof:
+// sibling=leaf0, sibling_is_left=true. Mutating either byte, index, sibling
+// side, sibling hash, size, chunk size, count, or root must fail verification.
+message BlobRangePlan {
+  uint32 plan_version = 1; // exactly 1
+  TypedObjectId blob_tid = 2; // must be kind-01 canonical TID
+  uint64 raw_payload_bytes = 3; // excludes canonical header; <= 2^40
+  uint32 chunk_bytes = 4; // 1..4 MiB
+  uint64 leaf_count = 5; // ceil(payload/chunk_bytes), zero for empty payload
+  bytes merkle_root = 6; // exactly 32 bytes
+  uint64 issued_unix_millis = 7;
+  uint64 expires_unix_millis = 8; // <= 30 seconds after issuance
+  RepositoryId repository_id = 9;
+  uint64 policy_version = 10;
+  bytes effective_view_id = 11;
+  GrantAudience audience = 12;
+  bytes authority_key_id = 13; // bounded configured-key selector
+  bytes ed25519_signature = 14; // exactly 64 bytes over documented transcript
+}
+
+message GetRangePlanRequest {
+  RequestContext context = 1;
+  TypedObjectId blob_tid = 2;
+  ObjectGrant exact_object_grant = 3; // path/reachability authorization still required
+}
+message GetRangePlanResponse {
+  BlobRangePlan plan = 1;
+  ObjectGrant grant = 2; // audience-scoped grant, independently checked on range calls
+}
+
+message MerkleSibling {
+  bytes hash = 1; // exactly 32 bytes
+  bool sibling_is_left = 2;
+}
+message VerifiedBlobChunk {
+  uint64 chunk_index = 1;
+  bytes raw_payload_chunk = 2;
+  repeated MerkleSibling proof = 3;
+}
+
+message GetObjectRangeRequest {
+  RequestContext context = 1;
+  TypedObjectId blob_tid = 2;
+  BlobRangePlan plan = 3;
+  ObjectGrant exact_object_grant = 4;
+  uint64 first_chunk_index = 5;
+  uint32 chunk_count = 6; // 1..64; each response <= 16 MiB encoded
+}
+message GetObjectRangeResponse {
+  TypedObjectId blob_tid = 1;
+  uint64 raw_payload_offset = 2; // first_chunk_index * chunk_bytes; payload excludes canonical header
+  uint64 raw_payload_total_bytes = 3;
+  repeated VerifiedBlobChunk chunks = 4;
+  ObjectGrant grant = 5; // rechecked for each chunk at current policy/audience
+}
+
+message CapabilitiesRequest {
+  uint32 api_version = 1;
+}
+message CapabilitiesResponse {
+  repeated uint32 envelope_versions = 1;
+  repeated StorageCodec codecs = 2;
+  repeated uint32 canonical_versions = 3;
+  uint32 max_wanted_objects = 4;       // 128
+  uint32 max_batch_encoded_bytes = 5;  // 16 MiB
+  uint32 max_object_encoded_bytes = 6; // 16 MiB
+  uint64 max_object_logical_bytes = 7; // 64 MiB ordinary; blob ranges <= 2^40 payload
+  uint32 max_expansion_ratio = 8;      // 64
+  uint32 max_decoder_window_bytes = 9; // 8 MiB
+  uint32 max_range_chunk_bytes = 10;   // 4 MiB
+  uint32 max_range_chunks_per_call = 11; // 64
+  uint32 max_merkle_proof_bytes = 12;  // 64 KiB
+  uint32 max_in_flight = 13;           // 8
+  uint32 max_retry_budget = 14;        // 3
+  uint32 max_deadline_millis = 15;     // 30000
+  uint32 max_range_plan_lifetime_millis = 16; // 30000
+}
+
+service ObjectService {
+  // Same service and method set at authority, regional and node tiers.
+  // Credential is authenticated transport metadata. Every wanted object is
+  // authorized separately before any lookup or bytes; no possession-list mode.
+  rpc GetObjects(GetObjectsRequest) returns (GetObjectsResponse);
+  // Plan issuance is authority-backed and requires a current exact grant.
+  rpc GetRangePlan(GetRangePlanRequest) returns (GetRangePlanResponse);
+  // Rechecks grant, plan signature, expiry and current policy independently for
+  // each response chunk. Object range offset is raw blob payload relative.
+  rpc GetObjectRange(GetObjectRangeRequest) returns (GetObjectRangeResponse);
+  rpc Capabilities(CapabilitiesRequest) returns (CapabilitiesResponse);
+}
+
+// Upload RPCs are authority-only. Regional and node cache services MUST NOT
+// register this service. All requests require authenticated transport
+// credentials, repository write capability, current policy, and exact write
+// scope. Idempotency keys are bound to principal/session/repository/scope.
+message UploadWriteScope {
+  RepositoryId repository_id = 1;
+  bytes opaque_authority_write_scope = 2;
+  uint64 policy_version = 3;
+  bytes effective_view_id = 4;
+  bytes exact_path_proof = 5; // authority-verifiable bounded proof; never caller identity
+}
+message BeginUploadRequest {
+  RepositoryId repository_id = 1;
+  TypedObjectId object_id = 2;
+  ObjectKind object_kind = 3;
+  uint64 declared_canonical_frame_bytes = 4;
+  uint64 declared_encoded_bytes = 5;
+  UploadWriteScope write_scope = 6;
+  bytes idempotency_key = 7; // 16..128 bytes
+}
+message BeginUploadResponse {
+  bytes upload_id = 1; // opaque, principal/session/scope-bound
+  uint64 max_frame_bytes = 2;
+  uint32 max_chunk_bytes = 3;
+  uint64 accepted_offset = 4; // canonical encoded transfer offset
+  int64 expires_unix_millis = 5;
+}
+message UploadChunksRequest {
+  bytes upload_id = 1;
+  uint64 expected_offset = 2;
+  bytes bounded_chunk = 3; // 1..4 MiB; retry of same offset+bytes is idempotent
+}
+message UploadChunksResponse {
+  uint64 accepted_offset = 1; // durable next byte offset; gaps/different replay conflict
+}
+message FinishUploadRequest {
+  bytes upload_id = 1;
+  bytes expected_logical_sha256 = 2; // exactly 32 bytes over full canonical frame
+  TypedObjectId expected_object_id = 3;
+}
+message FinishUploadResponse {
+  TypedObjectId durable_object_id = 1; // only after full decode, canonical validation and TID verification
+  uint64 durable_frame_bytes = 2;
+}
+service UploadService {
+  rpc BeginUpload(BeginUploadRequest) returns (BeginUploadResponse);
+  rpc UploadChunks(UploadChunksRequest) returns (UploadChunksResponse);
+  rpc FinishUpload(FinishUploadRequest) returns (FinishUploadResponse);
+}
