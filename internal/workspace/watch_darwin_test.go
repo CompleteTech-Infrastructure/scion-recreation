@@ -4,6 +4,7 @@ package workspace
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -193,7 +194,7 @@ func TestDarwinSyntheticFaults(t *testing.T) {
 	}
 }
 func TestDarwinPartialInitialization(t *testing.T) {
-	for _, kind := range []string{"common-open", "second-registration", "registration-cap", "descriptor-cap", "symlink", "depth"} {
+	for _, kind := range []string{"common-open", "second-registration", "registration-eintr-before", "registration-eintr-after", "read-eintr-exhaustion", "registration-cap", "descriptor-cap", "symlink", "depth"} {
 		t.Run(kind, func(t *testing.T) {
 			root, meta := t.TempDir(), privateMetadataDir(t)
 			watchOK(t, Save(meta, Manifest{Base: testChangeset(t, "partial"), SparseVersion: 1, SparseAll: true, State: Clean}))
@@ -224,13 +225,33 @@ func TestDarwinPartialInitialization(t *testing.T) {
 					if len(c) > 0 {
 						nativeFDs = append(nativeFDs, k, int(c[0].Ident))
 						count++
+						if count == 2 && (kind == "registration-eintr-before" || kind == "registration-eintr-after") {
+							if kind == "registration-eintr-after" {
+								if _, err := real(k, c, events, ts); err != nil {
+									return 0, err
+								}
+							}
+							return -1, syscall.EINTR
+						}
 						if kind == "second-registration" && count == 2 {
 							return 0, syscall.ENOSPC
 						}
 					}
+					if len(c) == 0 && kind == "read-eintr-exhaustion" {
+						return -1, syscall.EINTR
+					}
 					return real(k, c, events, ts)
 				}
 			})
+			if kind == "registration-eintr-before" || kind == "registration-eintr-after" || kind == "read-eintr-exhaustion" {
+				watchIs(t, e, syscall.EINTR)
+			}
+			if kind == "read-eintr-exhaustion" {
+				watchIs(t, e, ErrWatchLimit)
+			}
+			if kind == "registration-eintr-before" || kind == "registration-eintr-after" {
+				watchCheck(t, len(nativeFDs) == 4, "registration interruption retried")
+			}
 			watchCheck(t, e != nil && w == nil, "partial initialization succeeded")
 			for _, fd := range nativeFDs {
 				watchIs(t, syscall.Fstat(fd, new(syscall.Stat_t)), syscall.EBADF)
@@ -287,4 +308,123 @@ func TestDarwinCancelCloseAndWatermark(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Deterministic read seam cases do not substitute for the native event tests.
+func TestDarwinEINTRRead(t *testing.T) {
+	for _, kind := range []string{"transient", "last-attempt", "exhausted", "cancel", "deadline", "partial-output", "real-error", "already-canceled"} {
+		t.Run(kind, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if kind == "already-canceled" {
+				cancel()
+			}
+			if kind == "deadline" {
+				ctx, cancel = context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+				defer cancel()
+			}
+			calls := 0
+			b := darwinWatch{kq: 17, kevent: func(k int, c, e []syscall.Kevent_t, ts *syscall.Timespec) (int, error) {
+				calls++
+				watchCheck(t, k == 17 && len(c) == 0 && len(e) == 1 && ts != nil && *ts == (syscall.Timespec{}), "read changed queue/registration/timeout")
+				if kind == "cancel" {
+					cancel()
+					return -1, syscall.EINTR
+				}
+				if kind == "partial-output" {
+					return 1, syscall.EINTR
+				}
+				if kind == "real-error" && calls == 2 {
+					return -1, syscall.EIO
+				}
+				if kind == "exhausted" || kind == "real-error" || calls == 1 || kind == "last-attempt" && calls < darwinReadAttempts {
+					return -1, syscall.EINTR
+				}
+				e[0] = syscall.Kevent_t{Ident: 19, Filter: syscall.EVFILT_VNODE, Fflags: syscall.NOTE_WRITE}
+				return 1, nil
+			}}
+			events := make([]syscall.Kevent_t, 1)
+			n, err := b.readEvents(ctx, events)
+			switch kind {
+			case "transient", "last-attempt":
+				watchOK(t, err)
+				watchCheck(t, n == 1 && events[0].Ident == 19, "lost returned hint")
+				want := 2
+				if kind == "last-attempt" {
+					want = darwinReadAttempts
+				}
+				watchCheck(t, calls == want, "calls=%d want=%d", calls, want)
+			case "exhausted":
+				watchIs(t, err, ErrWatchLimit)
+				watchIs(t, err, syscall.EINTR)
+				watchCheck(t, calls == darwinReadAttempts && n == 0, "unbounded read")
+			case "cancel", "already-canceled":
+				watchIs(t, err, context.Canceled)
+				want := 1
+				if kind == "already-canceled" {
+					want = 0
+				}
+				watchCheck(t, calls == want, "read after cancel")
+			case "deadline":
+				watchIs(t, err, context.DeadlineExceeded)
+				watchCheck(t, calls == 0, "read after deadline")
+			case "partial-output":
+				watchIs(t, err, ErrWatchStale)
+				watchCheck(t, calls == 1 && n == 0, "retried uncertain output")
+			case "real-error":
+				watchIs(t, err, syscall.EIO)
+				watchCheck(t, calls == 2 && !errors.Is(err, ErrWatchLimit), "swallowed real failure")
+			}
+		})
+	}
+}
+func TestDarwinEINTRRetainsNativeHint(t *testing.T) {
+	var reads atomic.Int32
+	w, _, meta := darwinFixture(t, func(b *darwinWatch) {
+		real := b.kevent
+		b.kevent = func(k int, c, e []syscall.Kevent_t, ts *syscall.Timespec) (int, error) {
+			if len(c) == 0 && reads.Add(1) == 1 {
+				if err := os.WriteFile(filepath.Join(b.name, "sub", "original"), []byte("changed"), 0600); err != nil {
+					return 0, err
+				}
+				return -1, syscall.EINTR
+			}
+			return real(k, c, e, ts)
+		}
+	})
+	b := w.backend.(*darwinWatch)
+	r := b.barrier(context.Background())
+	watchOK(t, r.err)
+	watchCheck(t, reads.Load() >= 2 && r.watermark > 0 && r.registrations == 3, "interruption lost coverage: %+v", r)
+	m, _, _ := w.Snapshot()
+	requirePathBytes(t, m.DirtyPaths, []byte("sub/original"))
+	watchUnknown(t, w, meta)
+	watchOK(t, w.Close())
+	watchCheck(t, b.root == nil && b.kq == -1 && len(b.nodes) == 0, "native cleanup failed")
+}
+
+func TestDarwinEINTRCancel(t *testing.T) {
+	var active atomic.Bool
+	var calls atomic.Int32
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w, root, meta := darwinFixture(t, func(b *darwinWatch) {
+		real := b.kevent
+		b.kevent = func(k int, c, e []syscall.Kevent_t, ts *syscall.Timespec) (int, error) {
+			if len(c) == 0 && active.Load() {
+				calls.Add(1)
+				cancel()
+				return -1, syscall.EINTR
+			}
+			return real(k, c, e, ts)
+		}
+	})
+	darwinTrustedBaseline(t, w, root)
+	b := w.backend.(*darwinWatch)
+	active.Store(true)
+	watchIs(t, b.Barrier(ctx), context.Canceled)
+	_ = b.Close()
+	watchCheck(t, calls.Load() > 0 && calls.Load() <= darwinReadAttempts, "cancel interruption calls=%d", calls.Load())
+	watchUnknown(t, w, meta)
+	watchCheck(t, b.root == nil && b.kq == -1 && len(b.nodes) == 0 && len(b.fds) == 0, "cancellation leaked native resources")
 }

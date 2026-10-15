@@ -5,6 +5,7 @@ package workspace
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"sync"
@@ -21,6 +22,7 @@ const (
 	darwinDescriptors   = darwinRegistrations + 5 // root, kqueue, enumeration, two rooted-resolution FDs
 	darwinPending       = 64
 	darwinPasses        = 4
+	darwinReadAttempts  = 4 // per empty-changelist read; at most 16 read calls per cycle
 )
 
 type darwinNode struct {
@@ -180,6 +182,10 @@ func (b *darwinWatch) register(path string, info os.FileInfo) error {
 		syscall.SetKevent(&change, int(f.Fd()), syscall.EVFILT_VNODE, syscall.EV_ADD|syscall.EV_CLEAR)
 		change.Fflags = syscall.NOTE_WRITE | syscall.NOTE_EXTEND | syscall.NOTE_ATTRIB | syscall.NOTE_LINK | syscall.NOTE_RENAME | syscall.NOTE_DELETE | syscall.NOTE_REVOKE
 		_, err = b.kevent(b.kq, []syscall.Kevent_t{change}, nil, &syscall.Timespec{})
+		// A failed changelist has no rollback guarantee. Never retry registration.
+		if err != nil {
+			err = fmt.Errorf("darwin kevent registration: %w", err)
+		}
 	}
 	if err != nil {
 		return errors.Join(err, f.Close())
@@ -292,6 +298,30 @@ func (b *darwinWatch) maintenance(ctx context.Context) error {
 	b.maintain = false
 	return b.sameRoot()
 }
+
+// Darwin kevent(2): EINTR precedes returned events. Retry only reads with no
+// changelist; never re-arm EV_CLEAR registrations or extend the caller deadline.
+func (b *darwinWatch) readEvents(ctx context.Context, events []syscall.Kevent_t) (int, error) {
+	for attempt := 0; attempt < darwinReadAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		n, err := b.kevent(b.kq, nil, events, &syscall.Timespec{})
+		if e := ctx.Err(); e != nil {
+			return 0, fmt.Errorf("darwin kevent read canceled: %w", errors.Join(e, err))
+		}
+		if err != syscall.EINTR {
+			if err != nil {
+				err = fmt.Errorf("darwin kevent read: %w", err)
+			}
+			return n, err
+		}
+		if n > 0 {
+			return 0, fmt.Errorf("darwin kevent read with interrupted output: %w", errors.Join(ErrWatchStale, err))
+		}
+	}
+	return 0, fmt.Errorf("darwin kevent read interruption budget: %w", errors.Join(ErrWatchLimit, syscall.EINTR))
+}
 func (b *darwinWatch) cycle(ctx context.Context) error {
 	if b.terminal != nil {
 		return b.terminal
@@ -308,7 +338,7 @@ func (b *darwinWatch) cycle(ctx context.Context) error {
 			}
 		}
 		events := make([]syscall.Kevent_t, b.pending+1)
-		n, err := b.kevent(b.kq, nil, events, &syscall.Timespec{})
+		n, err := b.readEvents(ctx, events)
 		if err != nil {
 			return b.loss(err)
 		} // no restart can silently restore coverage
