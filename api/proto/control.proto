@@ -1,0 +1,324 @@
+syntax = "proto3";
+
+// Canopy control-v1 wire contract. Protobuf is a transport encoding only;
+// it is never the canonical encoding used to compute native object IDs.
+// Compatibility: field numbers and wire types are permanent within v1. New
+// fields are additive; removed numbers and names must be reserved. A breaking
+// semantic or wire change requires a new package/API version. Unknown fields
+// may be ignored only when they do not affect authorization or identity.
+// Every mutating request MUST carry a nonempty idempotency_key. An
+// expected_policy_version and any applicable expected_base_generation or
+// expected_target_generation MUST be present; zero is a valid supplied value.
+// Protobuf optional presence is intentional and servers reject absence.
+package canopy.control.v1;
+
+option go_package = "canopy.local/canopy/api/gen/control/v1;controlv1";
+
+// Credentials MUST be supplied as authenticated transport metadata and MUST
+// NOT be represented in RequestContext or trusted principal claims in bodies.
+// RPC cancellation uses transport cancellation; the deadline is also explicit
+// so intermediaries can enforce it. Servers must not log credentials/deadlines.
+message RequestContext {
+  uint32 api_version = 1; // exactly 1
+  bytes request_id = 2;   // opaque caller correlation bytes
+  bytes repository_id = 3; // exactly 16 bytes
+  optional uint64 deadline_unix_nanos = 4;
+  uint32 max_work_units = 5;
+  uint64 max_response_bytes = 6;
+}
+
+// Every cursor is opaque and authenticated by the server. It MUST bind the
+// source revision, authorized view, policy version, selection and query mode;
+// cursors from another binding fail with FAILED_PRECONDITION. Limits are hard
+// work/byte/page bounds. Exhaustion returns RESOURCE_EXHAUSTED, never partial
+// approximate ancestry, merge-base, history or blame answers.
+
+message ResponseContext {
+  uint32 api_version = 1;
+  bytes request_id = 2;
+  bytes trace_id = 3;
+  Error error = 4; // absent on success; present on every failure
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  UNAUTHENTICATED = 1;
+  PERMISSION_DENIED = 2;
+  NOT_FOUND = 3; // use consistent non-enumeration policy
+  INVALID_ARGUMENT = 4;
+  CONFLICT = 5;
+  FAILED_PRECONDITION = 6;
+  RESOURCE_EXHAUSTED = 7;
+  UNAVAILABLE = 8;
+  DEADLINE_EXCEEDED = 9;
+  CORRUPT_DATA = 10;
+  UNKNOWN_WRITE_STATUS = 11; // outcome uncertain; never imply committed success
+}
+message Error {
+  ErrorCode code = 1;
+  bytes safe_message = 2; // opaque, redacted text; no hidden names or credentials
+  bool retryable = 3;
+  bytes operation_id = 4;
+}
+
+// Native v1 IDs are opaque 35-byte values with the canonical version/kind
+// prefix. Projected/view IDs below are separate opaque identities, never TIDs.
+message ChangesetId { bytes value = 1; } // value is exactly 35 bytes and kind 02
+message BlobId { bytes value = 1; } // value is exactly 35 bytes and kind 01
+message ProjectionId { bytes value = 1; }
+message PublicationId { bytes value = 1; }
+message FileOperation {
+  bytes path = 1; // raw relative path bytes; never Unicode-normalized
+  enum Tag {
+    DELETE = 0; // canonical operation tag 00
+    SET_REGULAR = 1; // canonical operation tag 01
+    SET_EXECUTABLE = 2; // canonical operation tag 02
+    SET_SYMLINK = 3; // canonical operation tag 03
+  }
+  optional Tag tag = 2; // distinguish omitted tag from canonical DELETE=00
+  optional BlobId target = 3; // required for SET; forbidden for DELETE
+}
+message AuthorMetadata {
+  bytes author_identity = 1; // declared object metadata, not authenticated principal
+  int64 author_unix_seconds = 2;
+  sint32 author_offset_minutes = 3;
+  optional bytes committer_identity = 4;
+  optional int64 committer_unix_seconds = 5;
+  optional sint32 committer_offset_minutes = 6;
+  bytes message = 7;
+  optional bytes declared_message_encoding = 8;
+}
+message CanonicalChangeset {
+  bytes repository_id = 1; // exactly 16 bytes
+  repeated ChangesetId ordered_parent_ids = 2; // preserve order; no sorting/dedup
+  AuthorMetadata author = 3;
+  repeated FileOperation operations = 4; // canonical byte-path ordering
+}
+message ProjectedChangeset {
+  ProjectionId projection_id = 1;
+  optional ChangesetId source_changeset_id = 2; // disclose only when independently authorized
+  optional uint32 visible_parent_count = 3;
+  repeated ProjectionId visible_parent_ids = 4;
+  optional bytes visible_message = 5;
+  optional bytes visible_author = 6;
+  repeated FileOperation visible_operations = 7;
+}
+
+message CreateChangesetRequest {
+  RequestContext context = 1;
+  repeated ChangesetId ordered_parent_ids = 2;
+  repeated FileOperation file_operations = 3;
+  AuthorMetadata author_metadata = 4;
+  bytes idempotency_key = 5; // mandatory, nonempty
+  optional uint64 expected_policy_version = 6; // presence required by v1; zero is valid
+  optional uint64 expected_base_generation = 7; // when a base alias participates; zero is valid
+}
+message CreateChangesetResponse {
+  ResponseContext context = 1;
+  ChangesetId changeset_id = 2;
+  PublicationId publication_id = 3;
+  // Detached creation never moves a ref.
+}
+message GetChangesetRequest { RequestContext context = 1; ChangesetId changeset_id = 2; }
+message GetChangesetResponse {
+  ResponseContext context = 1;
+  oneof authorized_representation {
+    bytes fully_authorized_canonical_bytes = 2; // complete canonical frame, after full object/field authorization
+    ProjectedChangeset projected = 3;
+  }
+}
+enum WriteOperationState {
+  WRITE_OPERATION_STATE_UNSPECIFIED = 0;
+  PENDING = 1;
+  COMMITTED = 2;
+  FAILED = 3;
+  OUTCOME_UNKNOWN = 4;
+}
+message GetOperationStatusRequest { RequestContext context = 1; bytes idempotency_key = 2; }
+message GetOperationStatusResponse {
+  ResponseContext context = 1;
+  WriteOperationState state = 2;
+  oneof result_identity {
+    ChangesetId changeset_id = 3;
+    PublicationId publication_id = 4;
+    bytes operation_id = 5;
+  }
+}
+message ApplyPathEditsRequest {
+  RequestContext context = 1;
+  ChangesetId base_changeset = 2;
+  repeated FileOperation file_operations = 3;
+  bytes idempotency_key = 4; // mandatory, nonempty
+  optional uint64 expected_policy_version = 5; // presence required by v1; zero is valid
+  optional uint64 expected_base_generation = 6; // presence required by v1; zero is valid
+}
+message ApplyPathEditsResponse { ResponseContext context = 1; ChangesetId changeset_id = 2; }
+
+service ChangesetService {
+  rpc CreateChangeset(CreateChangesetRequest) returns (CreateChangesetResponse);
+  rpc GetChangeset(GetChangesetRequest) returns (GetChangesetResponse);
+  rpc GetOperationStatus(GetOperationStatusRequest) returns (GetOperationStatusResponse);
+  rpc ApplyPathEdits(ApplyPathEditsRequest) returns (ApplyPathEditsResponse);
+}
+
+message RefValue { ChangesetId target = 1; uint64 generation = 2; }
+message GetRefRequest { RequestContext context = 1; bytes name = 2; }
+message GetRefResponse { ResponseContext context = 1; RefValue ref = 2; }
+message CompareAndSwapRefRequest {
+  RequestContext context = 1;
+  bytes name = 2;
+  oneof expected_state {
+    RefValue expected_ref = 3; // compare target AND generation
+    bool expect_absent = 4; // must be true for creation; false is invalid; presence is explicit
+  }
+  ChangesetId new_target = 5;
+  bytes idempotency_key = 6; // mandatory, nonempty
+  optional uint64 expected_policy_version = 7; // presence required by v1; zero is valid
+}
+message CompareAndSwapRefResponse { ResponseContext context = 1; uint64 new_generation = 2; }
+service RefService {
+  rpc GetRef(GetRefRequest) returns (GetRefResponse);
+  rpc CompareAndSwapRef(CompareAndSwapRefRequest) returns (CompareAndSwapRefResponse);
+}
+
+message ScopedGrant { bytes grant = 1; bytes scope = 2; uint64 expires_unix_nanos = 3; }
+message GetRootViewRequest {
+  RequestContext context = 1;
+  ChangesetId changeset_id = 2;
+  repeated bytes path_selection = 3;
+  optional uint64 expected_policy_version = 4; // presence required by v1; zero is valid
+  bytes view_selection_id = 5;
+}
+message GetRootViewResponse {
+  ResponseContext context = 1;
+  bytes authorized_manifest = 2; // opaque authorized manifest, no raw tree IDs
+  repeated ScopedGrant object_grants = 3; // exact scoped grants only
+}
+message IsAncestorRequest { RequestContext context = 1; ChangesetId ancestor = 2; ChangesetId descendant = 3; }
+message IsAncestorResponse { ResponseContext context = 1; bool is_ancestor = 2; uint64 work_units = 3; }
+message MergeBasesRequest { RequestContext context = 1; ChangesetId left = 2; ChangesetId right = 3; }
+message MergeBasesResponse { ResponseContext context = 1; repeated ChangesetId all_best_common_ancestors = 2; uint64 work_units = 3; }
+message DiffOptions {
+  bool include_binary_content = 1;
+  bool detect_renames = 2;
+  bool detect_copies = 3;
+  uint32 context_lines = 4;
+  uint32 max_hunks = 5;
+}
+message DiffRequest {
+  RequestContext context = 1; ChangesetId old_changeset = 2; ChangesetId new_changeset = 3;
+  repeated bytes paths = 4; DiffOptions options = 5; bytes cursor = 6;
+  optional uint64 expected_policy_version = 7; // presence required by v1; zero is valid
+  bytes view_selection_id = 8;
+}
+message DiffEntry {
+  bytes path = 1; bytes old_path = 2; FileOperation.Tag old_mode = 3; FileOperation.Tag new_mode = 4;
+  bytes old_bytes = 5; bytes new_bytes = 6; // exact bytes; never UTF-8 decode or normalize
+  bool binary = 7; bool has_final_newline = 8; // preserve binary and trailing-newline distinctions
+  repeated bytes hunks = 9; // each hunk is a bounded opaque unified-diff fragment
+  bool truncated = 10;
+}
+message DiffResponse { ResponseContext context = 1; repeated DiffEntry entries = 2; bytes next_cursor = 3; uint64 work_units = 4; }
+enum HistoryPolicy { HISTORY_POLICY_UNSPECIFIED = 0; FIRST_PARENT = 1; ALL_PARENTS = 2; }
+message PathHistoryRequest {
+  RequestContext context = 1; ChangesetId changeset_id = 2; bytes path = 3;
+  HistoryPolicy history_policy = 4; bytes cursor = 5;
+  optional uint64 expected_policy_version = 6; // presence required by v1; zero is valid
+  bytes view_selection_id = 7; uint32 max_entries = 8;
+}
+message HistoryEntry {
+  ChangesetId changeset_id = 1;
+  optional uint32 visible_parent_count = 2;
+  optional bytes visible_author = 3;
+  optional bytes visible_message = 4;
+  optional bytes path = 5;
+}
+message PathHistoryResponse { ResponseContext context = 1; repeated HistoryEntry entries = 2; bytes next_cursor = 3; uint64 work_units = 4; }
+enum BlamePolicy { BLAME_POLICY_UNSPECIFIED = 0; BLAME_FIRST_PARENT = 1; BLAME_ALL_PARENTS = 2; }
+message LineRange { uint64 start_line = 1; uint64 end_line_exclusive = 2; }
+message BlameRequest {
+  RequestContext context = 1; ChangesetId changeset_id = 2; bytes path = 3;
+  LineRange line_range = 4; BlamePolicy blame_policy = 5;
+  optional uint64 expected_policy_version = 6; // presence required by v1; zero is valid
+  bytes view_selection_id = 7; uint32 max_lines = 8;
+}
+message LineOrigin { uint64 line_number = 1; ChangesetId changeset_id = 2; optional bytes visible_author = 3; }
+message BlameResponse { ResponseContext context = 1; repeated LineOrigin line_origins = 2; BlamePolicy policy = 3; uint64 work_units = 4; }
+message FindCopiesRequest {
+  RequestContext context = 1; ChangesetId changeset_id = 2; bytes path = 3; uint32 candidate_budget = 4;
+  optional uint64 expected_policy_version = 5; // presence required by v1; zero is valid
+  bytes view_selection_id = 6;
+}
+message CopyCandidate { bytes path = 1; ChangesetId source_changeset = 2; }
+message FindCopiesResponse { ResponseContext context = 1; repeated CopyCandidate authorized_candidates = 2; uint64 work_units = 3; }
+service QueryService {
+  rpc GetRootView(GetRootViewRequest) returns (GetRootViewResponse);
+  rpc IsAncestor(IsAncestorRequest) returns (IsAncestorResponse);
+  rpc MergeBases(MergeBasesRequest) returns (MergeBasesResponse);
+  rpc Diff(DiffRequest) returns (DiffResponse);
+  rpc PathHistory(PathHistoryRequest) returns (PathHistoryResponse);
+  rpc Blame(BlameRequest) returns (BlameResponse);
+  rpc FindCopies(FindCopiesRequest) returns (FindCopiesResponse);
+}
+
+// Conflicts preserve exact byte inputs and path; unresolved conflicts remain
+// explicit and cannot be reported as a committed changeset.
+message Conflict { bytes path = 1; bytes kind = 2; bytes base = 3; bytes left = 4; bytes right = 5; }
+message Resolution { bytes path = 1; FileOperation operation = 2; }
+message MergeRequest {
+  RequestContext context = 1; ChangesetId left = 2; ChangesetId right = 3; bytes base_policy = 4;
+  repeated Resolution resolutions = 5; bytes idempotency_key = 6;
+  optional uint64 expected_policy_version = 7; // presence required by v1; zero is valid
+  optional uint64 expected_target_generation = 8; // when target is a ref; zero is valid
+}
+message MergeResponse { ResponseContext context = 1; bytes operation_id = 2; repeated Conflict conflicts = 3; optional ChangesetId changeset_id = 4; }
+message CherryPickRequest {
+  RequestContext context = 1; ChangesetId change = 2; ChangesetId target = 3; repeated Resolution resolutions = 4;
+  bytes idempotency_key = 5; optional uint64 expected_policy_version = 6; // presence required by v1; zero is valid
+  optional uint64 expected_target_generation = 7; // when target is a ref; zero is valid
+}
+message CherryPickResponse { ResponseContext context = 1; bytes operation_id = 2; repeated Conflict conflicts = 3; optional ChangesetId changeset_id = 4; }
+message RebaseRequest {
+  RequestContext context = 1; repeated ChangesetId ordered_changes = 2; ChangesetId target = 3;
+  repeated Resolution resolutions = 4; bytes idempotency_key = 5;
+  optional uint64 expected_policy_version = 6; // presence required by v1; zero is valid
+  optional uint64 expected_target_generation = 7; // when target is a ref; zero is valid
+}
+message RebaseMapEntry { ChangesetId old_changeset = 1; ChangesetId new_changeset = 2; }
+message RebaseResponse { ResponseContext context = 1; bytes operation_id = 2; repeated RebaseMapEntry old_to_new_map = 3; repeated Conflict conflicts = 4; }
+message RevertRequest {
+  RequestContext context = 1; ChangesetId change = 2; ChangesetId target = 3; uint32 mainline_parent = 4;
+  bytes idempotency_key = 5; optional uint64 expected_policy_version = 6; // presence required by v1; zero is valid
+  optional uint64 expected_target_generation = 7; // when target is a ref; zero is valid
+}
+message RevertResponse { ResponseContext context = 1; bytes operation_id = 2; repeated Conflict conflicts = 3; optional ChangesetId changeset_id = 4; }
+service EditService {
+  rpc Merge(MergeRequest) returns (MergeResponse);
+  rpc CherryPick(CherryPickRequest) returns (CherryPickResponse);
+  rpc Rebase(RebaseRequest) returns (RebaseResponse);
+  rpc Revert(RevertRequest) returns (RevertResponse);
+}
+
+message PolicyScope { bytes scope = 1; }
+message PolicyRule { bytes subject = 1; bytes resource_path = 2; bytes action = 3; bool allow = 4; }
+message GetPolicyRequest { RequestContext context = 1; PolicyScope authorized_policy_scope = 2; }
+message GetPolicyResponse { ResponseContext context = 1; uint64 policy_version = 2; repeated PolicyRule visible_rules = 3; }
+message PolicyRuleChange { PolicyRule rule = 1; bool delete = 2; }
+message UpdatePolicyRequest {
+  RequestContext context = 1; optional uint64 expected_policy_version = 2; // presence required by v1; zero is valid
+  repeated PolicyRuleChange rule_changes = 3; bytes idempotency_key = 4;
+}
+message UpdatePolicyResponse { ResponseContext context = 1; uint64 new_policy_version = 2; }
+message IssueObjectGrantsRequest {
+  RequestContext context = 1; bytes source_view = 2; repeated bytes requested_objects = 3; bytes audience = 4;
+  optional uint64 expected_policy_version = 5; // presence required by v1; zero is valid
+}
+message IssueObjectGrantsResponse { ResponseContext context = 1; repeated ScopedGrant scoped_expiring_grants = 2; }
+message PolicyFreshnessRequest { RequestContext context = 1; uint64 known_version = 2; }
+message PolicyFreshnessResponse { ResponseContext context = 1; uint64 current_version = 2; uint64 valid_until_unix_nanos = 3; }
+service IdentityPolicyService {
+  rpc GetPolicy(GetPolicyRequest) returns (GetPolicyResponse);
+  rpc UpdatePolicy(UpdatePolicyRequest) returns (UpdatePolicyResponse);
+  rpc IssueObjectGrants(IssueObjectGrantsRequest) returns (IssueObjectGrantsResponse);
+  rpc PolicyFreshness(PolicyFreshnessRequest) returns (PolicyFreshnessResponse);
+}
