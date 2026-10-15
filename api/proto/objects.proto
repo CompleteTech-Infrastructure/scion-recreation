@@ -1,0 +1,546 @@
+syntax = "proto3";
+
+package canopy.objects.v1;
+option go_package = "canopy.local/canopy/api/gen/objects/v1;objectsv1";
+
+// objects-v1 candidate protocol. No imports or serving implementation is implied.
+// Authenticated transport credentials establish principal/session; body fields
+// never establish identity. Every ObjectService method has identical shape and
+// semantics at authority, regional and node. Fetch topology is strictly
+// node -> regional -> authority; authority-mediated grant refresh is separate
+// control traffic and never permission to bypass a failed cache tier.
+//
+// Before lookup AND every response frame/chunk/cache hit/resume/snapshot delivery,
+// check transport identity, current policy/freshness, repository, exact scope,
+// path/visible reachability proof, view, recipient audience, session and expiry.
+// Raw changesets require full-object-read over every disclosed path, metadata
+// field and history edge. Otherwise use a separately identified projection via
+// its authorized query API; never disguise projected bytes as canonical bytes.
+// Denied, unknown-scope and nonexistent objects have the same public NOT_FOUND
+// shape, size class and lookup-independent behavior. Do not echo hidden paths,
+// counts, existence, raw roots or credentials in errors, traces or capabilities.
+// Local multi-user daemons require protected per-session credentials and private
+// caches; UID/PID text or possession of a socket/file handle is not authority.
+// Unknown enum values/versions, absent required messages/oneofs/optional fields,
+// duplicate singular wire fields and conflicting oneofs fail INVALID_ARGUMENT.
+// Missing/malformed authorization grants use normalized NOT_FOUND instead;
+// authentication failure is UNAUTHENTICATED. Capabilities needs authenticated
+// context only and returns no object/session existence information.
+// Unknown protobuf fields may be ignored only within wire/depth/count budgets;
+// they never confer rights. Canonical frames reject ALL unknown/trailing bytes.
+
+// All limits include protobuf field tags, lengths, nested messages, unknown
+// fields and grants. Wire means uncompressed protobuf bytes before gRPC's
+// five-byte record prefix; transport message compression is disabled. A call
+// additionally permits exactly five framing bytes per response/request record.
+// Enforce byte limits before decoding/allocation, nesting depth <=16, then field
+// bounds/counts and checked U64 arithmetic before content lookup or allocation.
+// Enum constants are normative; Capabilities reports these same constants.
+enum ProtocolLimit {
+  option allow_alias = true;
+  LIMIT_UNSPECIFIED = 0;
+  MAX_READ_REQUEST_BYTES = 2097152;       // 2 MiB, all read methods
+  MAX_UPLOAD_REQUEST_BYTES = 8388608;     // 8 MiB, includes chunk and auth
+  MAX_RESPONSE_MESSAGE_BYTES = 16777216; // 16 MiB, unary or stream frame
+  MIN_RESPONSE_MESSAGE_BYTES = 65536;
+  MAX_WHOLE_FRAME_BYTES = 67108886;       // 64 MiB payload PLUS 22-byte header
+  MAX_WHOLE_ENCODED_BYTES = 71303168;     // 68 MiB; RAW always available
+  MAX_STREAM_BYTES = 134217728;          // 128 MiB including ALL response frames
+  MAX_CHUNK_BYTES = 4194304;
+  MAX_WANTED_OBJECTS = 128;
+  MAX_STREAM_FRAMES = 8192;
+  MAX_METADATA_FRAME_BYTES = 16384;
+  STREAM_TERMINAL_RESERVE_BYTES = 2162688; // >=129 * 16384
+  MAX_GRANT_MESSAGE_BYTES = 8192;
+  MAX_GRANT_TOKEN_BYTES = 4096;
+  MAX_RESUME_TOKEN_BYTES = 4096;
+  MAX_AUDIENCE_BYTES = 256;
+  MAX_KEY_ID_BYTES = 64;
+  MAX_RANGE_CHUNKS = 64;
+  MAX_PROOF_BYTES = 65536;
+  MAX_PROOF_SIBLINGS = 64;
+  MAX_IN_FLIGHT = 8;
+  MAX_RETRY_BUDGET = 3;
+  MAX_DEADLINE_MILLIS = 30000;
+  MAX_EXPANSION_RATIO = 64;
+  MAX_DECODER_WINDOW_BYTES = 8388608;
+  MAX_UPLOAD_SESSION_MILLIS = 3600000;
+}
+
+// Canonical TID = U16BE(1), U8(kind), SHA-256(canonical header + payload).
+// Exactly 35 bytes. Only blob=1 and changeset=2 exist; unknown tree kinds fail.
+message TypedObjectId { bytes canonical_tid = 1; }
+message RepositoryId { bytes value = 1; } // exactly 16 bytes
+// Descriptive identity union, not an authorization object or raw fetch route.
+// object is a canonical TID; projection_id is exactly 32 opaque authority bytes.
+message ExactReadScope {
+  oneof scope {
+    TypedObjectId object = 1;
+    bytes projection_id = 2;
+  }
+}
+enum ObjectKind {
+  OBJECT_KIND_UNSPECIFIED = 0;
+  RAW_BLOB = 1;
+  RAW_CHANGESET = 2;
+}
+enum StorageCodec {
+  STORAGE_CODEC_UNSPECIFIED = 0;
+  CODEC_RAW = 1;
+  CODEC_GZIP = 2;
+}
+
+// Grant-bridge-v1 semantics, mirrored normatively:
+// - Token is opaque authority-issued authenticated state or authenticated capability, 1..4096 bytes. Clients do not create, reinterpret or widen it. A digest or integrity range plan is never authorization. A token issuer may use protected server state; no token signature/serialization algorithm is presumed frozen here.
+// - exact_scope_binding, effective_view_id and principal_session_binding are each exactly32 opaque authority-issued bytes. repository_id is exactly16 raw bytes. audience is 1..256 exact bytes naming ONE recipient service instance/tier. All are exact-match authenticated claim mirrors, never unchecked client authority. policy_version and expires_unix_millis must be explicitly present; policy version0 is legal. Expiry is signed Unix UTC MILLISECONDS, positive and <=253402300799999. No nanos bridge, floating point, rounding or unit inference. Reject out-of-range, missing, expired or contradictory mirrors. Copy fields losslessly between the two local message types by matching field numbers/types; never reinterpret or reconstruct a grant from client hints.
+// - The protected authority-side scope binds principal and credential/session; repository; operation; exact allowed canonical object IDs or separately identified authorized projection IDs; current policy version and effective view; authorized source/path/selection/reachability proof; one audience; expiry; and for streaming/ranges the stream-session ID, exact permitted half-open logical-payload intervals and maximum aggregate bytes. These authenticated claims remain protected, not a permission to expose hidden path proof names/counts/raw roots. Requests are checked against all protected claims; possession of a digest, plan or random scope handle is insufficient.
+// - Range offset0 addresses logical blob payload, excluding canonical header. Every requested [offset,offset+length) must fit an authorized interval without overflow, with aggregate delivered logical bytes <= protected max. Replays/resumes count against the same stream budget; an authorized new range or budget needs authority reissue, never caller enlargement. GetRangePlan alone grants no data. Client request/session identifiers must bind to the authenticated stream/session stored by authority, not an arbitrary unstated local counter. Object author owns concrete bounded request matching fields and per-message limits.
+// - Stream-session identity for whole objects, chunks, resume, snapshots and ranges is a protected authority claim. Scope matching includes exact wanted objects and per-object selected ranges; renewal may preserve or narrow but never implicitly widen. Every hit/chunk/range/resume rechecks current authorization and freshness. Grant lifetime <=30000 milliseconds from authoritative issuance, all caches and open streams obey approved maximum30-second revocation target, clock uncertainty consumes that bound, uncertain freshness fails closed. Expiry is not a substitute for freshness/current policy validation. Refresh long transfers through authority.
+// - Each tier requires its own audience-bound token; authority mediates delegation/reissue without client bypass or cross-audience forwarding. Transport authentication principal/session must equal protected grant binding. Declared mirrors and token-internal claims must agree on every delivery. Expiry and policy mirrors cannot authorize stale snapshots.
+// - Malformed/missing/mismatched grants return a typed denial without revealing whether hidden objects, scopes, paths or raw metadata exist. Grant metadata does not identify hidden directory boundaries or paths. Concrete currentness/authorization enforcement belongs to later IAM/runtime tasks, not this schema acceptance.
+// Full serialized ObjectGrant <=8192 bytes including unknown fields.
+message ObjectGrant {
+  bytes opaque_authority_token = 1;
+  bytes exact_scope_binding = 2;
+  bytes audience = 3;
+  optional uint64 policy_version = 4;
+  bytes effective_view_id = 5;
+  optional int64 expires_unix_millis = 6;
+  bytes repository_id = 7;
+  bytes principal_session_binding = 8;
+}
+
+// Required on every request (including capabilities and upload); every bytes
+// field here is exactly32 except request_id (exactly16) and repository (16).
+// Stream ID is authority-issued before this call and matched to protected state;
+// batch_binding is an opaque authority binding of the exact ordered wanted list
+// or range/upload operation. Ordered selection means (TID,kind,full-payload
+// interval) tuples, not serialized WantedObject bytes: renewed grants, resume
+// tokens/actions, correlation IDs and caller limits are excluded from its stable
+// identity. The authority still validates those fields independently. Neither
+// binding is caller-created authority. Request ID is
+// correlation only and may change on retry. policy_version presence is required.
+// Zero for any limit means the advertised maximum; nonzero may only reduce it.
+// Out-of-range positive values are INVALID_ARGUMENT, not silently clamped.
+// max_response_bytes in [65536,16777216], deadline in [1,30000], retry in [1,3].
+// Retry budget is a maximum, not automatic retry permission; permanent denials
+// cannot be retried. At most8 in-flight calls per transport principal/session.
+message RequestContext {
+  RepositoryId repository_id = 1;
+  bytes effective_view_id = 2;
+  optional uint64 policy_version = 3;
+  uint32 max_response_bytes = 4;
+  uint32 requested_deadline_millis = 5;
+  uint32 retry_budget = 6;
+  uint32 api_version = 7; // exactly1
+  bytes request_id = 8;
+  bytes stream_session_id = 9;
+  bytes batch_binding = 10;
+}
+enum ErrorCode {
+  ERROR_UNSPECIFIED = 0;
+  UNAUTHENTICATED = 1;
+  PERMISSION_DENIED = 2;
+  NOT_FOUND = 3; // normalized hidden/missing/invalid-scope denial
+  INVALID_ARGUMENT = 4;
+  CONFLICT = 5;
+  FAILED_PRECONDITION = 6;
+  RESOURCE_EXHAUSTED = 7;
+  UNAVAILABLE = 8;
+  DEADLINE_EXCEEDED = 9;
+  CORRUPT_DATA = 10;
+}
+// No free-form error text/hidden detail. retry_after_millis 0..30000; nonzero
+// only for UNAVAILABLE/RESOURCE_EXHAUSTED. Errors never imply an upstream bypass.
+message Error { ErrorCode code = 1; uint32 retry_after_millis = 2; }
+message ResponseMetadata {
+  uint32 api_version = 1; // exactly1
+  bytes request_id = 2; // exactly16; echoes correlation, not credentials
+  bytes trace_id = 3; // exactly16; opaque, contains no source/hidden identity
+}
+
+// Header for one COMPLETE canonical object, followed by encoded byte chunks.
+// logical_frame_bytes includes the 22-byte header and <=67108886; canonical
+// changeset payload maximum stays67108864. Whole blobs above that frame cap
+// use blob ranges (payload <=2^40), never a changeset relabeled as blob.
+// RAW is mandatory and exactly the canonical frame; GZIP is optional, exactly
+// one member across all concatenated chunks, no trailing/concatenated members.
+// Full encoded representation <=71303168; window <=8MiB, expansion <=64:1.
+// If GZIP fails ratio/size limits use RAW, which fits every valid changeset.
+// A whole-object grant must cover [0,logical_frame_bytes-22) of that exact
+// canonical object payload; chunking never narrows the full-object-read decision.
+// Before start, server validates the entire durable frame and full TID. Receiver
+// incrementally decodes/hash-checks, then validates one full canonical frame,
+// declared sizes, kind, header, no trailing bytes and SHA256/TID before exposing
+// verified content or accepting a completion token. Chunk receipt alone is never
+// completion. Buffer/spool is bounded by declared size; streaming hash/decoder
+// state is bounded. Envelope is metadata, not itself a serialized upload format.
+// Serialized envelope metadata <=1024 bytes including unknown fields.
+message ObjectEnvelope {
+  uint32 envelope_version = 1; // exactly1
+  StorageCodec codec = 2;
+  ObjectKind object_kind = 3;
+  TypedObjectId object_id = 4;
+  uint64 logical_frame_bytes = 5;
+  bytes logical_sha256 = 6; // exactly32, entire canonical frame
+  uint64 encoded_bytes = 7;
+}
+enum ResumeAction {
+  RESUME_UNSPECIFIED = 0; // required when token absent: transfer from byte0
+  SKIP_VERIFIED = 1;
+  REDELIVER = 2;
+}
+message WantedObject {
+  TypedObjectId object_id = 1;
+  ObjectKind object_kind = 2; // must equal embedded TID kind
+  ObjectGrant grant = 3;
+  bytes resume_token = 4; // absent or1..4096 bytes; complete-object only
+  ResumeAction resume_action = 5;
+}
+
+// wanted length1..effective(max_objects) <=128; duplicate TIDs are invalid for
+// the entire request before lookup, even with different grants. No possession
+// list or inventory exchange. Ordered indices are stable and authority-bound.
+// max_stream_bytes covers sum of serialized GetObjectsResponse messages,
+// including start, chunk, terminal, final and any unknown fields; five framing
+// bytes per message are additional and bounded by8192 messages. Zero defaults
+// to128MiB, nonzero range[2162688,134217728]. max_concurrency zero defaults8,
+// nonzero1..8. Authorization ledger separately charges logical payload bytes
+// (canonical header excluded) across calls/replays; stream wire quota cannot
+// replace/widen that protected aggregate budget.
+message GetObjectsRequest {
+  RequestContext context = 1;
+  repeated WantedObject wanted = 2;
+  uint32 max_objects = 3;
+  uint32 max_stream_bytes = 4;
+  uint32 max_concurrency = 5;
+}
+message ObjectDelivery { ObjectEnvelope envelope = 1; }
+// Offsets are into the concatenated ENCODED representation, including canonical
+// header for RAW; first0, contiguous, strictly increasing, <=declared encoded
+// size. All chunks except final are C bytes; final1..C. C=min(4MiB,effective
+// response cap-16384). No interleaving across objects; no empty chunks.
+message ObjectChunk { uint64 encoded_offset = 1; bytes data = 2; }
+enum ObjectOutcomeCode {
+  OUTCOME_UNSPECIFIED = 0;
+  DELIVERED_VERIFIED = 1;
+  SKIPPED_VERIFIED = 2;
+  ITEM_ERROR = 3;
+}
+message ObjectOutcome {
+  ObjectOutcomeCode code = 1;
+  Error error = 2; // present iff ITEM_ERROR
+  bytes completed_object_resume_token = 3; // present iff successful;1..4096
+}
+message StreamComplete {
+  uint32 terminal_count = 1; // exactly wanted.length
+  uint32 completed_count = 2; // DELIVERED_VERIFIED + SKIPPED_VERIFIED, not errors
+  uint64 stream_bytes = 3; // includes this final message
+}
+
+// State machine: for index0..N-1 emit start, contiguous chunks, terminal OR a
+// lone error/skip terminal, then exactly one complete event. Each event has
+// sequence0..K-1; start/chunk/terminal item_index is its requested index; complete
+// item_index=N. Exactly one terminal per item on a normally terminated RPC;
+// complete only after all terminals, no events afterward. Successful terminal
+// follows full validation; no partial-object token. Start/chunk/success terminal
+// carry the exact current grant; denied errors omit it. All metadata-only frames
+// <=16384 bytes. Every frame <=effective response cap and whole stream <=quota.
+//
+// Admission reserves2162688 wire bytes and129 frame slots for terminals/final.
+// Before an item's start, reserve its encoded_bytes + (ceil(encoded_bytes/C)+1)
+// *16384 wire bytes, corresponding data frame slots, and remaining authorized
+// payload budget. If insufficient, emit RESOURCE_EXHAUSTED for that and ALL
+// remaining indices without content lookup (no budget-dependent existence leak).
+// This conservative reservation includes envelope/grant/metadata; unused bytes
+// may be released only at terminal. An oversized whole blob returns
+// FAILED_PRECONDITION (authorized callers can request blob ranges). Operational
+// item errors remain distinct from normalized hidden/missing NOT_FOUND.
+//
+// Completed tokens are protected authority state/capabilities bound to principal,
+// credential/session, repository, stream ID, ordered batch binding, item index,
+// exact TID/kind, envelope version, policy/view, audience and original completion.
+// Lifetime <=30s and cannot exceed grant/freshness expiry. Token expiry never
+// renews via replay. With valid token SKIP_VERIFIED emits only successful terminal
+// (caller MUST already retain fully verified bytes); REDELIVER transfers from0
+// and charges all bytes again. Invalid/stale/mismatched token -> that item's
+// FAILED_PRECONDITION, no implicit skip or restart. Current authorization is
+// required for skip as well as redelivery. Renew grants through authority only.
+//
+// Network disconnect, transport error or absent final event means incomplete
+// RPC, never inferred success. Preserve only locally verified complete objects
+// with complete successful terminal tokens; discard partial objects. Reconnect
+// same bound stream/list with new request ID and explicit per-item actions;
+// uncompleted items restart0. No byte-offset resume. Lost token => fresh transfer
+// from0 with current grant, charged again. Expired session/batch -> new authority
+// authorization; no automatic skip. Concurrent calls for the same stream are
+// CONFLICT; aggregate-byte reservations/debits are atomic small metadata state,
+// not a global ingestion sequencer. Delivery retries cannot reset that ledger.
+// At most8 active read stream sessions per principal/credential session, each
+// retaining <=2MiB metadata and <=128 completed-token records. Protected
+// aggregate read allowance per stream is finite and <=2^40 logical payload
+// bytes, including replay; each call additionally obeys its128MiB wire cap. Authority sets
+// absolute stream expiry <=1h from creation; renewal cannot extend it. Release
+// expired metadata/reservations; a grant cannot resurrect expired stream state.
+// An open RPC may obtain authority reissue to refresh its per-frame grant, only
+// for the same principal/session/list/view/policy/intervals and remaining ledger;
+// it cannot extend a completed token or convert reissue into an added byte budget.
+// If refresh fails, stop content and emit a normalized item error or terminate
+// transport without success. A new stream/budget requires fresh authorization.
+message GetObjectsResponse {
+  ResponseMetadata metadata = 1;
+  uint32 sequence = 2;
+  uint32 item_index = 3;
+  ObjectGrant grant = 4;
+  oneof event {
+    ObjectDelivery start = 5;
+    ObjectChunk chunk = 6;
+    ObjectOutcome terminal = 7;
+    StreamComplete complete = 8;
+  }
+}
+
+// Range plans commit to the complete raw blob payload, not to a self-asserted
+// checksum supplied by a range caller. Authority mints only after validating
+// the complete durable canonical blob frame against its full TID. The plan is
+// integrity metadata, never authorization. A valid exact-object grant and
+// current policy are independently checked for every requested chunk.
+//
+// Merkle construction (SHA-256, all lengths/counts unsigned big-endian):
+// leaf(i, chunk) = SHA256(ASCII("CANOPY\0BLOB-RANGE\0LEAF\0") || U64BE(i) ||
+//                         U32BE(len(chunk)) || chunk)
+// node(left,right) = SHA256(ASCII("CANOPY\0BLOB-RANGE\0NODE\0") || left || right)
+// Empty payload root = SHA256(ASCII("CANOPY\0BLOB-RANGE\0EMPTY\0") || U64BE(0)).
+// Pair adjacent leaves at each level; an unpaired last node is promoted
+// unchanged to the next level (never duplicated). One-leaf root is that leaf.
+// Chunk i is payload[i*chunk_size : min((i+1)*chunk_size,payload_size)].
+// Root binds payload_size, chunk_size, leaf_count and the full canonical blob
+// TID in the signed plan transcript below; verifier checks exact final chunk
+// length and index. Plan signing transcript is exactly:
+// ASCII("CANOPY\0BLOB-RANGE\0PLAN\0") || U16BE(plan_version=1) ||
+// TID[35] || U64BE(payload_size) || U32BE(chunk_size) || U64BE(leaf_count) ||
+// root[32] || U64BE(issued_unix_millis) || U64BE(expires_unix_millis) ||
+// U16BE(len(repository_id)) || repository_id[16] ||
+// U16BE(len(policy_version encoding)) || U64BE(policy_version) ||
+// U16BE(len(effective_view_id)) || effective_view_id ||
+// U16BE(len(audience)) || audience (1..256 exact recipient bytes).
+// Signature is Ed25519 over the transcript, 64 bytes. Trust keys are selected
+// from bounded local authority configuration by key_id; never from caller URLs.
+// The exact root, full TID, payload size, chunk geometry, expiry, repository,
+// policy, view and audience are signature-bound. Proof has <= 64 sibling hashes
+// and <= 64 KiB serialized. No client buffers the whole blob to verify a range.
+// Literal proof vector: payload bytes 61 62 63 ("abc"), chunk_size=2,
+// payload_size=3, leaf_count=2. Leaf 0 (index 0, bytes 61 62) is
+// e4dbf793a0cdf801ab28b5e1f685f441eb4a27ecec85b15e96639803f7c77c3a.
+// Leaf 1 (index 1, byte 63) is
+// 61c92be82c59d7b7575180eee5fda2031ebb7f35cc25ff8eb5540c52aff78ede.
+// Root is 8a9d5e3047e61143a3be8a1fd0e4626f02ba281dd38708e9aa8d42b8aa7e60a4.
+// Chunk 0 proof: sibling=leaf1, sibling_is_left=false. Chunk 1 proof:
+// sibling=leaf0, sibling_is_left=true. Mutating either byte, index, sibling
+// side, sibling hash, size, chunk size, count, or root must fail verification.
+// Siblings are ordered bottom-up; at a promoted odd last node consume no
+// sibling. At each non-promoted level direction must agree with index parity;
+// reject missing/extra siblings and require the computed root to equal the plan.
+// View is exactly 32 bytes, repository exactly 16, key selector 1..64 bytes.
+// Plan times are positive Unix UTC milliseconds <=253402300799999; lifetime
+// <=30000 ms. Signature validity alone establishes neither freshness nor access.
+// Full serialized plan <=4096 bytes including unknown fields.
+message BlobRangePlan {
+  uint32 plan_version = 1; // exactly1
+  TypedObjectId blob_tid = 2; // canonical kind01 only
+  uint64 raw_payload_bytes = 3; // <=2^40, header excluded
+  uint32 chunk_bytes = 4; //1..4194304
+  uint64 leaf_count = 5; // ceil(payload/chunk),0 for empty
+  bytes merkle_root = 6; // exactly32
+  uint64 issued_unix_millis = 7;
+  uint64 expires_unix_millis = 8;
+  RepositoryId repository_id = 9;
+  optional uint64 policy_version = 10; // required,0 legal
+  bytes effective_view_id = 11; // exactly32
+  bytes audience = 12; //1..256; exact recipient, not an enum
+  bytes authority_key_id = 13; //1..64, configured trust key only
+  bytes ed25519_signature = 14; // exactly64 over transcript, not authorization
+}
+// Range selector presence is required, including explicit offset0/length0.
+// Length0 only for empty blob, offset0, count0. Otherwise length>0, checked
+// offset+length<=payload<=2^40. Every selector must match protected stream scope
+// and be a subset of its permitted half-open interval, with remaining aggregate
+// logical-byte budget. Geometry cannot widen it: first*chunk_bytes == offset and
+// min((first+count)*chunk_bytes,payload) == offset+length. Nonaligned requests
+// fail FAILED_PRECONDITION without extra neighboring bytes. Replays charge again.
+message PayloadInterval {
+  optional uint64 offset = 1;
+  optional uint64 length = 2;
+}
+message GetRangePlanRequest {
+  RequestContext context = 1;
+  TypedObjectId blob_tid = 2;
+  ObjectGrant exact_object_grant = 3;
+  PayloadInterval requested_interval = 4;
+}
+message RangePlanResult { BlobRangePlan plan = 1; ObjectGrant grant = 2; }
+message GetRangePlanResponse {
+  ResponseMetadata metadata = 1;
+  oneof result { RangePlanResult value = 2; Error error = 3; }
+}
+message MerkleSibling { bytes hash = 1; bool sibling_is_left = 2; }
+// Full serialized chunk <=len(raw_payload_chunk)+65536+64, including all
+// proof/unknown fields. These limits hold even if a protobuf parser retains
+// unknown fields; reserialization must not evade the admission estimate.
+message VerifiedBlobChunk {
+  uint64 chunk_index = 1;
+  bytes raw_payload_chunk = 2;
+  repeated MerkleSibling proof = 3; // <=64, each hash32, proof wire<=65536
+}
+message GetObjectRangeRequest {
+  RequestContext context = 1;
+  TypedObjectId blob_tid = 2;
+  BlobRangePlan plan = 3;
+  ObjectGrant exact_object_grant = 4;
+  uint64 first_chunk_index = 5;
+  uint32 chunk_count = 6; //1..64, or0 for empty
+  PayloadInterval requested_interval = 7;
+}
+message ObjectRange {
+  TypedObjectId blob_tid = 1;
+  uint64 raw_payload_offset = 2;
+  uint64 raw_payload_total_bytes = 3;
+  repeated VerifiedBlobChunk chunks = 4;
+  ObjectGrant grant = 5;
+}
+// Unary, all-or-error. Before allocating payload/proofs reserve conservative
+// wire bound16384 + count*(plan.chunk_bytes+65536+64) <=effective response cap.
+// This includes envelope/metadata/grant/proofs/nested tags. If it cannot fit,
+// RESOURCE_EXHAUSTED, zero chunks; never silently truncate. In particular four
+// 4MiB chunks do not fit16MiB. Exact encoded message is checked again before send.
+// Chunks strictly increasing, exactly count; verify full plan signature from
+// trusted configuration plus every proof and geometry before exposing range.
+// Atomic reserve/debit of full requested length in protected stream ledger must
+// precede lookup; recheck authorization for EACH chunk. If authorization changes
+// mid-assembly, return only normalized error and release unexposed reservation.
+// No range resume token; retry entire interval with same ledger, current grant
+// and retry budget. Plan request issues integrity metadata, never new authority.
+message GetObjectRangeResponse {
+  ResponseMetadata metadata = 1;
+  oneof result { ObjectRange value = 2; Error error = 3; }
+}
+message CapabilitiesRequest { RequestContext context = 1; }
+message Capabilities {
+  repeated uint32 envelope_versions = 1; // [1], exactly one
+  repeated StorageCodec codecs = 2; // RAW mandatory, GZIP if implemented;1..2 unique values
+  repeated uint32 canonical_versions = 3; // [1]
+  repeated ProtocolLimit limits = 4; // each distinct nonzero value once, ascending
+  uint64 max_blob_payload_bytes = 5; //1099511627776 (2^40)
+  uint64 max_upload_frame_bytes = 6; //1099511627798 (2^40+22)
+}
+message CapabilitiesResponse {
+  ResponseMetadata metadata = 1;
+  oneof result { Capabilities value = 2; Error error = 3; }
+}
+// Request-level structural/limit failures before stream admission use gRPC
+// INVALID_ARGUMENT/RESOURCE_EXHAUSTED, unauthenticated -> UNAUTHENTICATED;
+// context-scope denial -> NOT_FOUND. Unary methods use typed Error result once
+// context can be safely admitted. Transport trailers carry api-version1,
+// request-id16 and trace-id16 (binary values) when no response can be decoded.
+// Midstream per-item failures use terminal.error; transport loss/cancellation
+// has no synthetic terminal/complete. gRPC OK requires valid final complete.
+// Unavailable/deadline are never successes. No free-form transport status details.
+service ObjectService {
+  rpc GetObjects(GetObjectsRequest) returns (stream GetObjectsResponse);
+  rpc GetRangePlan(GetRangePlanRequest) returns (GetRangePlanResponse);
+  rpc GetObjectRange(GetObjectRangeRequest) returns (GetObjectRangeResponse);
+  rpc Capabilities(CapabilitiesRequest) returns (CapabilitiesResponse);
+}
+
+// UploadService is registered ONLY at authority; caches MUST NOT register it.
+// Each call needs authenticated transport + current write grant and exact proof;
+// an upload ID is no bearer authority. Grant operation=upload binds object TID,
+// kind, repository, path/selection proof, codec/envelope/declared lengths,
+// idempotency key and authority-issued stream/session. Every chunk/retry/finish
+// rechecks policy/freshness/audience; expiry/uncertainty stops writes fail-closed.
+message UploadWriteScope { ObjectGrant grant = 1; }
+// Upload v1 grammar is ONLY RAW canonical frame bytes: concatenation of chunks
+// equals exactly C(kind,payload); no serialized ObjectEnvelope, chunk headers,
+// gzip members or transport prefixes in this byte stream. Select version1 and
+// CODEC_RAW explicitly; GZIP/unknown rejected before staging. Both declared sizes
+// equal full canonical frame length (header INCLUDED). Blob <=2^40+22, changeset
+// <=67108886. Header/payload validity remains canonical-v1, not this limit alone.
+// Chunk size is fixed4MiB except final (1..4MiB); offsets count these RAW bytes.
+// Thus at most262145 distinct chunks, all U64 additions checked. Staging capacity
+// is reserved before Begin acknowledgement; principal/session aggregate staging
+// <=2^40+22 bytes and <=8 active sessions. Admission may return RESOURCE_EXHAUSTED.
+message BeginUploadRequest {
+  RequestContext context = 1;
+  TypedObjectId object_id = 2;
+  ObjectKind object_kind = 3;
+  uint64 declared_canonical_frame_bytes = 4;
+  uint64 declared_encoded_bytes = 5;
+  UploadWriteScope write_scope = 6;
+  bytes idempotency_key = 7; //16..128 bytes
+  uint32 envelope_version = 8; // exactly1
+  StorageCodec codec = 9; // exactlyCODEC_RAW
+}
+message UploadSession {
+  bytes upload_id = 1; // exactly32 opaque authority-issued, bound to tuple above
+  uint64 max_frame_bytes = 2; // applicable kind's cap
+  uint32 max_chunk_bytes = 3; //4194304
+  uint64 accepted_offset = 4; // next durably staged RAW frame byte
+  int64 expires_unix_millis = 5; // positive UTC ms, creation+<=3600000
+}
+message BeginUploadResponse {
+  ResponseMetadata metadata = 1;
+  oneof result { UploadSession value = 2; Error error = 3; }
+}
+// Begin key + identical immutable tuple returns SAME session/offset/result even
+// after lost response. Different tuple with same key -> CONFLICT. Session expiry
+// is not grant expiry: renewable30s write grants required throughout up to1h.
+// No hidden growth: expire staging/results and reject expired IDs with normalized
+// FAILED_PRECONDITION, never implicitly begin a new upload or extend old expiry.
+message UploadChunksRequest {
+  RequestContext context = 1;
+  bytes upload_id = 2; // exactly32
+  uint64 expected_offset = 3;
+  bytes bounded_chunk = 4; // exact scheduled chunk length
+  UploadWriteScope write_scope = 5;
+}
+message UploadProgress { uint64 accepted_offset = 1; }
+// Append only at accepted_offset, acknowledge only after durable staging plus
+// durable progress record. Replay an entire previous scheduled chunk at its
+// original offset with byte-identical data -> current durable offset. Different
+// bytes, partial overlap, gap, unaligned offset or excess -> CONFLICT, no change.
+// Serialize updates per upload; timeout/UNAVAILABLE means outcome uncertain,
+// retry same tuple; never infer commit from sent bytes. No global writer lock.
+message UploadChunksResponse {
+  ResponseMetadata metadata = 1;
+  oneof result { UploadProgress value = 2; Error error = 3; }
+}
+message FinishUploadRequest {
+  RequestContext context = 1;
+  bytes upload_id = 2; // exactly32
+  bytes expected_logical_sha256 = 3; // exactly32, whole canonical frame
+  TypedObjectId expected_object_id = 4;
+  UploadWriteScope write_scope = 5;
+}
+message DurableObject {
+  TypedObjectId durable_object_id = 1;
+  uint64 durable_frame_bytes = 2;
+}
+// Finish requires all declared RAW bytes durably staged; otherwise
+// FAILED_PRECONDITION. Parse entire canonical frame (including all changeset
+// bounds/order/options), verify header length/kind, expected digest/TID, no
+// trailing data and current write authorization. Invalid/corrupt -> typed error,
+// no durable success. Verify existing same-TID bytes fully, never overwrite a
+// mismatching object. Success only after durable object AND durable idempotent
+// finish result; return exactly the same tuple on repeated Finish within session
+// retention, including timeout-after-commit. Changed expected tuple -> CONFLICT.
+// Unknown commit outcome -> UNAVAILABLE and repeat Finish; never false success.
+// This is durable object storage only, not changeset publication/ref mutation.
+message FinishUploadResponse {
+  ResponseMetadata metadata = 1;
+  oneof result { DurableObject value = 2; Error error = 3; }
+}
+service UploadService {
+  rpc BeginUpload(BeginUploadRequest) returns (BeginUploadResponse);
+  rpc UploadChunks(UploadChunksRequest) returns (UploadChunksResponse);
+  rpc FinishUpload(FinishUploadRequest) returns (FinishUploadResponse);
+}
