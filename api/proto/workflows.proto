@@ -1,0 +1,565 @@
+syntax = "proto3";
+
+package canopy.workflows.v1;
+
+import "api/proto/control.proto";
+
+option go_package = "canopy.local/canopy/api/gen/workflows/v1;workflowsv1";
+
+// workflows-v1: wire contracts, not an execution engine or a signature format.
+// control-v1 owns envelopes, canonical ChangesetId, PublicationId, ref CAS and
+// ErrorCode. grants-v1/security-v1 remain authoritative for authentication,
+// object delivery and freshness. These workflow IDs confer NO read/write rights.
+// Protobuf bytes are not canonical object bytes or attestation signing bytes.
+// Field numbers/types are permanent in v1; removed names/numbers must be
+// reserved. Breaking semantics require a new API/record version. Unknown
+// identity, policy, decision, stage or result values fail closed, never default.
+// Validate original wire before decoding loses duplicate singular/oneof tags;
+// reject unknown fields, wrong wire types, conflicting arms, malformed lengths,
+// overflow and nonminimal varints. No required oneof may be absent.
+//
+// Admission uses the accepted control RequestContext: API=1, repository[16],
+// request correlation[16], explicit deadline/work/response budgets. Enforce the
+// accepted grants-v1 2MiB request and 16MiB response maxima and tighter caller
+// limits before allocation; authorization metadata compression is disabled,
+// nesting depth <=16. All repeated fields are additionally bounded by
+// admitted work/bytes; never silently truncate an attestation or membership set.
+// Scheduling also admits finite per-principal/session outstanding-job, queue,
+// retry and retained-record quotas; work/authority failure cannot bypass them.
+// Every mutation requires a nonempty idempotency key (16..128 bytes) and present
+// expected_policy_version, INCLUDING 0. Same authenticated owner/key/immutable
+// request returns the retained result after fresh authorization; a different
+// payload is CONFLICT. An uncertain write is UNKNOWN_WRITE_STATUS, never success.
+// No retry can revive a revoked/stale decision or make a historical allow current.
+//
+// Authenticate using verified transport principal AND session before protected
+// lookup. Caller author/actor text and repository content cannot authenticate,
+// approve, attest, delegate or exempt checks. Responses and records disclose
+// source IDs, policy versions, actors, paths, evidence and relationships only
+// after independent field/history/metadata authorization. If a complete record
+// cannot be disclosed, return the same NOT_FOUND shape as hidden/missing; never
+// return a partial record with invented source/policy identity. Authorized UI
+// projections belong to the accepted projection contracts, not raw record IDs.
+// Every delivery, including cached/local results, obeys current security policy,
+// bounded freshness and owner ADR-007's maximum 30s revocation DESIGN target.
+// Unknown freshness is UNAVAILABLE, not a stale allow. No measured claim here.
+// Protected decision state binds authenticated principal/session and effective
+// security view as well as source/policy; body fields never select another
+// principal's view. These private bindings are not extra public policy data.
+
+// Distinct authority-issued, repository-scoped opaque namespaces. Each value is
+// nonempty and bounded by admission; clients never derive one ID from another,
+// parse tokens, or infer content identity from equality of these handles.
+message ChangeRequestId { bytes value = 1; }
+message PatchsetId { bytes value = 1; }
+message ApprovalId { bytes value = 1; }
+message ThreadId { bytes value = 1; }
+message JobId { bytes value = 1; }
+message ValidationId { bytes value = 1; }
+message LandingId { bytes value = 1; }
+message ArtifactId { bytes value = 1; }
+message DeploymentAuthorizationId { bytes value = 1; }
+message DeploymentId { bytes value = 1; }
+message WorkflowId { bytes value = 1; }
+message FailureId { bytes value = 1; }
+
+// Immutable source identity: repository plus canonical-v1 kind-02 ChangesetId
+// (exactly 35 bytes, prefix 000102). Never a ref name, publication, projection,
+// patchset, Git hash or artifact ID. Resolve/authorize in this repository.
+message SourceRevision {
+  bytes repository_id = 1; // exactly16, must equal outer/record repository
+  canopy.control.v1.ChangesetId changeset_id = 2;
+}
+// Exact immutable version of the repository policy evaluated, not a policy
+// document or a grant. Policy rules/hidden paths are never returned here.
+message PolicyIdentity {
+  bytes repository_id = 1; // exactly16, must equal the source repository
+  optional uint64 policy_version = 2; // REQUIRED; supplied 0 is valid
+}
+// Authority-resolved audit identity, server-produced ONLY; no request accepts
+// this as authentication. All fields require metadata visibility to disclose.
+message AuthenticatedActor {
+  enum Class {
+    CLASS_UNSPECIFIED = 0;
+    HUMAN = 1;
+    BUILD_JOB = 2;
+    MODEL_WORKER = 3;
+    SERVICE_ACCOUNT = 4;
+  }
+  bytes issuer = 1;
+  bytes subject = 2;
+  optional Class principal_class = 3;
+  bytes session_binding = 4; // protected opaque audit binding; not a credential
+}
+// Required on every stored record below; all members present/nonempty, version
+// exactly1. Timestamp is server UTC Unix milliseconds, not source metadata.
+message RecordMetadata {
+  optional uint32 format_version = 1;
+  bytes repository_id = 2;
+  AuthenticatedActor recorded_by = 3;
+  optional int64 recorded_unix_millis = 4;
+}
+message PatchsetIdentity {
+  ChangeRequestId change_request_id = 1;
+  PatchsetId patchset_id = 2;
+  optional uint64 ordinal = 3; // present, authority-issued; 0 is a valid first
+}
+// Patchsets are immutable. Add/rebase/base change creates a new identity; never
+// retarget the same PatchsetId. Declared changeset author is not recorded_by.
+message Patchset {
+  RecordMetadata metadata = 1;
+  PatchsetIdentity identity = 2;
+  SourceRevision source = 3;
+  SourceRevision base = 4;
+}
+// Reuse the EXACT PublicationId produced by ChangesetService.CreateChangeset.
+// This record describes durable detached publication; it neither creates a new
+// publication service nor moves any ref. Multiple external record identities
+// cannot replace or change the source's canonical ID.
+message PublicationRecord {
+  RecordMetadata metadata = 1;
+  canopy.control.v1.PublicationId publication_id = 2;
+  SourceRevision source = 3;
+  PolicyIdentity policy = 4;
+}
+
+// All four members required and compared to protected records. The reviewed
+// source is exactly the patchset source; target_base is the exact base for which
+// applicability was evaluated. Same visible diff/author/tree is insufficient.
+message ApprovalSubject {
+  PatchsetIdentity patchset = 1;
+  SourceRevision source = 2;
+  PolicyIdentity policy = 3;
+  SourceRevision target_base = 4;
+}
+enum ReviewDecision {
+  REVIEW_DECISION_UNSPECIFIED = 0;
+  APPROVE = 1;
+  REQUEST_CHANGES = 2;
+  ABSTAIN = 3;
+}
+message ApprovalRecord {
+  RecordMetadata metadata = 1;
+  ApprovalId approval_id = 2;
+  ApprovalSubject subject = 3;
+  optional ReviewDecision decision = 4;
+}
+// Requirements are authority-evaluated under exactly this policy; identifiers
+// name protected rules, not executable caller policy. Reviewer counts/expertise
+// and independence are policy choices, not hard-coded defaults in this schema.
+message ApprovalRequirement {
+  bytes requirement_id = 1;
+  optional uint32 independent_reviewers_required = 2;
+  repeated bytes required_expertise_ids = 3;
+}
+message ApprovalEvaluation {
+  ApprovalSubject subject = 1;
+  repeated ApprovalRequirement requirements = 2;
+  repeated ApprovalId applicable_decisions = 3;
+  // Explicit: an empty requirements/decision set does not imply approval.
+  optional bool satisfied = 4;
+  // Authorized policy-evaluation reasons, not an RPC failure: required when
+  // satisfied=false. No hidden rule text or expected/actual identity echo.
+  repeated RejectionReason reasons = 5;
+}
+
+// Typed workflow detail augments, NEVER replaces, control ErrorCode.
+// INVALID_INPUT -> INVALID_ARGUMENT; VERSION_CONFLICT/REF_CONFLICT -> CONFLICT;
+// STALE_* / *_REVOKED / REQUIRED_* / ARTIFACT_MISMATCH -> FAILED_PRECONDITION;
+// NOT_AVAILABLE -> NOT_FOUND; AUTHENTICATION_REQUIRED -> UNAUTHENTICATED;
+// ACTION_DENIED -> PERMISSION_DENIED (only when action existence is public);
+// BUDGET_EXHAUSTED -> RESOURCE_EXHAUSTED; AUTHORITY_UNAVAILABLE -> UNAVAILABLE;
+// DEADLINE_EXPIRED -> DEADLINE_EXCEEDED; INVALID_RECORD -> CORRUPT_DATA;
+// WRITE_STATUS_UNKNOWN -> UNKNOWN_WRITE_STATUS. Permanent denials not retryable.
+// Stale detail is visible only to a caller authorized for the evaluated binding;
+// otherwise NOT_AVAILABLE. No rejection echoes expected/actual hidden IDs,
+// policy contents, versions, counts, paths, artifacts or diagnostic evidence.
+enum RejectionReason {
+  REJECTION_REASON_UNSPECIFIED = 0;
+  INVALID_INPUT = 1;
+  VERSION_CONFLICT = 2;
+  REF_CONFLICT = 3;
+  STALE_PATCHSET = 4;
+  STALE_SOURCE = 5;
+  STALE_POLICY = 6;
+  STALE_BASE = 7;
+  STALE_APPROVAL = 8;
+  APPROVAL_REVOKED = 9;
+  STALE_VALIDATION = 10;
+  VALIDATION_REVOKED = 11;
+  REQUIRED_APPROVAL_MISSING = 12;
+  REQUIRED_VALIDATION_MISSING = 13;
+  ARTIFACT_MISMATCH = 14;
+  NOT_AVAILABLE = 15;
+  AUTHENTICATION_REQUIRED = 16;
+  ACTION_DENIED = 17;
+  BUDGET_EXHAUSTED = 18;
+  AUTHORITY_UNAVAILABLE = 19;
+  DEADLINE_EXPIRED = 20;
+  INVALID_RECORD = 21;
+  WRITE_STATUS_UNKNOWN = 22;
+  SOURCE_REVOKED = 23;
+}
+message WorkflowRejection { optional RejectionReason reason = 1; }
+// Every RPC response has outer control ResponseContext plus exactly one result
+// arm. Success: value present and context.error absent. Failure: rejection
+// present, context.error present with the mapping above, value absent. Never
+// embed a successful historical allow in a failed current evaluation.
+
+// Suite version is an opaque exact configuration/version identity, nonempty;
+// no mutable "latest" alias. No signature, token or artifact digest algorithm is
+// selected here. ArtifactId resolves protected immutable provenance and bytes.
+message SuiteIdentity { bytes suite_id = 1; bytes suite_version = 2; }
+enum ValidationStage {
+  VALIDATION_STAGE_UNSPECIFIED = 0;
+  PRE_LAND = 1;
+  POST_LAND = 2;
+  PRE_DEPLOY = 3;
+  DIAGNOSTIC = 4;
+}
+message ValidationSubject {
+  SourceRevision source = 1;
+  PolicyIdentity policy = 2;
+  SuiteIdentity suite = 3;
+  optional ValidationStage stage = 4;
+  // PRE_LAND requires patchset and target_base; source is the immutable FINAL
+  // candidate against that base, possibly different from reviewed source.
+  // POST_LAND/PRE_DEPLOY require landing_id, source=that landing's landed_source.
+  // DIAGNOSTIC cannot satisfy landing/deployment gates. No stage is inferred.
+  optional PatchsetIdentity patchset = 5;
+  optional SourceRevision target_base = 6;
+  optional LandingId landing_id = 7;
+}
+message ValidationJob {
+  RecordMetadata metadata = 1;
+  JobId job_id = 2;
+  ValidationSubject subject = 3;
+}
+enum ValidationResult {
+  VALIDATION_RESULT_UNSPECIFIED = 0;
+  PASSED = 1;
+  FAILED = 2;
+  CANCELLED = 3;
+  INCONCLUSIVE = 4;
+  SKIPPED = 5;
+}
+message ValidationRecord {
+  RecordMetadata metadata = 1;
+  ValidationId validation_id = 2;
+  JobId job_id = 3;
+  ValidationSubject subject = 4; // EXACT scheduled job subject; no client rewrite
+  repeated ArtifactId artifact_ids = 5; // exact tested/produced artifacts, no aliases
+  optional ValidationResult result = 6;
+  bytes evidence = 7; // bounded authorized reference/bytes; no credential/log dump
+}
+// Replaying an old test against a new source/base/policy/suite/stage/artifact
+// rejects, even when content or a ref name appears equal. CI_ATTEST capability
+// and the authenticated job/delegation must match protected scheduling state.
+// Only PASSED, current, non-revoked required validations satisfy a gate. A stored
+// result remains historical evidence after revocation; it never means current.
+
+message LandingMember {
+  PatchsetIdentity patchset = 1;
+  SourceRevision reviewed_source = 2;
+  repeated ApprovalId approval_ids = 3;
+}
+message RefExpectation {
+  bytes name = 1; // exact authorized ref name, nonempty
+  canopy.control.v1.RefValue expected_ref = 2; // BOTH target and generation present, incl0
+}
+message LandingRecord {
+  RecordMetadata metadata = 1;
+  LandingId landing_id = 2;
+  repeated LandingMember members = 3; // nonempty exact grouping, no implicit members
+  SourceRevision landed_source = 4; // exact combined result, never patchset alias
+  PolicyIdentity policy = 5;
+  RefExpectation previous_ref = 6;
+  optional uint64 new_generation = 7;
+  canopy.control.v1.PublicationId publication_id = 8;
+  repeated ValidationId pre_land_validation_ids = 9;
+}
+// LandChange checks current patchset/source/base/policy and independent approval
+// applicability; records exact members and the immutable candidate to be tested.
+// Required PRE_LAND tests must pass for that SAME final candidate/base/policy,
+// including combined-change interactions. No earlier per-member result can be
+// relabeled as a combined result. Bind member approvals to reviewed_source and
+// exact target base; policy decides requirements, never caller annotations.
+// Authority verifies candidate_source is exactly the result of these members
+// against the expected base, with no omitted/extra member or unreviewed edits;
+// caller-supplied membership is intent, not proof of this relationship.
+// Recheck revocation/current policy at mutation, publish durable candidate and
+// use control-v1's narrow target+generation CAS (including generation0). A stale
+// ref returns REF_CONFLICT, no landing record. Recompute/retest/reassess before
+// retry. No lock held through tests, repository lock or global ingestion order.
+// POST_LAND checks name landed_source; PRE_DEPLOY checks also bind exact artifact.
+
+message DeploymentAuthorization {
+  RecordMetadata metadata = 1;
+  DeploymentAuthorizationId authorization_id = 2;
+  SourceRevision source = 3;
+  PolicyIdentity policy = 4;
+  ArtifactId artifact_id = 5;
+  LandingId landing_id = 6;
+  repeated ValidationId validation_ids = 7;
+  bytes environment_id = 8; // exact configured deployment target, nonempty
+}
+// Deployment identity is distinct from authorization, artifact, source and
+// landing. An authorized execution adapter produces this historical record;
+// AuthorizeDeploy does NOT execute a deployment. No new deployment RPC/service
+// is invented. All links must equal the protected authorization/landing/test
+// records. No "current"/"tested" boolean permits bypassing those links.
+message DeploymentRecord {
+  RecordMetadata metadata = 1;
+  DeploymentId deployment_id = 2;
+  DeploymentAuthorizationId authorization_id = 3;
+  SourceRevision source = 4;
+  PolicyIdentity policy = 5;
+  ArtifactId artifact_id = 6;
+  LandingId landing_id = 7;
+  repeated ValidationId validation_ids = 8;
+  bytes environment_id = 9;
+}
+// AuthorizeDeploy resolves every validation, not a caller assertion of success:
+// exact landed source, policy, required suite versions/stages, artifact provenance
+// and environment must match; skipped/failed/missing/revoked outcomes deny.
+// Required POST_LAND and PRE_DEPLOY validations cover the exact landed revision
+// and deployed artifact; PRE_LAND alone is insufficient. Policy can require more.
+// DeploymentAuthorization is a recorded decision, not a bearer grant or durable
+// promise of current eligibility. Execution MUST reauthenticate and recheck
+// source/policy/approvals/tests/artifact/revocation at use; failure/uncertainty
+// denies. Historical DeploymentRecord does not assert a currently valid release.
+
+message ChangeRequest {
+  RecordMetadata metadata = 1;
+  ChangeRequestId change_request_id = 2;
+  optional uint64 version = 3;
+  bytes title = 4;
+  bytes description = 5;
+  Patchset current_patchset = 6;
+  repeated bytes related_work = 7; // bounded, authorized opaque references
+}
+message RangeAnchor {
+  SourceRevision source = 1;
+  bytes path = 2; // exact nonempty canonical raw path; no normalization
+  optional uint64 start_line = 3; // zero-based inclusive
+  optional uint64 end_line_exclusive = 4; // >start; both present
+}
+message ThreadRecord {
+  RecordMetadata metadata = 1;
+  ThreadId thread_id = 2;
+  PatchsetIdentity patchset = 3;
+  RangeAnchor range_anchor = 4;
+  bytes comment = 5;
+  optional uint64 version = 6;
+  optional bool resolved = 7; // explicit false differs from absence
+}
+
+// Original catalog ReviewService methods and responsibilities are preserved.
+// expected_version applies to the mutable CR/thread aggregate, NOT source ID.
+message CreateChangeRequestRequest {
+  canopy.control.v1.RequestContext context = 1;
+  SourceRevision source_changeset = 2;
+  bytes title = 3;
+  bytes description = 4;
+  bytes idempotency_key = 5;
+  optional uint64 expected_policy_version = 6;
+  SourceRevision base = 7;
+  repeated bytes related_work = 8;
+}
+message CreateChangeRequestResponse {
+  canopy.control.v1.ResponseContext context = 1;
+  oneof result { ChangeRequest value = 2; WorkflowRejection rejection = 3; }
+}
+message AddPatchsetRequest {
+  canopy.control.v1.RequestContext context = 1;
+  ChangeRequestId change_request_id = 2;
+  optional uint64 expected_version = 3;
+  SourceRevision source_changeset = 4;
+  bytes idempotency_key = 5;
+  optional uint64 expected_policy_version = 6;
+  SourceRevision base = 7;
+}
+message AddPatchsetResponse {
+  canopy.control.v1.ResponseContext context = 1;
+  oneof result { Patchset value = 2; WorkflowRejection rejection = 3; }
+}
+message GetChangeRequestRequest {
+  canopy.control.v1.RequestContext context = 1;
+  ChangeRequestId change_request_id = 2;
+}
+message GetChangeRequestResponse {
+  canopy.control.v1.ResponseContext context = 1;
+  oneof result { ChangeRequest value = 2; WorkflowRejection rejection = 3; }
+}
+message AddThreadRequest {
+  canopy.control.v1.RequestContext context = 1;
+  PatchsetIdentity patchset = 2;
+  RangeAnchor range_anchor = 3; // source MUST equal exact patchset source
+  bytes comment = 4;
+  bytes idempotency_key = 5;
+  optional uint64 expected_policy_version = 6;
+}
+message AddThreadResponse {
+  canopy.control.v1.ResponseContext context = 1;
+  oneof result { ThreadRecord value = 2; WorkflowRejection rejection = 3; }
+}
+message ResolveThreadRequest {
+  canopy.control.v1.RequestContext context = 1;
+  ThreadId thread_id = 2;
+  optional uint64 expected_version = 3;
+  optional bool resolution = 4;
+  bytes idempotency_key = 5;
+  optional uint64 expected_policy_version = 6;
+}
+message ResolveThreadResponse {
+  canopy.control.v1.ResponseContext context = 1;
+  oneof result { ThreadRecord value = 2; WorkflowRejection rejection = 3; }
+}
+message ReviewPatchsetRequest {
+  canopy.control.v1.RequestContext context = 1;
+  ApprovalSubject subject = 2;
+  optional ReviewDecision decision = 3;
+  bytes idempotency_key = 4;
+  optional uint64 expected_policy_version = 5; // equals subject.policy version
+}
+message ReviewPatchsetResponse {
+  canopy.control.v1.ResponseContext context = 1;
+  oneof result { ApprovalRecord value = 2; WorkflowRejection rejection = 3; }
+}
+message EvaluateApprovalPolicyRequest {
+  canopy.control.v1.RequestContext context = 1;
+  ApprovalSubject subject = 2; // includes catalog patchset_id and target_base
+}
+message EvaluateApprovalPolicyResponse {
+  canopy.control.v1.ResponseContext context = 1;
+  oneof result { ApprovalEvaluation value = 2; WorkflowRejection rejection = 3; }
+}
+message LandChangeRequest {
+  canopy.control.v1.RequestContext context = 1;
+  repeated LandingMember members = 2; // >=1; includes catalog patchset_id
+  RefExpectation target = 3; // expected_main_target AND generation
+  optional uint64 expected_policy_version = 4;
+  bytes idempotency_key = 5;
+  SourceRevision candidate_source = 6;
+  repeated ValidationId pre_land_validation_ids = 7;
+}
+message LandChangeResponse {
+  canopy.control.v1.ResponseContext context = 1;
+  oneof result { LandingRecord value = 2; WorkflowRejection rejection = 3; }
+}
+message GetLandingRecordRequest {
+  canopy.control.v1.RequestContext context = 1;
+  oneof selection {
+    ChangeRequestId change_request_id = 2;
+    SourceRevision changeset = 3;
+  }
+  // CR selection pins a snapshot before pagination. Never latest-offset paging.
+  bytes cursor = 4;
+  optional uint32 max_records = 5; // present, positive, within caller byte/work caps
+}
+message LandingRecords { repeated LandingRecord records = 1; bytes next_cursor = 2; }
+// Cursor opaque/authenticated, binds repo, selection, authorized view, policy,
+// snapshot and limits. Filter before pagination; never hidden counts/gaps.
+message GetLandingRecordResponse {
+  canopy.control.v1.ResponseContext context = 1;
+  oneof result { LandingRecords value = 2; WorkflowRejection rejection = 3; }
+}
+service ReviewService {
+  rpc CreateChangeRequest(CreateChangeRequestRequest) returns (CreateChangeRequestResponse);
+  rpc AddPatchset(AddPatchsetRequest) returns (AddPatchsetResponse);
+  rpc GetChangeRequest(GetChangeRequestRequest) returns (GetChangeRequestResponse);
+  rpc AddThread(AddThreadRequest) returns (AddThreadResponse);
+  rpc ResolveThread(ResolveThreadRequest) returns (ResolveThreadResponse);
+  rpc ReviewPatchset(ReviewPatchsetRequest) returns (ReviewPatchsetResponse);
+  rpc EvaluateApprovalPolicy(EvaluateApprovalPolicyRequest) returns (EvaluateApprovalPolicyResponse);
+  rpc LandChange(LandChangeRequest) returns (LandChangeResponse);
+  rpc GetLandingRecord(GetLandingRecordRequest) returns (GetLandingRecordResponse);
+}
+
+message ScheduleValidationRequest {
+  canopy.control.v1.RequestContext context = 1;
+  ValidationSubject subject = 2; // catalog source_revision, suite_id, policy_version
+  bytes idempotency_key = 3;
+  optional uint64 expected_policy_version = 4; // equals subject.policy version
+}
+message ScheduleValidationResponse {
+  canopy.control.v1.ResponseContext context = 1;
+  oneof result { ValidationJob value = 2; WorkflowRejection rejection = 3; }
+}
+message RecordValidationRequest {
+  canopy.control.v1.RequestContext context = 1;
+  JobId job_id = 2;
+  ValidationSubject subject = 3; // EXACT scheduled subject, all linkage compared
+  repeated ArtifactId artifact_ids = 4;
+  optional ValidationResult result = 5;
+  bytes evidence = 6;
+  bytes idempotency_key = 7;
+  optional uint64 expected_policy_version = 8; // equals subject.policy version
+}
+message RecordValidationResponse {
+  canopy.control.v1.ResponseContext context = 1;
+  oneof result { ValidationRecord value = 2; WorkflowRejection rejection = 3; }
+}
+message AuthorizeDeployRequest {
+  canopy.control.v1.RequestContext context = 1;
+  ArtifactId artifact_id = 2;
+  SourceRevision source_revision = 3;
+  optional uint64 expected_policy_version = 4;
+  repeated ValidationId validation_ids = 5;
+  bytes idempotency_key = 6;
+  LandingId landing_id = 7;
+  bytes environment_id = 8;
+}
+message AuthorizeDeployResponse {
+  canopy.control.v1.ResponseContext context = 1;
+  // value is allow for this exact binding at evaluation time; rejection is deny.
+  oneof result { DeploymentAuthorization value = 2; WorkflowRejection rejection = 3; }
+}
+message BisectRequest {
+  canopy.control.v1.RequestContext context = 1;
+  SourceRevision good = 2;
+  SourceRevision bad = 3;
+  SuiteIdentity test_policy = 4;
+  optional uint64 budget = 5; // finite admitted candidate/test work; presence required
+  bytes idempotency_key = 6;
+  optional uint64 expected_policy_version = 7;
+}
+message BisectProgress {
+  WorkflowId workflow_id = 1;
+  SourceRevision good = 2;
+  SourceRevision bad = 3;
+  PolicyIdentity policy = 4;
+  SuiteIdentity test_policy = 5;
+  optional uint64 consumed_work = 6;
+  // No answer on exhausted/inconclusive work; explicit pending differs from a
+  // tested result. Every tested candidate still requires a ValidationRecord.
+  oneof outcome { bool pending = 7; SourceRevision first_bad = 8; }
+}
+message BisectResponse {
+  canopy.control.v1.ResponseContext context = 1;
+  oneof result { BisectProgress value = 2; WorkflowRejection rejection = 3; }
+}
+message ProposeRemediationRequest {
+  canopy.control.v1.RequestContext context = 1;
+  FailureId failure_id = 2;
+  SourceRevision source_revision = 3;
+  bytes proposal = 4; // bounded untrusted proposal, not policy or approval
+  bytes idempotency_key = 5;
+  optional uint64 expected_policy_version = 6;
+}
+message RemediationProposal { ChangeRequestId change_request_id = 1; }
+message ProposeRemediationResponse {
+  canopy.control.v1.ResponseContext context = 1;
+  oneof result { RemediationProposal value = 2; WorkflowRejection rejection = 3; }
+}
+// Permissions remain those in the full catalog: ScheduleValidation write;
+// RecordValidation ci_attest; AuthorizeDeploy deploy; Bisect/ProposeRemediation
+// write. ReviewService likewise retains write/read/approve/land separation.
+// A fix proposal cannot self-approve, land or deploy through these RPCs.
+service CIService {
+  rpc ScheduleValidation(ScheduleValidationRequest) returns (ScheduleValidationResponse);
+  rpc RecordValidation(RecordValidationRequest) returns (RecordValidationResponse);
+  rpc AuthorizeDeploy(AuthorizeDeployRequest) returns (AuthorizeDeployResponse);
+  rpc Bisect(BisectRequest) returns (BisectResponse);
+  rpc ProposeRemediation(ProposeRemediationRequest) returns (ProposeRemediationResponse);
+}
