@@ -204,6 +204,12 @@ func (p *GitStream) readByte() (byte, error) {
 	}
 	b, err := p.r.ReadByte()
 	if err != nil {
+		// A blocked read may finish only after request cancellation. Keep the
+		// terminal classification consistent with successful reads and peek;
+		// EOF after cancellation is not evidence of source truncation.
+		if cancel := p.ctx.Err(); cancel != nil {
+			return 0, p.reject("cancelled", "input cancelled", cancel)
+		}
 		if err == io.EOF {
 			return 0, io.EOF
 		}
