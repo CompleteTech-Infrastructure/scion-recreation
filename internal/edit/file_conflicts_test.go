@@ -552,3 +552,37 @@ func TestCanonicalTreeTextMergeParityAndFailureIsolation(t *testing.T) {
 		if got, conflict, _, err := MergeCanonicalTreeTextFile(ctx,repo,selected,path,corrupt,blobs,budget); err == nil || got.Validate() == nil || conflict != nil { t.Fatal(got,conflict,err) }
 	}
 }
+
+func TestResolveFileEntriesRequiresExactCompleteConflictSet(t *testing.T) {
+	path := func(s string) model.Path { p, err := model.NewPath([]byte(s)); if err != nil { t.Fatal(err) }; return p }
+	a,b,c := fileFixture(t,model.SetRegular,"a"),fileFixture(t,model.SetExecutable,"b"),fileFixture(t,model.SetSymlink,"c")
+	entries := []FileMergeEntry{{path("A"),a,b,c},{path("a"),a,a,b},{path("\xff"),a,AbsentFile(),c}}
+	manual := fileFixture(t,model.SetRegular,"new\x00")
+	resolutions := []ResolvedFileEntry{{entries[0].Path,manual},{entries[2].Path,AbsentFile()}}
+	budget := FileMergeBudget{3,3,12} // Eight original bytes plus four manual bytes.
+	got, err := ResolveFileEntries(context.Background(),entries,resolutions,budget)
+	if err != nil || len(got) != 3 { t.Fatal(got,err) }
+	want := []ResolvedFileEntry{{entries[0].Path,manual},{entries[1].Path,b},{entries[2].Path,AbsentFile()}}
+	for i := range want { if got[i] != want[i] { t.Fatal(got,want) } }
+	// Result owns its slice; immutable values may safely be shared.
+	got[0] = ResolvedFileEntry{}
+	if resolutions[0].Version != manual || resolutions[0].Path != entries[0].Path { t.Fatal("resolution input mutated") }
+	for _, bad := range [][]ResolvedFileEntry{nil,resolutions[:1],{resolutions[0],resolutions[0]},{resolutions[1],resolutions[0]},{{entries[1].Path,manual},resolutions[1]},{{entries[0].Path,FileVersion{}},resolutions[1]}, {resolutions[0],resolutions[1],{entries[1].Path,b}}} {
+		if out, err := ResolveFileEntries(context.Background(),entries,bad,budget); err != ErrFileState || out != nil { t.Fatal(out,err) }
+	}
+	short := budget; short.Payload--
+	if out, err := ResolveFileEntries(context.Background(),entries,resolutions,short); err != ErrFileBudget || out != nil { t.Fatal(out,err) }
+	// Resolutions cannot override an automatic winner.
+	if out, err := ResolveFileEntries(context.Background(),entries[1:2],[]ResolvedFileEntry{{entries[1].Path,manual}},budget); err != ErrFileState || out != nil { t.Fatal(out,err) }
+	if out, err := ResolveFileEntries(context.Background(),entries[1:2],nil,budget); err != nil || len(out) != 1 || out[0].Version != b { t.Fatal(out,err) }
+	if out, err := ResolveFileEntries(context.Background(),nil,nil,FileMergeBudget{1,1,0}); err != nil || out != nil { t.Fatal(out,err) }
+	baseline := &preparationCancelContext{Context:context.Background()}
+	if out, err := ResolveFileEntries(baseline,entries,resolutions,budget); err != nil || len(out) != 3 { t.Fatal(out,err) }
+	// Exercise every observed checkpoint, including after manual and automatic
+	// results have been privately appended. These are test intentions, not runs.
+	for at := 1; at <= baseline.calls; at++ {
+		ctx := &preparationCancelContext{Context:context.Background(),cancelAt:at}
+		if out, err := ResolveFileEntries(ctx,entries,resolutions,budget); err != context.Canceled || out != nil { t.Fatal(at,out,err) }
+	}
+	if out, err := ResolveFileEntries(nil,entries,resolutions,budget); err != ErrFileState || out != nil { t.Fatal(out,err) }
+}

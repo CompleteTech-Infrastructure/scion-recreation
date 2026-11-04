@@ -570,3 +570,56 @@ func canonicalTreeFileSides(ctx context.Context, repository [16]byte, selected [
 	if err := ctx.Err(); err != nil { return bad(err) }
 	return sides, usage, nil
 }
+
+// ResolveFileEntries applies an explicitly complete set of exact-path manual
+// resolutions to MergeFileEntries' opaque independent-file conflicts. A valid
+// resolution may contain newly edited bytes or explicit absence; it need not
+// choose an existing side. Exactly one resolution is required per actual
+// conflict, in raw-path order, with no extras or duplicates. Automatic winners
+// are preserved rather than overridden. Missing/extra/mismatched resolutions
+// fail closed with ErrFileState; no unresolved or partial result escapes.
+//
+// FileMergeBudget admits the original three states AND every manual resolution
+// payload together. Entries/PathBytes bound the original batch; resolution paths
+// must exactly match its conflict subset, and at most Entries resolutions exist.
+// Repeated payloads count separately. This is private syntax/composition, not
+// evidence of user approval, source identity, base policy, permissions or complete
+// tree validity. Manual delete/file/directory interactions, canonical operation
+// preparation, durable publication and authorization remain caller obligations.
+func ResolveFileEntries(ctx context.Context, entries []FileMergeEntry, resolutions []ResolvedFileEntry, budget FileMergeBudget) ([]ResolvedFileEntry, error) {
+	if ctx == nil { return nil, ErrFileState }
+	if err := ctx.Err(); err != nil { return nil, err }
+	if len(resolutions) > len(entries) { return nil, ErrFileState }
+	resolved, conflicts, err := MergeFileEntries(ctx, entries, budget)
+	if err != nil { return nil, err }
+	if len(resolutions) != len(conflicts) { return nil, ErrFileState }
+	if len(conflicts) == 0 { return resolved, nil }
+	// Original input admission succeeded, so summing its lengths cannot exceed
+	// Payload. Reserve all explicit states before constructing any output.
+	remaining := budget.Payload
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil { return nil, err }
+		for _, v := range [3]FileVersion{entry.Base,entry.Left,entry.Right} { remaining -= uint64(len(v.content)) }
+	}
+	for i, resolution := range resolutions {
+		if err := ctx.Err(); err != nil { return nil, err }
+		if resolution.Path != conflicts[i].Path || resolution.Version.Validate() != nil { return nil, ErrFileState }
+		n := uint64(len(resolution.Version.content))
+		if n > remaining { return nil, ErrFileBudget }; remaining -= n
+	}
+	var out []ResolvedFileEntry
+	at := 0
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil { return nil, err }
+		if at < len(resolutions) && entry.Path == resolutions[at].Path {
+			out = append(out, resolutions[at]); at++
+			continue
+		}
+		version, conflict, err := MergeFileVersions(ctx, entry.Base, entry.Left, entry.Right, budget.Payload)
+		if err != nil { return nil, err }
+		if conflict != nil { return nil, ErrFileState }
+		out = append(out, ResolvedFileEntry{entry.Path,version})
+	}
+	if err := ctx.Err(); err != nil { return nil, err }
+	return out, nil
+}
