@@ -118,3 +118,43 @@ func TestCanonicalTextReplayCombinesTargetAndDeclaredDelta(t *testing.T) {
 		if got, conflict, _, err := PrepareCanonicalTextFileReplay(cancelled,repo,selected[1],selected[0],selected[2],path,sources,blobs,budget); err != context.Canceled || got.Operation != (model.Operation{}) || got.BlobFrame != nil || conflict != nil { t.Fatal(got,conflict,err) }
 	}
 }
+
+func TestCanonicalRootFileReplayHasExplicitEmptyBase(t *testing.T) {
+	ctx := context.Background(); repo := [16]byte{3}; path, _ := model.NewPath([]byte("a"))
+	ids, frames := canonicalMergeInputs(t,[3]string{"", "b\x00", "c\x00"})
+	blobs := map[model.BlobID][]byte{ids[0]:frames[0],ids[1]:frames[1],ids[2]:frames[2]}
+	makeSource := func(parents []model.ChangesetID, ops []model.Operation) derived.TreeSourceFrame {
+		v, err := model.NewChangeset(model.ChangesetInput{RepoID:repo,Parents:parents,Operations:ops}); if err != nil { t.Fatal(err) }
+		id, err := model.HashChangeset(ctx,v); if err != nil { t.Fatal(err) }
+		var frame bytes.Buffer; if err := model.EncodeChangeset(ctx,&frame,v); err != nil { t.Fatal(err) }
+		return derived.TreeSourceFrame{ID:id,Frame:frame.Bytes()}
+	}
+	emptyOp, _ := model.NewOperation(path,model.SetExecutable,&ids[0])
+	binaryOp, _ := model.NewOperation(path,model.SetRegular,&ids[1])
+	otherOp, _ := model.NewOperation(path,model.SetSymlink,&ids[2])
+	absent := makeSource(nil,nil)
+	empty := makeSource(nil,[]model.Operation{emptyOp})
+	binary := makeSource(nil,[]model.Operation{binaryOp})
+	other := makeSource(nil,[]model.Operation{otherOp})
+	child := makeSource([]model.ChangesetID{absent.ID},[]model.Operation{binaryOp})
+	sources := []derived.TreeSourceFrame{absent,empty,binary,other,child}
+	graph := derived.TreeObjectGraphBudget{Graph:derived.TreeGraphBudget{Visits:4096,PageBytes:4096*derived.MaxTreePageBytes,ContextBytes:64<<20},BlobBytes:1<<20}
+	step := derived.TreeCheckedWriteBudget{Parent:graph,Candidate:graph,Rewrite:derived.TreeChangesetBudget{Rewrite:derived.TreeRewriteBudget{Pages:4096,ReadBytes:4096*derived.MaxTreePageBytes,WriteBytes:4096*derived.MaxTreePageBytes},Operations:4096,InputBytes:model.MaxChangesetPayload}}
+	budget := TreeFileMergeBudget{Replay:derived.TreeReplayBudget{Sources:5,SourceBytes:1<<20,Pages:4096,PageBytes:4096*derived.MaxTreePageBytes,Step:step},Lookup:[3]derived.TreeLookupBudget{{Pages:4096,ReadBytes:4096*derived.MaxTreePageBytes},{Pages:4096,ReadBytes:4096*derived.MaxTreePageBytes},{Pages:4096,ReadBytes:4096*derived.MaxTreePageBytes}},Payload:4}
+	for _, tc := range []struct{change,target model.ChangesetID; want model.Operation; frame []byte}{{binary.ID,absent.ID,binaryOp,frames[1]},{binary.ID,binary.ID,binaryOp,frames[1]},{absent.ID,other.ID,otherOp,frames[2]},{empty.ID,absent.ID,emptyOp,frames[0]}} {
+		got, conflict, used, err := PrepareCanonicalRootFileReplay(ctx,repo,tc.change,tc.target,path,sources,blobs,budget)
+		if err != nil || conflict != nil || used.Replay.Sources != 5 || got.Operation != tc.want || !bytes.Equal(got.BlobFrame,tc.frame) { t.Fatal(got,conflict,used,err) }
+	}
+	got, conflict, _, err := PrepareCanonicalRootFileReplay(ctx,repo,binary.ID,other.ID,path,sources,blobs,budget)
+	if err != nil || conflict == nil || got.Operation != (model.Operation{}) || got.BlobFrame != nil || !conflict.Base.IsAbsent() || conflict.Left != fileFixture(t,model.SetSymlink,"c\x00") || conflict.Right != fileFixture(t,model.SetRegular,"b\x00") { t.Fatal(got,conflict,err) }
+	if got, conflict, _, err := PrepareCanonicalRootFileReplay(ctx,repo,child.ID,absent.ID,path,sources,blobs,budget); err != metadata.ErrFailedPrecondition || got.Operation != (model.Operation{}) || got.BlobFrame != nil || conflict != nil { t.Fatal(got,conflict,err) }
+	if got, conflict, _, err := PrepareCanonicalFileReplay(ctx,repo,binary.ID,model.ChangesetID{},absent.ID,path,sources,blobs,budget); err != ErrFileState || got.Operation != (model.Operation{}) || got.BlobFrame != nil || conflict != nil { t.Fatal("ordinary API inferred root",got,conflict,err) }
+	short := budget; short.Payload = 3
+	if got, conflict, _, err := PrepareCanonicalRootFileReplay(ctx,repo,binary.ID,other.ID,path,sources,blobs,short); err != ErrFileBudget || got.Operation != (model.Operation{}) || got.BlobFrame != nil || conflict != nil { t.Fatal(got,conflict,err) }
+	short.Payload = 0
+	if got, conflict, _, err := PrepareCanonicalRootFileReplay(ctx,repo,empty.ID,absent.ID,path,sources,blobs,short); err != nil || conflict != nil || got.Operation != emptyOp || len(got.BlobFrame) != 22 { t.Fatal(got,conflict,err) }
+	bad := append([]derived.TreeSourceFrame(nil),sources...); bad[4].Frame = append([]byte(nil),child.Frame...); bad[4].Frame[len(child.Frame)-1] ^= 1
+	if got, conflict, _, err := PrepareCanonicalRootFileReplay(ctx,repo,binary.ID,absent.ID,path,bad,blobs,budget); err == nil || got.Operation != (model.Operation{}) || got.BlobFrame != nil || conflict != nil { t.Fatal(got,conflict,err) }
+	cancelled,cancel := context.WithCancel(ctx); cancel()
+	if got, conflict, _, err := PrepareCanonicalRootFileReplay(cancelled,repo,binary.ID,absent.ID,path,sources,blobs,budget); err != context.Canceled || got.Operation != (model.Operation{}) || got.BlobFrame != nil || conflict != nil { t.Fatal(got,conflict,err) }
+}
