@@ -5,6 +5,8 @@ import (
 	"errors"
 	"reflect"
 	"testing"
+
+	"canopy.local/canopy/internal/model"
 )
 
 func TestDiffTextLiteralHunks(t *testing.T) {
@@ -83,4 +85,89 @@ func TestDiffTextExactOutputBudgetAndOwnership(t *testing.T) {
 	if string(got.Hunk)!=want { t.Fatal("output aliases inputs") }
 	budget.OutputBytes--
 	if got,err := DiffText(context.Background(),old,next,budget); !errors.Is(err,ErrDiffLimit) || got.Hunk!=nil { t.Fatal("one-byte output overflow accepted") }
+}
+
+func fileDiffOp(t *testing.T, path string, mode model.OperationTag, digestByte byte) model.Operation {
+	t.Helper()
+	p, err := model.NewPath([]byte(path))
+	if err != nil { t.Fatal(err) }
+	var digest [32]byte
+	digest[0] = digestByte
+	typed, _ := model.NewTypedID(model.BlobKind, digest)
+	id, _ := model.NewBlobID(typed)
+	op, err := model.NewOperation(p, mode, &id)
+	if err != nil { t.Fatal(err) }
+	return op
+}
+
+func TestFileEntryDiffAllSmallStates(t *testing.T) {
+	// For each of three independent paths: absent, regular blob1,
+	// executable blob1, or symlink blob2. Expected deltas come from states.
+	for oldCode := 0; oldCode < 64; oldCode++ {
+		for newCode := 0; newCode < 64; newCode++ {
+			var old, next []model.Operation
+			var want []FileDelta
+			for path, a, b := 0, oldCode, newCode; path < 3; path, a, b = path+1, a/4, b/4 {
+				x, y := a%4, b%4
+				name := string(byte('a'+path))
+				var before, after model.Operation
+				blob := func(state int) byte { if state == 3 { return 2 }; return 1 }
+				if x != 0 { before = fileDiffOp(t, name, model.OperationTag(x), blob(x)); old = append(old, before) }
+				if y != 0 { after = fileDiffOp(t, name, model.OperationTag(y), blob(y)); next = append(next, after) }
+				if x != y {
+					p, _ := model.NewPath([]byte(name))
+					want = append(want, FileDelta{Path: p, Before: before, After: after, BeforePresent: x != 0, AfterPresent: y != 0, ModeChanged: x != 0 && y != 0 && x != y, ContentChanged: x != 0 && y != 0 && blob(x) != blob(y)})
+				}
+			}
+			got, err := DiffFileEntries(context.Background(), old, next, FileDiffBudget{6, 6, 3})
+			if err != nil || len(got) != len(want) { t.Fatalf("%d/%d: %v %v", oldCode, newCode, got, err) }
+			for i := range want { if got[i] != want[i] { t.Fatalf("%d/%d delta%d", oldCode, newCode, i) } }
+		}
+	}
+}
+
+func TestFileEntryDiffContentAndRawPaths(t *testing.T) {
+	old := []model.Operation{fileDiffOp(t, "A", model.SetRegular, 1), fileDiffOp(t, "a", model.SetSymlink, 1), fileDiffOp(t, "\xff", model.SetRegular, 1)}
+	next := []model.Operation{fileDiffOp(t, "A", model.SetRegular, 2), fileDiffOp(t, "a", model.SetSymlink, 2), fileDiffOp(t, "\xff", model.SetExecutable, 1)}
+	got, err := DiffFileEntries(context.Background(), old, next, FileDiffBudget{6, 6, 3})
+	if err != nil || len(got) != 3 { t.Fatal(got, err) }
+	for i := 0; i < 3; i++ {
+		if got[i].Path != old[i].Path() || !got[i].BeforePresent || !got[i].AfterPresent || got[i].ContentChanged != (i < 2) || got[i].ModeChanged != (i == 2) { t.Fatal(i, got[i]) }
+	}
+	// Returned immutable values do not alias the caller's slice slots.
+	old[0], next[0] = model.Operation{}, model.Operation{}
+	if got[0].Before.Path().Validate() != nil || got[0].After.Path().Validate() != nil { t.Fatal("slice alias") }
+}
+
+type fileDiffCancelContext struct { context.Context; cancel context.CancelFunc; calls, at int }
+func (c *fileDiffCancelContext) Err() error {
+	c.calls++
+	if c.calls == c.at { c.cancel() }
+	return c.Context.Err()
+}
+
+func TestFileEntryDiffRejectsAndBudgets(t *testing.T) {
+	a, b := fileDiffOp(t, "a", model.SetRegular, 1), fileDiffOp(t, "b", model.SetRegular, 1)
+	deleted, _ := model.NewOperation(a.Path(), model.Delete, nil)
+	for _, bad := range [][]model.Operation{{{}}, {deleted}, {a, a}, {b, a}} {
+		for _, side := range []bool{false, true} {
+			old, next := bad, []model.Operation(nil)
+			if side { old, next = next, old }
+			if got, err := DiffFileEntries(context.Background(), old, next, FileDiffBudget{10, 100, 10}); got != nil || !errors.Is(err, ErrFileDiffInput) { t.Fatal(got, err) }
+		}
+	}
+	for _, budget := range []FileDiffBudget{{}, {1000001, 1, 1}, {1, 65<<20, 1}, {1, 1, 2}, {1, 100, 1}, {2, 1, 2}, {2, 2, 1}} {
+		if got, err := DiffFileEntries(context.Background(), []model.Operation{a}, []model.Operation{b}, budget); got != nil || !errors.Is(err, ErrFileDiffLimit) { t.Fatal(budget, got, err) }
+	}
+	if got, err := DiffFileEntries(context.Background(), []model.Operation{a}, []model.Operation{b}, FileDiffBudget{2, 2, 2}); err != nil || len(got) != 2 { t.Fatal(got, err) }
+	if got, err := DiffFileEntries(nil, nil, nil, FileDiffBudget{1, 1, 1}); got != nil || !errors.Is(err, ErrFileDiffInput) { t.Fatal(got, err) }
+	// Cancel before emission, after one delta, and at the final check.
+	for _, at := range []int{4, 5, 6} {
+		ctx, cancel := context.WithCancel(context.Background())
+		mid := &fileDiffCancelContext{Context: ctx, cancel: cancel, at: at}
+		got, err := DiffFileEntries(mid, []model.Operation{a}, []model.Operation{b}, FileDiffBudget{2, 2, 2})
+		cancel()
+		if got != nil || !errors.Is(err, context.Canceled) { t.Fatal(at, got, err) }
+		if got, err := DiffFileEntries(ctx, nil, nil, FileDiffBudget{1, 1, 1}); got != nil || !errors.Is(err, context.Canceled) { t.Fatal(got, err) }
+	}
 }
