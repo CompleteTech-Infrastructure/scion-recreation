@@ -6,8 +6,10 @@ import (
 	"reflect"
 	"testing"
 
+	"canopy.local/canopy/internal/derived"
 	"canopy.local/canopy/internal/model"
 	"canopy.local/canopy/internal/query"
+	storage "canopy.local/canopy/internal/storage/metadata"
 )
 
 func statusFile(t *testing.T, path string, tag model.OperationTag, data []byte) ObservedFile {
@@ -117,4 +119,55 @@ func TestStatusSnapshotRejectsAndCancelsWithoutPartialOutput(t *testing.T) {
 		if out,err:=CompareStatusSnapshot(ctx,binding,source,nil,files,statusBudget());err!=context.Canceled||out!=nil{t.Fatalf("stop %d: %v %v",stop,out,err)}
 	}
 	if !reflect.DeepEqual(files,saved){t.Fatal("input bytes mutated")}
+}
+
+func TestCanonicalStatusBindsBaseAndVerifiesCompleteDAG(t *testing.T) {
+	ctx:=context.Background();repo:=[16]byte{9}
+	files:=[]ObservedFile{statusFile(t,"a",model.SetRegular,[]byte("payload")),statusFile(t,"b",model.SetRegular,[]byte("payload"))}
+	rows:=statusBase(t,files);blob,_:=rows[0].Target()
+	var raw bytes.Buffer
+	if err:=model.EncodeBlob(ctx,&raw,7,bytes.NewReader([]byte("payload")));err!=nil{t.Fatal(err)}
+	blobs:=map[model.BlobID][]byte{blob:raw.Bytes()}
+	source:=func(input model.ChangesetInput) derived.TreeSourceFrame {
+		v,err:=model.NewChangeset(input);if err!=nil{t.Fatal(err)}
+		id,err:=model.HashChangeset(ctx,v);if err!=nil{t.Fatal(err)}
+		var frame bytes.Buffer;if err:=model.EncodeChangeset(ctx,&frame,v);err!=nil{t.Fatal(err)}
+		return derived.TreeSourceFrame{ID:id,Frame:frame.Bytes()}
+	}
+	root:=source(model.ChangesetInput{RepoID:repo,Operations:rows[:1]})
+	left:=source(model.ChangesetInput{RepoID:repo,Parents:[]model.ChangesetID{root.ID},Operations:rows[1:]})
+	del,err:=model.NewOperation(files[0].Path,model.Delete,nil);if err!=nil{t.Fatal(err)}
+	right:=source(model.ChangesetInput{RepoID:repo,Parents:[]model.ChangesetID{root.ID},Operations:[]model.Operation{del}})
+	merge:=source(model.ChangesetInput{RepoID:repo,Parents:[]model.ChangesetID{left.ID,right.ID}})
+	sources:=[]derived.TreeSourceFrame{root,left,right,merge}
+	graph:=derived.TreeGraphBudget{Visits:4096,PageBytes:4096*derived.MaxTreePageBytes,ContextBytes:64<<20}
+	objects:=derived.TreeObjectGraphBudget{Graph:graph,BlobBytes:1<<20}
+	step:=derived.TreeCheckedWriteBudget{Parent:objects,Candidate:objects,Rewrite:derived.TreeChangesetBudget{Rewrite:derived.TreeRewriteBudget{Pages:4096,ReadBytes:4096*derived.MaxTreePageBytes,WriteBytes:4096*derived.MaxTreePageBytes},Operations:4096,InputBytes:model.MaxChangesetPayload}}
+	budget:=CanonicalStatusBudget{Replay:derived.TreeReplayBudget{Sources:4,SourceBytes:model.MaxChangesetPayload+88,Pages:4096,PageBytes:4096*derived.MaxTreePageBytes,Step:step},Snapshot:derived.TreeEntriesBudget{Graph:graph,Entries:2,PathBytes:4},Compare:statusBudget()}
+	binding:=Manifest{Base:merge.ID,SparseVersion:1,SparseAll:true,State:Uncertain}
+	observed:=[]ObservedFile{files[0],files[1],statusFile(t,"c",model.SetRegular,nil)};observed[1].Tag=model.SetExecutable
+	got,used,err:=CompareCanonicalStatus(ctx,repo,binding,sources,blobs,observed,budget)
+	want,err2:=CompareStatusSnapshot(ctx,binding,merge.ID,rows,observed,budget.Compare)
+	if err!=nil||err2!=nil||!reflect.DeepEqual(got,want)||len(got)!=2||used.Replay.Sources!=4||used.Snapshot.Visits==0{t.Fatal(got,used,err,err2)}
+	// Select a non-final source: right deleted a; parent one must not be
+	// unioned into merge's first-parent tree or ignored during verification.
+	binding.Base=right.ID
+	if out,_,err:=CompareCanonicalStatus(ctx,repo,binding,sources,blobs,files[:1],budget);err!=nil||len(out)!=1||out[0].BeforePresent{t.Fatal(out,err)}
+	binding.Base=left.ID
+	bad:=append([]derived.TreeSourceFrame(nil),sources...);bad[3].Frame=append([]byte(nil),merge.Frame...);bad[3].Frame[len(bad[3].Frame)-1]^=1
+	if out,_,err:=CompareCanonicalStatus(ctx,repo,binding,bad,blobs,files,budget);err==nil||out!=nil{t.Fatal("later corruption ignored")}
+	binding.Base=merge.ID
+	if out,_,err:=CompareCanonicalStatus(ctx,repo,binding,[]derived.TreeSourceFrame{root,left,merge},blobs,files,budget);err==nil||out!=nil{t.Fatal("missing second parent ignored")}
+	if out,_,err:=CompareCanonicalStatus(ctx,[16]byte{10},binding,sources,blobs,files,budget);err==nil||out!=nil{t.Fatal("wrong repository")}
+	if out,_,err:=CompareCanonicalStatus(ctx,repo,binding,sources,nil,files,budget);err==nil||out!=nil{t.Fatal("missing canonical blob")}
+	binding.Base=testChangeset(t,"missing-status-base")
+	if out,usage,err:=CompareCanonicalStatus(ctx,repo,binding,sources,blobs,files,budget);err!=storage.ErrNotFound||out!=nil||usage.Replay.Sources!=4{t.Fatal(out,usage,err)}
+	binding.Base=merge.ID;short:=budget;short.Snapshot.PathBytes=3
+	if out,_,err:=CompareCanonicalStatus(ctx,repo,binding,sources,blobs,files,short);err==nil||out!=nil{t.Fatal("enumeration budget ignored")}
+	short=budget;short.Compare.Entries=3;short.Compare.Changes=3
+	if out,usage,err:=CompareCanonicalStatus(ctx,repo,binding,sources,blobs,files,short);err!=ErrStatusLimit||out!=nil||usage.Replay!=used.Replay||usage.Snapshot!=used.Snapshot{t.Fatal("combined row exhaustion must follow replay/enumeration",out,usage,err)}
+	probe:=&statusCancelContext{Context:ctx,stop:1000000}
+	if out,_,err:=CompareCanonicalStatus(probe,repo,binding,sources,blobs,observed,budget);err!=nil||len(out)!=2{t.Fatal(out,err)}
+	late:=&statusCancelContext{Context:ctx,stop:probe.calls}
+	if out,_,err:=CompareCanonicalStatus(late,repo,binding,sources,blobs,observed,budget);err!=context.Canceled||out!=nil{t.Fatal("late cancellation",out,err)}
 }
