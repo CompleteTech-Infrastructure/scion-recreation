@@ -411,3 +411,60 @@ func TestMergeFileEntriesSharedAdmissionAndLateCancellation(t *testing.T) {
 	if got, conflicts, err := MergeFileEntries(late, entries, FileMergeBudget{2,2,6}); err != context.Canceled || got != nil || conflicts != nil { t.Fatal(got, conflicts, err) }
 	if got, conflicts, err := MergeFileEntries(nil, entries, FileMergeBudget{2,2,6}); err != ErrFileState || got != nil || conflicts != nil { t.Fatal(got, conflicts, err) }
 }
+
+func TestCanonicalFileBatchParityAndSharedAdmission(t *testing.T) {
+	ids, frames := canonicalMergeInputs(t, [3]string{"x", "y", "z"})
+	var sides [3]CanonicalFileSide
+	for i := range sides { sides[i] = CanonicalFileSide{true, model.SetRegular, ids[i], frames[i]} }
+	a, _ := model.NewPath([]byte("a")); b, _ := model.NewPath([]byte("\xff"))
+	entries := []CanonicalFileMergeEntry{{a,sides},{b,sides}}
+	budget := FileMergeBudget{2,2,6}
+	out, conflicts, err := MergeCanonicalFileEntries(context.Background(), entries, budget)
+	if err != nil || out != nil || len(conflicts) != 2 { t.Fatal(out, conflicts, err) }
+	_, want, err := MergeCanonicalFileVersions(context.Background(), sides, 3)
+	if err != nil || want == nil { t.Fatal(want, err) }
+	for i, conflict := range conflicts { if conflict.Path != entries[i].Path || conflict.Sides != *want { t.Fatal(conflict) } }
+	entries[0].Sides[2] = sides[1]; entries[1].Sides[1] = sides[0]
+	out, conflicts, err = MergeCanonicalFileEntries(context.Background(), entries, budget)
+	if err != nil || conflicts != nil || len(out) != 2 { t.Fatal(out, conflicts, err) }
+	for i, entry := range entries {
+		want, conflict, err := MergeCanonicalFileVersions(context.Background(), entry.Sides, 3)
+		if err != nil || conflict != nil || out[i] != (ResolvedFileEntry{entry.Path,want}) { t.Fatal(out, conflict, err) }
+	}
+	for _, bad := range []FileMergeBudget{{1,2,6},{2,1,6},{2,2,5},{},{4097,2,6},{2,65<<20,6},{2,2,65<<20}} {
+		if out, conflicts, err := MergeCanonicalFileEntries(context.Background(), entries, bad); err != ErrFileBudget || out != nil || conflicts != nil { t.Fatal(out, conflicts, err) }
+	}
+	// A later corrupt frame must suppress even an earlier valid conflict.
+	entries[0].Sides = sides
+	for side := range sides {
+		bad := append([]CanonicalFileMergeEntry(nil), entries...)
+		bad[1].Sides = sides
+		bad[1].Sides[side].Frame = append([]byte(nil), frames[side]...)
+		bad[1].Sides[side].Frame[len(frames[side])-1] ^= 1
+		if out, conflicts, err := MergeCanonicalFileEntries(context.Background(), bad, budget); err == nil || out != nil || conflicts != nil { t.Fatal(out, conflicts, err) }
+	}
+}
+
+func TestCanonicalFileBatchEmptyInvalidAndCancellation(t *testing.T) {
+	a, _ := model.NewPath([]byte("a")); b, _ := model.NewPath([]byte("b"))
+	ids, frames := canonicalMergeInputs(t, [3]string{"", "", ""})
+	empty := CanonicalFileSide{true,model.SetExecutable,ids[0],frames[0]}
+	entries := []CanonicalFileMergeEntry{{a,[3]CanonicalFileSide{{},empty,empty}},{b,[3]CanonicalFileSide{}}}
+	budget := FileMergeBudget{2,2,0}
+	out, conflicts, err := MergeCanonicalFileEntries(context.Background(), entries, budget)
+	if err != nil || conflicts != nil || len(out) != 2 || out[0].Version.IsAbsent() || !out[1].Version.IsAbsent() { t.Fatal(out, conflicts, err) }
+	if out, conflicts, err := MergeCanonicalFileEntries(context.Background(), nil, budget); err != nil || out != nil || conflicts != nil { t.Fatal(out, conflicts, err) }
+	badSide := CanonicalFileSide{Frame: []byte{}}
+	for _, bad := range [][]CanonicalFileMergeEntry{{entries[0],entries[0]}, {entries[1],entries[0]}, {{model.Path{},[3]CanonicalFileSide{}}}, {{a,[3]CanonicalFileSide{badSide}}}, {{a,[3]CanonicalFileSide{{Present:true}}}}} {
+		if out, conflicts, err := MergeCanonicalFileEntries(context.Background(), bad, budget); err != ErrFileState || out != nil || conflicts != nil { t.Fatal(out, conflicts, err) }
+	}
+	if out, conflicts, err := MergeCanonicalFileEntries(nil, entries, budget); err != ErrFileState || out != nil || conflicts != nil { t.Fatal(out, conflicts, err) }
+	baseline := &preparationCancelContext{Context:context.Background()}
+	if _, _, err := MergeCanonicalFileEntries(baseline, entries, budget); err != nil { t.Fatal(err) }
+	// Every cancellation point, including after verified staging and final
+	// merge resolution, must suppress both result collections.
+	for at := 1; at <= baseline.calls; at++ {
+		ctx := &preparationCancelContext{Context:context.Background(),cancelAt:at}
+		if out, conflicts, err := MergeCanonicalFileEntries(ctx, entries, budget); err != context.Canceled || out != nil || conflicts != nil { t.Fatal(at, out, conflicts, err) }
+	}
+}
