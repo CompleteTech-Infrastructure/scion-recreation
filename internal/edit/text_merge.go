@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+
+	"canopy.local/canopy/internal/model"
 )
 
 var (
@@ -273,4 +275,38 @@ func MergeText(ctx context.Context, base, left, right []byte, budget ThreeWayTex
 	rh, err := diff(r, right)
 	if err != nil { return nil, nil, err }
 	return MergeTextHunks(ctx, base, lh, rh, TextMergeBudget{Bytes: budget.Bytes, Hunks: budget.Hunks})
+}
+
+// MergeCanonicalText verifies three complete canonical blob frames before
+// merging their payloads. IDs and frames are ordered base, left, right. All
+// frames are verified even when IDs match. A digest is not an access grant:
+// callers must authorize the inputs, choose the correct base and classify text.
+// NUL rejection is only a guard, not comprehensive binary classification.
+//
+// All three blobs are present; absence, modes, trees, compression, remote fetch
+// and publication are outside this primitive. Bytes charges combined decoded
+// payloads and bounds merged output separately, excluding three 22-byte headers.
+// Private buffers prevent a late verification failure from exposing content.
+// These admission limits are not peak-memory ceilings. Frames must not mutate
+// during the call. Verification/errors return no output or conflict; a verified
+// overlap returns the same structured conflict as MergeText.
+func MergeCanonicalText(ctx context.Context, ids [3]model.BlobID, frames [3][]byte, budget ThreeWayTextBudget) ([]byte, *TextConflict, error) {
+	if ctx == nil { return nil, nil, ErrTextInput }
+	if err := ctx.Err(); err != nil { return nil, nil, err }
+	if budget.Bytes == 0 || budget.Bytes > 64<<20 || budget.Lines == 0 || budget.Lines > 1000000 || budget.Cells == 0 || budget.Cells > 4000000 || budget.Hunks == 0 || budget.Hunks > 1000000 {
+		return nil, nil, ErrTextLimit
+	}
+	remainingFrameBytes := budget.Bytes + 66
+	for _, frame := range frames {
+		if uint64(len(frame)) > remainingFrameBytes { return nil, nil, ErrTextLimit }
+		remainingFrameBytes -= uint64(len(frame))
+	}
+	remaining := budget.Bytes
+	var payloads [3]bytes.Buffer
+	for i, frame := range frames {
+		n, err := model.DecodeBlob(ctx, bytes.NewReader(frame), ids[i], &payloads[i], remaining)
+		if err != nil { return nil, nil, err }
+		remaining -= n
+	}
+	return MergeText(ctx, payloads[0].Bytes(), payloads[1].Bytes(), payloads[2].Bytes(), budget)
 }
