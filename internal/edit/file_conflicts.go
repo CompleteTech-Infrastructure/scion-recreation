@@ -113,3 +113,53 @@ func MergeFileVersions(ctx context.Context, base, left, right FileVersion, maxBy
 	}
 	return result, nil, nil
 }
+
+// MergeTextFileVersions composes file-state handling with bounded text merging.
+// Callers explicitly select this operation for text: NUL rejection is only a
+// guard, not a comprehensive classifier. Use MergeFileVersions for opaque binary
+// and symlink data. This is not authorization, base selection or publication.
+//
+// Identical/unchanged whole-file cases resolve first without parsing content.
+// Competing edits merge as text only when ALL three states are present regular
+// or executable files. Delete/modify, distinct additions and symlink/type cases
+// retain exact structured conflicts. Modes use ordinary three-way equality:
+// equal side modes win; otherwise the side different from base wins. An
+// unresolved mode or text overlap keeps all three exact FileConflict states.
+// Byte admission always applies; line/cell/hunk work limits are consumed only
+// when text analysis runs. Bytes is not a peak-memory ceiling. Byte admission
+// failures return ErrFileBudget; invalid text limits or exhausted text work
+// return ErrTextLimit. No result escapes on error.
+func MergeTextFileVersions(ctx context.Context, base, left, right FileVersion, budget ThreeWayTextBudget) (FileVersion, *FileConflict, error) {
+	if ctx == nil { return FileVersion{}, nil, ErrFileState }
+	if err := ctx.Err(); err != nil { return FileVersion{}, nil, err }
+	if budget.Bytes == 0 || budget.Bytes > 64<<20 || budget.Lines == 0 || budget.Lines > 1000000 || budget.Cells == 0 || budget.Cells > 4000000 || budget.Hunks == 0 || budget.Hunks > 1000000 {
+		return FileVersion{}, nil, ErrTextLimit
+	}
+	resolved, conflict, err := MergeFileVersions(ctx, base, left, right, budget.Bytes)
+	if err != nil || conflict == nil { return resolved, conflict, err }
+	for _, v := range []FileVersion{base, left, right} {
+		if v.state != 2 || (v.mode != model.SetRegular && v.mode != model.SetExecutable) {
+			return FileVersion{}, conflict, nil
+		}
+	}
+	var mode model.OperationTag
+	switch {
+	case left.mode == right.mode:
+		mode = left.mode
+	case left.mode == base.mode:
+		mode = right.mode
+	case right.mode == base.mode:
+		mode = left.mode
+	default:
+		return FileVersion{}, conflict, nil
+	}
+	// Combined byte admission already succeeded above. Conversions own local
+	// bounded copies; returned content is independently owned by PresentFile.
+	content, overlap, err := MergeText(ctx, []byte(base.content), []byte(left.content), []byte(right.content), budget)
+	if err != nil { return FileVersion{}, nil, err }
+	if overlap != nil { return FileVersion{}, conflict, nil }
+	resolved, err = PresentFile(mode, content)
+	if err != nil { return FileVersion{}, nil, err }
+	if err := ctx.Err(); err != nil { return FileVersion{}, nil, err }
+	return resolved, nil, nil
+}

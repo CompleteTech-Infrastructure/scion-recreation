@@ -118,3 +118,65 @@ func TestFileStatePresenceOwnershipAndBudgets(t *testing.T) {
 		t.Fatal("nil context accepted")
 	}
 }
+
+func TestTextFileMergeComposition(t *testing.T) {
+	regular := func(s string) FileVersion { return fileFixture(t, model.SetRegular, s) }
+	executable := func(s string) FileVersion { return fileFixture(t, model.SetExecutable, s) }
+	link := func(s string) FileVersion { return fileFixture(t, model.SetSymlink, s) }
+	base := regular("a\nb\n")
+	for _, tc := range []struct { name string; base, left, right, want FileVersion; conflict bool }{
+		{"disjoint-content", base, regular("A\nb\n"), regular("a\nB\n"), regular("A\nB\n"), false},
+		{"mode-and-content", base, executable("a\nb\n"), regular("A\nb\n"), executable("A\nb\n"), false},
+		{"same-mode-both-content", base, executable("A\nb\n"), executable("a\nB\n"), executable("A\nB\n"), false},
+		{"mode-revert-and-content", executable("a\nb\n"), regular("a\nb\n"), executable("A\nb\n"), regular("A\nb\n"), false},
+		{"empty-after-delete-lines", base, regular("b\n"), regular("a\n"), regular(""), false},
+		{"raw-newline", regular("\xff\r\nb"), regular("\xff\r\nB"), executable("\xff\r\nb"), executable("\xff\r\nB"), false},
+		{"identical", base, regular("x"), regular("x"), regular("x"), false},
+		{"delete-modify", base, AbsentFile(), regular("A\nb\n"), FileVersion{}, true},
+		{"distinct-additions", AbsentFile(), regular("a"), regular("b"), FileVersion{}, true},
+		{"symlink-content", link("a\nb\n"), link("A\nb\n"), link("a\nB\n"), FileVersion{}, true},
+		{"type-content", base, link("a\nb\n"), regular("A\nb\n"), FileVersion{}, true},
+		{"overlap", base, regular("A\nb\n"), regular("Z\nb\n"), FileVersion{}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, swap := range []bool{false, true} {
+				left, right := tc.left, tc.right
+				if swap { left, right = right, left }
+				got, conflict, err := MergeTextFileVersions(context.Background(), tc.base, left, right, ThreeWayTextBudget{1024, 100, 10000, 100})
+				if err != nil || got != tc.want || (conflict != nil) != tc.conflict { t.Fatal(got, conflict, err) }
+				if conflict != nil && *conflict != (FileConflict{tc.base, left, right}) { t.Fatal("conflict lost exact states") }
+			}
+		})
+	}
+}
+
+func TestTextFileMergeErrorsAndOpaqueFastPath(t *testing.T) {
+	base := fileFixture(t, model.SetRegular, "a\nb\n")
+	left := fileFixture(t, model.SetRegular, "A\nb\n")
+	right := fileFixture(t, model.SetRegular, "a\nB\n")
+	for _, tc := range []struct { budget ThreeWayTextBudget; want error }{
+		{ThreeWayTextBudget{}, ErrTextLimit}, {ThreeWayTextBudget{11, 6, 8, 2}, ErrFileBudget},
+		{ThreeWayTextBudget{12, 5, 8, 2}, ErrTextLimit}, {ThreeWayTextBudget{12, 6, 7, 2}, ErrTextLimit}, {ThreeWayTextBudget{12, 6, 8, 1}, ErrTextLimit},
+	} {
+		got, conflict, err := MergeTextFileVersions(context.Background(), base, left, right, tc.budget)
+		if got.Validate() == nil || conflict != nil || !errors.Is(err, tc.want) { t.Fatal(tc, got, conflict, err) }
+	}
+	// Fast paths still admit all bytes but do not consume text work budgets.
+	if got, conflict, err := MergeTextFileVersions(context.Background(), base, left, left, ThreeWayTextBudget{11, 1, 1, 1}); got.Validate() == nil || conflict != nil || !errors.Is(err, ErrFileBudget) { t.Fatal(got, conflict, err) }
+	if got, conflict, err := MergeTextFileVersions(context.Background(), base, left, left, ThreeWayTextBudget{12, 1, 1, 1}); err != nil || conflict != nil || got != left { t.Fatal(got, conflict, err) }
+	if got, conflict, err := MergeTextFileVersions(context.Background(), base, left, right, ThreeWayTextBudget{12, 6, 8, 2}); err != nil || conflict != nil || got != fileFixture(t, model.SetRegular, "A\nB\n") { t.Fatal(got, conflict, err) }
+	for _, tc := range []struct { ctx context.Context; base FileVersion; want error }{
+		{nil, base, ErrFileState}, {context.Background(), FileVersion{}, ErrFileState},
+	} {
+		got, conflict, err := MergeTextFileVersions(tc.ctx, tc.base, left, right, ThreeWayTextBudget{100, 100, 100, 100})
+		if got.Validate() == nil || conflict != nil || !errors.Is(err, tc.want) { t.Fatal(got, conflict, err) }
+	}
+	ctx, cancel := context.WithCancel(context.Background()); cancel()
+	if got, conflict, err := MergeTextFileVersions(ctx, base, left, right, ThreeWayTextBudget{100, 100, 100, 100}); got.Validate() == nil || conflict != nil || !errors.Is(err, context.Canceled) { t.Fatal(got, conflict, err) }
+	a := fileFixture(t, model.SetRegular, "\x00")
+	b := fileFixture(t, model.SetRegular, "\x00a")
+	c := fileFixture(t, model.SetRegular, "\x00b")
+	if got, conflict, err := MergeTextFileVersions(context.Background(), a, b, c, ThreeWayTextBudget{100, 100, 100, 100}); got.Validate() == nil || conflict != nil || !errors.Is(err, ErrTextInput) { t.Fatal(got, conflict, err) }
+	// Unchanged/identical whole-file fast paths never parse or normalize bytes.
+	if got, conflict, err := MergeTextFileVersions(context.Background(), a, b, b, ThreeWayTextBudget{100, 100, 100, 100}); err != nil || conflict != nil || got != b { t.Fatal(got, conflict, err) }
+}
