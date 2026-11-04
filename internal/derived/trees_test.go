@@ -860,3 +860,90 @@ func TestApplyTreeChangesetDeleteThenSetBudgetAtomicity(t *testing.T) {
 	if got, out, err := ApplyTreeChangeset(context.Background(), root, frames, change, budget); err != metadata.ErrResourceExhausted || got != (TreePageID{}) || out != nil { t.Fatal("failed SET exposed successful DELETE") }
 	if len(frames) != 1 || !bytes.Equal(frames[root], before) { t.Fatal("cross-phase failure mutated trusted base") }
 }
+
+func treeBindingIdentity(t *testing.T, change model.ChangesetInput) metadata.DerivedIdentity {
+	t.Helper()
+	value, err := model.NewChangeset(change)
+	if err != nil { t.Fatal(err) }
+	id, err := model.HashChangeset(context.Background(), value)
+	if err != nil { t.Fatal(err) }
+	return metadata.DerivedIdentity{Repository: change.RepoID, Changeset: id, Kind: "TREE", Version: 1}
+}
+
+func TestPrepareTreeWriteRootAndSourceBinding(t *testing.T) {
+	empty, root, err := EncodeTreePageAt(UnlinkedTreePage{}, nil, nil)
+	if err != nil { t.Fatal(err) }
+	frames := map[TreePageID][]byte{root: empty}
+	change := model.ChangesetInput{RepoID: [16]byte{1}}
+	identity := treeBindingIdentity(t, change)
+	budget := TreeChangesetBudget{TreeRewriteBudget{4096, 4096*MaxTreePageBytes, 4096*MaxTreePageBytes}, 4096, model.MaxChangesetPayload}
+	candidate, out, err := PrepareTreeWrite(context.Background(), identity, change, nil, frames, budget)
+	if err != nil || candidate.Validate() != nil || candidate.Result.Identity != identity || candidate.Parents != nil || out != nil { t.Fatalf("root candidate: %v", err) }
+	raw, _ := root.MarshalBinary()
+	if !bytes.Equal(candidate.Result.Value.Bytes(), raw) { t.Fatal("root was not the literal empty tree") }
+	bad := func(key metadata.DerivedIdentity, input model.ChangesetInput, parent *metadata.DerivedResult, limits TreeChangesetBudget, want error) {
+		t.Helper()
+		got, out, err := PrepareTreeWrite(context.Background(), key, input, parent, frames, limits)
+		if err != want || got.Result != (metadata.DerivedResult{}) || got.Parents != nil || out != nil { t.Fatalf("failed binding leaked candidate: %v, want %v", err, want) }
+	}
+	for _, key := range []metadata.DerivedIdentity{
+		{Repository: [16]byte{2}, Changeset: identity.Changeset, Kind: "TREE", Version: 1},
+		{Repository: identity.Repository, Changeset: identity.Changeset, Kind: "tree-index", Version: 1},
+		{Repository: identity.Repository, Changeset: identity.Changeset, Kind: "TREE", Version: 2},
+		{},
+	} { bad(key, change, nil, budget, metadata.ErrInvalidArgument) }
+	changed := change; changed.Message = []byte("changed")
+	bad(identity, changed, nil, budget, metadata.ErrCorruptData)
+	bad(identity, change, &candidate.Result, budget, metadata.ErrInvalidArgument)
+	size, err := model.ValidateChangeset(change)
+	if err != nil { t.Fatal(err) }
+	budget.InputBytes = size
+	if _, _, err := PrepareTreeWrite(context.Background(), identity, change, nil, frames, budget); err != nil { t.Fatal("exact source budget rejected") }
+	budget.InputBytes--
+	bad(identity, change, nil, budget, metadata.ErrResourceExhausted)
+	ctx, cancel := context.WithCancel(context.Background()); cancel()
+	if got, out, err := PrepareTreeWrite(ctx, identity, change, nil, frames, budget); err != context.Canceled || got.Result != (metadata.DerivedResult{}) || out != nil { t.Fatal("cancellation lost") }
+}
+
+func TestPrepareTreeWriteExactParentZeroAndPrivateDelta(t *testing.T) {
+	path, _ := model.NewPath([]byte("a"))
+	tid, _ := model.NewTypedID(model.BlobKind, [32]byte{1})
+	blob, _ := model.NewBlobID(tid)
+	root, frames, err := BuildSingleLeafTree(context.Background(), path, 1, blob, TreeBuildBudget{1, 60})
+	if err != nil { t.Fatal(err) }
+	before := append([]byte(nil), frames[root]...)
+	var ids []model.ChangesetID
+	for _, n := range []byte{1, 2} {
+		tid, _ := model.NewTypedID(model.ChangesetKind, [32]byte{n})
+		id, _ := model.NewChangesetID(tid); ids = append(ids, id)
+	}
+	op, _ := model.NewOperation(path, model.Delete, nil)
+	change := model.ChangesetInput{RepoID: [16]byte{1}, Parents: ids, Operations: []model.Operation{op}}
+	identity := treeBindingIdentity(t, change)
+	raw, _ := root.MarshalBinary(); value, _ := metadata.NewDerivedValueID(raw)
+	parent := metadata.DerivedResult{Identity: metadata.DerivedIdentity{Repository: change.RepoID, Changeset: ids[0], Kind: "TREE", Version: 1}, Value: value}
+	budget := TreeChangesetBudget{TreeRewriteBudget{1, 60, 24}, 1, model.MaxChangesetPayload}
+	candidate, out, err := PrepareTreeWrite(context.Background(), identity, change, &parent, frames, budget)
+	if err != nil || len(out) != 1 || len(candidate.Parents) != 1 || candidate.Parents[0] != parent { t.Fatalf("parent-zero computation: %v", err) }
+	_, emptyRoot, _ := EncodeTreePageAt(UnlinkedTreePage{}, nil, nil)
+	emptyRaw, _ := emptyRoot.MarshalBinary()
+	if !bytes.Equal(candidate.Result.Value.Bytes(), emptyRaw) { t.Fatal("DELETE did not compute empty root") }
+	// Only parent zero is a tree dependency; the second parent's identity is
+	// still covered by the canonical source hash but is not a union input.
+	second := parent; second.Identity.Changeset = ids[1]
+	wrongRepo := parent; wrongRepo.Identity.Repository[0]++
+	wrongKind := parent; wrongKind.Identity.Kind = "other"
+	wrongVersion := parent; wrongVersion.Identity.Version++
+	wrongValue := parent; wrongValue.Value = metadata.DerivedValueID{}
+	for _, p := range []*metadata.DerivedResult{nil, &second, &wrongRepo, &wrongKind, &wrongVersion, &wrongValue} {
+		want := metadata.ErrInvalidArgument
+		if p == nil { want = metadata.ErrFailedPrecondition }
+		got, out, err := PrepareTreeWrite(context.Background(), identity, change, p, frames, budget)
+		if err != want || got.Result != (metadata.DerivedResult{}) || got.Parents != nil || out != nil { t.Fatalf("parent substitution accepted: %v", err) }
+	}
+	budget.Rewrite.WriteBytes--
+	if got, out, err := PrepareTreeWrite(context.Background(), identity, change, &parent, frames, budget); err != metadata.ErrResourceExhausted || got.Result != (metadata.DerivedResult{}) || out != nil { t.Fatal("failed private delta exposed binding") }
+	parent.Identity.Version++
+	if candidate.Parents[0].Identity.Version != 1 { t.Fatal("candidate retained mutable parent pointer") }
+	if len(frames) != 1 || !bytes.Equal(frames[root], before) { t.Fatal("binding mutated caller graph") }
+}

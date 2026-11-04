@@ -899,3 +899,59 @@ func ApplyTreeChangeset(ctx context.Context, root TreePageID, frames map[TreePag
 	if len(view.staged) == 0 { return current, nil, nil }
 	return current, view.staged, nil
 }
+
+// PrepareTreeWrite binds private tree computation to the frozen TREE-v1 mapping
+// key and canonical source bytes. Only parent zero is a required tree input;
+// additional canonical parents establish ancestry, never a union of trees.
+// The parent record MUST come from an authoritative complete mapping, and frames
+// MUST represent its validated retained graph (or include the literal empty
+// root for a parentless source). Matching identities alone cannot prove that.
+//
+// The returned DerivedWrite is a PRIVATE candidate, not a completed stored
+// result. Publication, parent membership, blob/page durability and retention,
+// authorization, and PutDerived's atomic checks are still mandatory elsewhere.
+// No storage provider is fabricated or called here. Inputs must not be mutated
+// concurrently. InputBytes bounds canonical payload, not allocation/RSS or CPU;
+// validation and canonical hashing add bounded passes separate from page I/O.
+func PrepareTreeWrite(ctx context.Context, identity metadata.DerivedIdentity, change model.ChangesetInput, parent *metadata.DerivedResult, frames map[TreePageID][]byte, budget TreeChangesetBudget) (metadata.DerivedWrite, map[TreePageID][]byte, error) {
+	bad := func(err error) (metadata.DerivedWrite, map[TreePageID][]byte, error) { return metadata.DerivedWrite{}, nil, err }
+	b := budget.Rewrite
+	if ctx == nil || identity.Validate() != nil || identity.Kind != "TREE" || identity.Version != 1 ||
+		budget.Operations == 0 || budget.Operations > 4096 || budget.InputBytes == 0 || budget.InputBytes > model.MaxChangesetPayload ||
+		b.Pages == 0 || b.Pages > 4096 || b.ReadBytes == 0 || b.ReadBytes > 4096*MaxTreePageBytes || b.WriteBytes == 0 || b.WriteBytes > 4096*MaxTreePageBytes { return bad(metadata.ErrInvalidArgument) }
+	if err := ctx.Err(); err != nil { return bad(err) }
+	if change.RepoID != identity.Repository { return bad(metadata.ErrInvalidArgument) }
+	if uint64(len(change.Operations)) > budget.Operations || uint64(len(change.Message)) > budget.InputBytes { return bad(metadata.ErrResourceExhausted) }
+	size, err := model.ValidateChangeset(change)
+	if err != nil { return bad(metadata.ErrInvalidArgument) }
+	if size > budget.InputBytes { return bad(metadata.ErrResourceExhausted) }
+	value, err := model.NewChangeset(change)
+	if err != nil { return bad(metadata.ErrInvalidArgument) }
+	source, err := model.HashChangeset(ctx, value)
+	if err != nil { return bad(err) }
+	if source != identity.Changeset { return bad(metadata.ErrCorruptData) }
+	var root TreePageID
+	var parents []metadata.DerivedResult
+	if len(change.Parents) == 0 {
+		if parent != nil { return bad(metadata.ErrInvalidArgument) }
+		_, root, err = EncodeTreePageAt(UnlinkedTreePage{}, nil, nil)
+		if err != nil { return bad(err) }
+	} else {
+		if parent == nil { return bad(metadata.ErrFailedPrecondition) }
+		want := metadata.DerivedIdentity{Repository: identity.Repository, Changeset: change.Parents[0], Kind: "TREE", Version: 1}
+		if parent.Identity != want || parent.Value.Validate() != nil { return bad(metadata.ErrInvalidArgument) }
+		root, err = ParseTreePageID(parent.Value.Bytes())
+		if err != nil { return bad(metadata.ErrInvalidArgument) }
+		parents = []metadata.DerivedResult{*parent}
+	}
+	root, added, err := ApplyTreeChangeset(ctx, root, frames, change, budget)
+	if err != nil { return bad(err) }
+	raw, err := root.MarshalBinary()
+	if err != nil { return bad(err) }
+	resultID, err := metadata.NewDerivedValueID(raw)
+	if err != nil { return bad(err) }
+	candidate := metadata.DerivedWrite{Result: metadata.DerivedResult{Identity: identity, Value: resultID}, Parents: parents}
+	if err := candidate.Validate(); err != nil { return bad(err) }
+	if err := ctx.Err(); err != nil { return bad(err) }
+	return candidate, added, nil
+}
