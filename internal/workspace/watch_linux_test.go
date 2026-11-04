@@ -349,13 +349,15 @@ func TestLinuxNativeOpenArmsObservation(t *testing.T) {
 	w, err := OpenNativeWatch(root, meta, limits)
 	watchOK(t, err)
 	defer w.Close()
-	_, before, _ := w.Snapshot()
+	_, before, err := w.Snapshot()
+	watchOK(t, err)
 	watchFile(t, filepath.Join(root, "file"), "changed")
 	deadline := time.After(2 * time.Second)
 	tick := time.NewTicker(5 * time.Millisecond)
 	defer tick.Stop()
 	for {
-		m, after, _ := w.Snapshot()
+		m, after, err := w.Snapshot()
+		watchOK(t, err)
 		if after > before {
 			requirePathBytes(t, m.DirtyPaths, []byte("file"))
 			return
