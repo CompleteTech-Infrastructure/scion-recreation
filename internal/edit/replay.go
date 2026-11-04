@@ -33,7 +33,7 @@ func PrepareCanonicalFileReplay(ctx context.Context, repository [16]byte, change
 	var usage TreeFileMergeUsage
 	if ctx == nil || change.Validate() != nil || parent.Validate() != nil || target.Validate() != nil || path.Validate() != nil { return zero, nil, usage, ErrFileState }
 	if err := ctx.Err(); err != nil { return zero, nil, usage, err }
-	if err := validateCanonicalReplayParent(ctx, repository, change, parent, sources, budget.Replay); err != nil { return zero, nil, usage, err }
+	if err := validateCanonicalReplayParent(ctx, repository, change, parent, sources, budget.Replay, false); err != nil { return zero, nil, usage, err }
 	version, conflict, used, err := MergeCanonicalTreeFile(ctx, repository, [3]model.ChangesetID{parent,target,change}, path, sources, blobs, budget)
 	usage = used
 	if err != nil { return zero, nil, usage, err }
@@ -61,7 +61,7 @@ func PrepareCanonicalTextFileReplay(ctx context.Context, repository [16]byte, ch
 	if err := ctx.Err(); err != nil { return zero, nil, usage, err }
 	b := budget.Text
 	if b.Bytes == 0 || b.Bytes > 64<<20 || b.Lines == 0 || b.Lines > 1000000 || b.Cells == 0 || b.Cells > 4000000 || b.Hunks == 0 || b.Hunks > 1000000 { return zero, nil, usage, ErrTextLimit }
-	if err := validateCanonicalReplayParent(ctx, repository, change, parent, sources, budget.Replay); err != nil { return zero, nil, usage, err }
+	if err := validateCanonicalReplayParent(ctx, repository, change, parent, sources, budget.Replay, false); err != nil { return zero, nil, usage, err }
 	version, conflict, used, err := MergeCanonicalTreeTextFile(ctx, repository, [3]model.ChangesetID{parent,target,change}, path, sources, blobs, budget)
 	usage = used
 	if err != nil { return zero, nil, usage, err }
@@ -71,9 +71,9 @@ func PrepareCanonicalTextFileReplay(ctx context.Context, repository [16]byte, ch
 	return operation, nil, usage, nil
 }
 
-// Caller has validated context and typed identities. This read-only check
-// admits all source frames before the extra bounded parent-membership decode.
-func validateCanonicalReplayParent(ctx context.Context, repository [16]byte, change, parent model.ChangesetID, sources []derived.TreeSourceFrame, budget derived.TreeReplayBudget) error {
+// Caller has validated context and typed identities (parent may be zero only
+// for explicit rootBase). Admit all source frames before the bounded decode.
+func validateCanonicalReplayParent(ctx context.Context, repository [16]byte, change, parent model.ChangesetID, sources []derived.TreeSourceFrame, budget derived.TreeReplayBudget, rootBase bool) error {
 	if budget.Sources == 0 || budget.Sources > 64 || budget.SourceBytes == 0 || budget.SourceBytes > model.MaxChangesetPayload+64*22 || budget.Step.Rewrite.InputBytes == 0 || budget.Step.Rewrite.InputBytes > model.MaxChangesetPayload { return metadata.ErrInvalidArgument }
 	if uint64(len(sources)) > budget.Sources { return metadata.ErrResourceExhausted }
 	// Admit the full supplied source batch before the extra parent-selection
@@ -95,10 +95,49 @@ func validateCanonicalReplayParent(ctx context.Context, repository [16]byte, cha
 		if err != nil { return err }
 		input := value.Snapshot()
 		if input.RepoID != repository { return metadata.ErrInvalidArgument }
-		for _, id := range input.Parents { if id == parent { found = true; break } }
+		if rootBase {
+			found = len(input.Parents) == 0
+		} else {
+			for _, id := range input.Parents { if id == parent { found = true; break } }
+		}
 		if !found { return metadata.ErrFailedPrecondition }
 		break
 	}
 	if !found { return metadata.ErrNotFound }
 	return nil
+}
+
+// PrepareCanonicalRootFileReplay explicitly replays a canonical root's exact
+// file state onto a target using an empty file base. The selected change must
+// have zero parents; a non-root source is rejected, never reinterpreted as root.
+// Existing parent-selected APIs continue to require a valid actual parent.
+// Distinct additions conflict; equal additions coalesce; absence in the root
+// preserves the target. Present-empty remains a file, distinct from absence.
+//
+// Full supplied DAG/source/blob validation remains mandatory. Three bounded
+// lookups run in order change/target/change through the shared derivation; the
+// first descriptor is then replaced by explicit absence, not a fetched parent.
+// Payload admits only target+root content, while replay still validates all
+// required blobs. The extra root decode and all phase budgets remain explicit.
+//
+// Output is a PRIVATE single SET/blob or DELETE candidate, possibly redundant,
+// or exact conflict. No whole-tree cherry-pick, authorization, ref/history change
+// or publication occurs. Directory-at-path means file-absence; file/directory
+// interactions need separate handling. Inputs must stay stable.
+func PrepareCanonicalRootFileReplay(ctx context.Context, repository [16]byte, change, target model.ChangesetID, path model.Path, sources []derived.TreeSourceFrame, blobs map[model.BlobID][]byte, budget TreeFileMergeBudget) (PreparedFileOperation, *FileConflict, TreeFileMergeUsage, error) {
+	var zero PreparedFileOperation
+	var usage TreeFileMergeUsage
+	if ctx == nil || change.Validate() != nil || target.Validate() != nil || path.Validate() != nil { return zero, nil, usage, ErrFileState }
+	if err := ctx.Err(); err != nil { return zero, nil, usage, err }
+	if err := validateCanonicalReplayParent(ctx, repository, change, model.ChangesetID{}, sources, budget.Replay, true); err != nil { return zero, nil, usage, err }
+	sides, used, err := canonicalTreeFileSides(ctx, repository, [3]model.ChangesetID{change,target,change}, path, sources, blobs, budget)
+	usage = used
+	if err != nil { return zero, nil, usage, err }
+	sides[0] = CanonicalFileSide{}
+	version, conflict, err := MergeCanonicalFileVersions(ctx, sides, budget.Payload)
+	if err != nil { return zero, nil, usage, err }
+	if conflict != nil { return zero, conflict, usage, nil }
+	operation, err := PrepareFileOperation(ctx, path, version, budget.Payload)
+	if err != nil { return zero, nil, usage, err }
+	return operation, nil, usage, nil
 }
