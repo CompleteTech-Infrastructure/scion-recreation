@@ -688,3 +688,135 @@ func SetTreeLeaf(ctx context.Context, root TreePageID, frames map[TreePageID][]b
 	if err := ctx.Err(); err != nil { return bad(err) }
 	return replacement, produced, nil
 }
+
+// DeleteTreeLeaf removes only an exact file leaf, prunes empty implicit
+// directories and normalizes unary radix pages at absolute fragment endpoints.
+// Absent leaves and directory paths are no-ops, never recursive deletions.
+// Caller MUST supply a validated retained base; unrelated subtrees and blobs
+// are not validated here. Outputs are PRIVATE candidates, not storage deletion,
+// GC, durable publication or authorization. Returned frames may include bounded
+// intermediate pages consumed by normalization; only the returned root defines
+// the candidate graph. Inputs must not change concurrently. Budget semantics
+// match SetTreeLeaf, including normalization fetches and occupied comparisons.
+func DeleteTreeLeaf(ctx context.Context, root TreePageID, frames map[TreePageID][]byte, path model.Path, budget TreeRewriteBudget) (TreePageID, map[TreePageID][]byte, error) {
+	bad := func(err error) (TreePageID, map[TreePageID][]byte, error) { return TreePageID{}, nil, err }
+	if ctx == nil || root.Validate() != nil || path.Validate() != nil || budget.Pages == 0 || budget.Pages > 4096 ||
+		budget.ReadBytes == 0 || budget.ReadBytes > 4096*MaxTreePageBytes || budget.WriteBytes == 0 || budget.WriteBytes > 4096*MaxTreePageBytes { return bad(metadata.ErrInvalidArgument) }
+	noop := func() (TreePageID, map[TreePageID][]byte, error) {
+		if err := ctx.Err(); err != nil { return bad(err) }
+		return root, nil, nil
+	}
+	var readPages, writePages, readBytes, writeBytes uint64
+	produced := make(map[TreePageID][]byte)
+	read := func(id TreePageID, dir, prefix []byte) (UnlinkedTreePage, error) {
+		if err := ctx.Err(); err != nil { return UnlinkedTreePage{}, err }
+		if readPages == budget.Pages { return UnlinkedTreePage{}, metadata.ErrResourceExhausted }
+		b, ok := produced[id]
+		if !ok { b, ok = frames[id] }
+		if !ok { return UnlinkedTreePage{}, ErrTreePageMissing }
+		if len(b) > MaxTreePageBytes { return UnlinkedTreePage{}, ErrTreePage }
+		if uint64(len(b)) > budget.ReadBytes-readBytes { return UnlinkedTreePage{}, metadata.ErrResourceExhausted }
+		readPages++
+		readBytes += uint64(len(b))
+		return DecodeTreePageAt(b, id, dir, prefix)
+	}
+	emit := func(p UnlinkedTreePage, dir, prefix []byte) (TreePageID, error) {
+		if err := ctx.Err(); err != nil { return TreePageID{}, err }
+		n := uint64(24+len(p.Label)+40*len(p.Children))
+		if p.Tag >= 1 && p.Tag <= 3 { n += model.TypedIDSize } else if p.Tag == 4 { n += TreePageIDSize }
+		if writePages == budget.Pages || n > budget.WriteBytes-writeBytes { return TreePageID{}, metadata.ErrResourceExhausted }
+		writePages++
+		writeBytes += n
+		b, id, err := EncodeTreePageAt(p, dir, prefix)
+		if err != nil { return TreePageID{}, err }
+		old, ok := frames[id]
+		if !ok { old, ok = produced[id] }
+		if ok {
+			if len(old) != len(b) { return TreePageID{}, ErrTreePage }
+			if uint64(len(old)) > budget.ReadBytes-readBytes { return TreePageID{}, metadata.ErrResourceExhausted }
+			readBytes += uint64(len(old))
+			if !bytes.Equal(old, b) { return TreePageID{}, ErrTreePage }
+		} else { produced[id] = b }
+		return id, nil
+	}
+	normalize := func(p UnlinkedTreePage, dir, prefix []byte) (TreePageID, bool, error) {
+		if p.Tag == 0 && len(p.Children) == 0 { return TreePageID{}, true, nil }
+		cap := 255-len(prefix)%256
+		for p.Tag == 0 && len(p.Children) == 1 && len(p.Label) < cap {
+			childPrefix := make([]byte, len(prefix)+len(p.Label)+1)
+			copy(childPrefix, prefix)
+			copy(childPrefix[len(prefix):], p.Label)
+			childPrefix[len(childPrefix)-1] = p.Children[0].Edge
+			child, err := read(p.Children[0].ID, dir, childPrefix)
+			if err != nil { return TreePageID{}, false, err }
+			label := make([]byte, len(p.Label)+1+len(child.Label))
+			copy(label, p.Label)
+			label[len(p.Label)] = p.Children[0].Edge
+			copy(label[len(p.Label)+1:], child.Label)
+			// A validated child cannot cross this absolute anchor.
+			if len(label) > cap { return TreePageID{}, false, ErrTreePage }
+			p = child
+			p.Label = label
+		}
+		id, err := emit(p, dir, prefix)
+		return id, false, err
+	}
+	raw := path.Bytes()
+	type ancestor struct { page UnlinkedTreePage; dir, prefix []byte; child int; directory bool }
+	var chain []ancestor
+	current := root
+	start, pos, end := 0, 0, bytes.IndexByte(raw, '/')
+	if end < 0 { end = len(raw) }
+	var replacement TreePageID
+	var empty bool
+	for {
+		var dir []byte
+		if start != 0 { dir = raw[:start-1] }
+		prefix := raw[start:pos]
+		p, err := read(current, dir, prefix)
+		if err != nil { return bad(err) }
+		if !bytes.HasPrefix(raw[pos:end], p.Label) { return noop() }
+		pos += len(p.Label)
+		if pos == end {
+			if end == len(raw) {
+				if p.Tag < 1 || p.Tag > 3 { return noop() }
+				p.Tag, p.Blob = 0, model.BlobID{}
+				replacement, empty, err = normalize(p, dir, prefix)
+				if err != nil { return bad(err) }
+				break
+			}
+			if p.Tag != 4 { return noop() }
+			chain = append(chain, ancestor{page: p, dir: dir, prefix: prefix, directory: true})
+			current = p.Directory
+			start, pos = end+1, end+1
+			n := bytes.IndexByte(raw[start:], '/')
+			end = len(raw)
+			if n >= 0 { end = start+n }
+			continue
+		}
+		edge := raw[pos]
+		i := sort.Search(len(p.Children), func(i int) bool { return p.Children[i].Edge >= edge })
+		if i == len(p.Children) || p.Children[i].Edge != edge { return noop() }
+		chain = append(chain, ancestor{page: p, dir: dir, prefix: prefix, child: i})
+		current = p.Children[i].ID
+		pos++
+	}
+	for i := len(chain)-1; i >= 0; i-- {
+		c := chain[i]
+		if c.directory {
+			if empty { c.page.Tag, c.page.Directory = 0, TreePageID{} } else { c.page.Directory = replacement }
+		} else if empty {
+			c.page.Children = append(c.page.Children[:c.child], c.page.Children[c.child+1:]...)
+		} else { c.page.Children[c.child].ID = replacement }
+		var err error
+		replacement, empty, err = normalize(c.page, c.dir, c.prefix)
+		if err != nil { return bad(err) }
+	}
+	if empty {
+		var err error
+		replacement, err = emit(UnlinkedTreePage{}, nil, nil)
+		if err != nil { return bad(err) }
+	}
+	if err := ctx.Err(); err != nil { return bad(err) }
+	return replacement, produced, nil
+}
