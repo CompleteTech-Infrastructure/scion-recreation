@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"strings"
 
 	"canopy.local/canopy/internal/model"
 )
@@ -252,4 +253,47 @@ func verifyCanonicalFileSides(ctx context.Context, sides [3]CanonicalFileSide, m
 		if err != nil { return [3]FileVersion{}, err }
 	}
 	return versions, nil
+}
+
+// PreparedFileOperation is PRIVATE candidate content, not a durable upload,
+// authorized operation, published changeset or conflict-resolution receipt.
+// DELETE has nil BlobFrame; SET has a complete canonical frame whose identity
+// equals Operation.Target, including present-empty. BlobFrame is caller-owned.
+type PreparedFileOperation struct {
+	Operation model.Operation
+	BlobFrame []byte
+}
+
+// PrepareFileOperation encodes one explicitly resolved file state at an exact
+// canonical path. Absence becomes DELETE; present mode and bytes become SET
+// plus a newly hashed canonical blob frame. It does not infer whether the path
+// changed, select/resolve conflicts or verify that this state came from a merge.
+// The caller must validate the whole changeset/tree, authorize every input and
+// output, durably upload bytes, obtain receipts and publish separately.
+//
+// maxPayload caps decoded content (0..64 MiB); zero admits absent/empty states.
+// A present frame adds 22 bytes of canonical header. Hashing and encoding make
+// two bounded streaming passes over immutable content. Output allocation is not
+// a reservation/RSS guarantee. Errors return no operation or frame.
+func PrepareFileOperation(ctx context.Context, path model.Path, version FileVersion, maxPayload uint64) (PreparedFileOperation, error) {
+	var zero PreparedFileOperation
+	if ctx == nil { return zero, ErrFileState }
+	if err := ctx.Err(); err != nil { return zero, err }
+	if path.Validate() != nil || version.Validate() != nil { return zero, ErrFileState }
+	if maxPayload > 64<<20 || uint64(len(version.content)) > maxPayload { return zero, ErrFileBudget }
+	if version.IsAbsent() {
+		op, err := model.NewOperation(path, model.Delete, nil)
+		if err != nil { return zero, err }
+		if err := ctx.Err(); err != nil { return zero, err }
+		return PreparedFileOperation{Operation: op}, nil
+	}
+	length := uint64(len(version.content))
+	id, err := model.HashBlob(ctx, length, strings.NewReader(version.content))
+	if err != nil { return zero, err }
+	var frame bytes.Buffer
+	if err := model.EncodeBlob(ctx, &frame, length, strings.NewReader(version.content)); err != nil { return zero, err }
+	op, err := model.NewOperation(path, version.mode, &id)
+	if err != nil { return zero, err }
+	if err := ctx.Err(); err != nil { return zero, err }
+	return PreparedFileOperation{Operation: op, BlobFrame: frame.Bytes()}, nil
 }

@@ -278,3 +278,41 @@ func TestCanonicalTextFileMergeVerificationAndAdmission(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background()); cancel()
 	if got, conflict, err := MergeCanonicalTextFileVersions(ctx, sides, ThreeWayTextBudget{3, 1, 1, 1}); err != context.Canceled || got != (FileVersion{}) || conflict != nil { t.Fatal(got, conflict, err) }
 }
+
+func TestPrepareFileOperationCanonicalRoundTrip(t *testing.T) {
+	path, err := model.NewPath([]byte("dir/\xff")); if err != nil { t.Fatal(err) }
+	for _, mode := range []model.OperationTag{model.SetRegular, model.SetExecutable, model.SetSymlink} {
+		for _, content := range []string{"", "a\x00b", "\xff\r\na", "../target"} {
+			version := fileFixture(t, mode, content)
+			got, err := PrepareFileOperation(context.Background(), path, version, uint64(len(content)))
+			if err != nil || got.Operation.Path() != path || got.Operation.Tag() != mode || len(got.BlobFrame) != len(content)+22 { t.Fatal(got, err) }
+			id, present := got.Operation.Target(); if !present { t.Fatal("SET target missing") }
+			var decoded bytes.Buffer
+			n, err := model.DecodeBlob(context.Background(), bytes.NewReader(got.BlobFrame), id, &decoded, uint64(len(content)))
+			if err != nil || n != uint64(len(content)) || decoded.String() != content { t.Fatal(n, err) }
+			again, err := PrepareFileOperation(context.Background(), path, version, uint64(len(content)))
+			if err != nil || again.Operation != got.Operation || !bytes.Equal(again.BlobFrame, got.BlobFrame) { t.Fatal("not deterministic", err) }
+			got.BlobFrame[0] ^= 1
+			original, _ := version.Content()
+			if string(original) != content || again.BlobFrame[0] == got.BlobFrame[0] { t.Fatal("frame aliases immutable input or another output") }
+		}
+	}
+	deleted, err := PrepareFileOperation(context.Background(), path, AbsentFile(), 0)
+	if err != nil || deleted.Operation.Path() != path || deleted.Operation.Tag() != model.Delete || deleted.BlobFrame != nil { t.Fatal(deleted, err) }
+	if _, ok := deleted.Operation.Target(); ok { t.Fatal("DELETE carried target") }
+}
+
+func TestPrepareFileOperationRejectsBeforeOutput(t *testing.T) {
+	path, err := model.NewPath([]byte("file")); if err != nil { t.Fatal(err) }
+	version := fileFixture(t, model.SetRegular, "abc")
+	for _, tc := range []struct { path model.Path; version FileVersion; limit uint64; want error }{
+		{path, version, 2, ErrFileBudget}, {path, version, 65<<20, ErrFileBudget},
+		{model.Path{}, version, 3, ErrFileState}, {path, FileVersion{}, 3, ErrFileState},
+	} {
+		got, err := PrepareFileOperation(context.Background(), tc.path, tc.version, tc.limit)
+		if err != tc.want || got.Operation != (model.Operation{}) || got.BlobFrame != nil { t.Fatal(got, err) }
+	}
+	if got, err := PrepareFileOperation(nil, path, version, 3); err != ErrFileState || got.Operation != (model.Operation{}) || got.BlobFrame != nil { t.Fatal(got, err) }
+	ctx, cancel := context.WithCancel(context.Background()); cancel()
+	if got, err := PrepareFileOperation(ctx, path, version, 3); err != context.Canceled || got.Operation != (model.Operation{}) || got.BlobFrame != nil { t.Fatal(got, err) }
+}
