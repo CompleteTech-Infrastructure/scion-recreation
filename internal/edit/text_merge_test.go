@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"testing"
+
+	"canopy.local/canopy/internal/model"
 )
 
 func TestTextHunkComposition(t *testing.T) {
@@ -180,4 +182,67 @@ func TestThreeWayTextLimitsAndInput(t *testing.T) {
 		got, conflict, err := MergeText(tc.ctx, tc.base, tc.left, tc.right, ThreeWayTextBudget{100, 100, 100, 100})
 		if got != nil || conflict != nil || !errors.Is(err, tc.want) { t.Fatal(got, conflict, err) }
 	}
+}
+
+func canonicalMergeInputs(t *testing.T, inputs [3]string) ([3]model.BlobID, [3][]byte) {
+	t.Helper()
+	var ids [3]model.BlobID
+	var frames [3][]byte
+	for i, input := range inputs {
+		var err error
+		ids[i], err = model.HashBlob(context.Background(), uint64(len(input)), bytes.NewReader([]byte(input)))
+		if err != nil { t.Fatal(err) }
+		var frame bytes.Buffer
+		if err := model.EncodeBlob(context.Background(), &frame, uint64(len(input)), bytes.NewReader([]byte(input))); err != nil { t.Fatal(err) }
+		frames[i] = frame.Bytes()
+	}
+	return ids, frames
+}
+
+func TestCanonicalTextMergeMatchesPayloads(t *testing.T) {
+	budget := ThreeWayTextBudget{1024, 100, 1000, 100}
+	for _, inputs := range [][3]string{
+		{"", "", ""}, {"a\nb\nc\n", "A\nb\nc\n", "a\nb\nC\n"},
+		{"a", "b", "c"}, {"a", "", ""}, {"same", "same", "same"},
+		{"\xff\r\na", "\xff\r\nA", "\xff\r\na"},
+	} {
+		ids, frames := canonicalMergeInputs(t, inputs)
+		want, conflict, err := MergeText(context.Background(), []byte(inputs[0]), []byte(inputs[1]), []byte(inputs[2]), budget)
+		if err != nil { t.Fatal(err) }
+		got, gotConflict, err := MergeCanonicalText(context.Background(), ids, frames, budget)
+		if err != nil || !bytes.Equal(got, want) || (gotConflict == nil) != (conflict == nil) { t.Fatal(inputs, got, gotConflict, err) }
+		if conflict != nil && *conflict != *gotConflict { t.Fatal(conflict, gotConflict) }
+	}
+}
+
+func TestCanonicalTextMergeRejectsEveryUnverifiedSide(t *testing.T) {
+	ids, frames := canonicalMergeInputs(t, [3]string{"a", "a", "a"})
+	budget := ThreeWayTextBudget{100, 100, 1000, 100}
+	for side := 0; side < 3; side++ {
+		for mode := 0; mode < 5; mode++ {
+			badIDs, badFrames := ids, frames
+			frame := append([]byte(nil), frames[side]...)
+			switch mode {
+			case 0: frame[len(frame)-1] ^= 1
+			case 1: frame = frame[:len(frame)-1]
+			case 2: frame = append(frame, 0)
+			case 3: badIDs[side] = model.BlobID{}
+			case 4: frame[21] = 255 // Declared payload cannot exceed remaining budget.
+			}
+			badFrames[side] = frame
+			got, conflict, err := MergeCanonicalText(context.Background(), badIDs, badFrames, budget)
+			if err == nil || got != nil || conflict != nil { t.Fatal(side, mode, got, conflict, err) }
+		}
+	}
+	for _, budget := range []ThreeWayTextBudget{{}, {2, 100, 100, 100}, {100, 2, 100, 100}, {65<<20, 100, 100, 100}, {100, 100, 4000001, 100}} {
+		got, conflict, err := MergeCanonicalText(context.Background(), ids, frames, budget)
+		if !errors.Is(err, ErrTextLimit) || got != nil || conflict != nil { t.Fatal(budget, got, conflict, err) }
+	}
+	ids, frames = canonicalMergeInputs(t, [3]string{"a", "", ""})
+	if got, conflict, err := MergeCanonicalText(context.Background(), ids, frames, ThreeWayTextBudget{1, 1, 4, 2}); err != nil || conflict != nil || len(got) != 0 { t.Fatal("zero remaining payload allowance", got, conflict, err) }
+	ids, frames = canonicalMergeInputs(t, [3]string{"", "", "\x00"})
+	if got, conflict, err := MergeCanonicalText(context.Background(), ids, frames, budget); !errors.Is(err, ErrTextInput) || got != nil || conflict != nil { t.Fatal(got, conflict, err) }
+	ctx, cancel := context.WithCancel(context.Background()); cancel()
+	if got, conflict, err := MergeCanonicalText(ctx, ids, frames, budget); !errors.Is(err, context.Canceled) || got != nil || conflict != nil { t.Fatal(got, conflict, err) }
+	if got, conflict, err := MergeCanonicalText(nil, ids, frames, budget); !errors.Is(err, ErrTextInput) || got != nil || conflict != nil { t.Fatal(got, conflict, err) }
 }
