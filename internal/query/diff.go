@@ -249,3 +249,31 @@ func DiffFileEntries(ctx context.Context, before, after []model.Operation, budge
 	if err := ctx.Err(); err != nil { return nil, err }
 	return deltas, nil
 }
+
+// DiffCanonicalText verifies two complete canonical blob frames, then runs the
+// bounded text diff over their verified payloads. It always verifies BOTH frames,
+// including equal expected IDs. A known digest is not an authorization grant.
+// Callers must authorize delivery and explicitly classify/admit text first;
+// the NUL guard in DiffText is not comprehensive binary classification.
+//
+// Both inputs are present blobs: this does not model absent files, tree changes,
+// mode changes, compression envelopes or remote fetches. InputBytes admits the
+// combined decoded payload bytes (excluding two 22-byte canonical headers).
+// Decoding uses private in-memory staging and exposes no partial content. Limits
+// are not peak-memory ceilings; buffers and output have bounded owned storage.
+// Input frames must not be modified during the call. Errors return zero TextDiff.
+func DiffCanonicalText(ctx context.Context, oldID, nextID model.BlobID, oldFrame, nextFrame []byte, budget TextDiffBudget) (TextDiff, error) {
+	var zero TextDiff
+	if ctx == nil { return zero, ErrDiffInput }
+	if err := ctx.Err(); err != nil { return zero, err }
+	if budget.InputBytes == 0 || budget.InputBytes > 64<<20 || budget.OutputBytes == 0 || budget.OutputBytes > 64<<20 || budget.Lines == 0 || budget.Lines > 1000000 || budget.Context > budget.Lines {
+		return zero, ErrDiffLimit
+	}
+	frameBytes := budget.InputBytes + 44
+	if uint64(len(oldFrame)) > frameBytes || uint64(len(nextFrame)) > frameBytes-uint64(len(oldFrame)) { return zero, ErrDiffLimit }
+	var old, next bytes.Buffer
+	used, err := model.DecodeBlob(ctx, bytes.NewReader(oldFrame), oldID, &old, budget.InputBytes)
+	if err != nil { return zero, err }
+	if _, err := model.DecodeBlob(ctx, bytes.NewReader(nextFrame), nextID, &next, budget.InputBytes-used); err != nil { return zero, err }
+	return DiffText(ctx, old.Bytes(), next.Bytes(), budget)
+}
