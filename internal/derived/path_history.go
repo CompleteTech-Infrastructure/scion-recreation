@@ -1,6 +1,7 @@
 package derived
 
 import (
+	"bytes"
 	"context"
 
 	"canopy.local/canopy/internal/model"
@@ -154,4 +155,61 @@ func ReadFirstParentPathHistory(ctx context.Context, repository [16]byte, start 
 		}
 		cursor = input.Parents[0]
 	}
+}
+
+// CanonicalPathHistoryBudget admits two separate phases: complete checked tree
+// replay, then a cumulative bounded history walk. History.SourceBytes also caps
+// aggregate retained decoded payload during the bridge. Re-decoding and owned
+// model copies add bounded passes; these fields are not peak-memory guarantees.
+type CanonicalPathHistoryBudget struct {
+	Replay TreeReplayBudget
+	History PathHistoryChainBudget
+}
+type CanonicalPathHistoryUsage struct {
+	Replay TreeReplayUsage
+	History PathHistoryChainUsage
+}
+
+// ReadCanonicalPathHistory derives private exact-path history from a complete
+// root-to-start canonical first-parent chain. Tree mappings come only from this
+// call's checked replay, never from caller-supplied mapping assertions. Both the
+// selected start ID and repository are bound explicitly. Steps are newest first;
+// absent/no-op states do not truncate earlier history. Any failure returns nil.
+//
+// Supplied byte integrity is not publication, durable retention or permission.
+// Additional parents are ancestry only and still require external membership/
+// publication checks. There is no provider, public delivery, pagination, resume,
+// rename/copy detection or durable index. All inputs must remain stable. Usage
+// and error distinctions are private and cannot bypass authorization filtering.
+func ReadCanonicalPathHistory(ctx context.Context, repository [16]byte, start model.ChangesetID, path model.Path, sources []TreeSourceFrame, blobs map[model.BlobID][]byte, budget CanonicalPathHistoryBudget) ([]PathHistoryStep, CanonicalPathHistoryUsage, error) {
+	var used CanonicalPathHistoryUsage
+	bad := func(err error) ([]PathHistoryStep, CanonicalPathHistoryUsage, error) { return nil, used, err }
+	h := budget.History
+	if ctx == nil || start.Validate() != nil || path.Validate() != nil || h.Nodes == 0 || h.Nodes > 4096 || h.Changes == 0 || h.Changes > h.Nodes || h.SourceBytes == 0 || h.SourceBytes > model.MaxChangesetPayload || h.Lookup.Pages == 0 || h.Lookup.Pages > 4096 || h.Lookup.ReadBytes == 0 || h.Lookup.ReadBytes > 4096*MaxTreePageBytes { return bad(metadata.ErrInvalidArgument) }
+	if err := ctx.Err(); err != nil { return bad(err) }
+	if len(sources) == 0 || sources[len(sources)-1].ID != start { return bad(metadata.ErrInvalidArgument) }
+	if uint64(len(sources)) > h.Nodes { return bad(metadata.ErrResourceExhausted) }
+	writes, pages, replay, err := ReplayCanonicalTreeChain(ctx, repository, sources, blobs, budget.Replay)
+	used.Replay = replay
+	if err != nil { return bad(err) }
+	// Replay has verified exact frame lengths. Reserve aggregate owned source
+	// payload before allocating the decoded bridge; headers are not payload.
+	var payload uint64
+	for _, source := range sources {
+		if err := ctx.Err(); err != nil { return bad(err) }
+		n := uint64(len(source.Frame)-22)
+		if n > h.SourceBytes-payload { return bad(metadata.ErrResourceExhausted) }
+		payload += n
+	}
+	nodes := make(map[model.ChangesetID]PathHistoryNode, len(sources))
+	for i, source := range sources {
+		value, err := model.DecodeChangeset(ctx, bytes.NewReader(source.Frame), source.ID, budget.Replay.Step.Rewrite.InputBytes)
+		if err != nil { return bad(err) }
+		nodes[source.ID] = PathHistoryNode{Source: value, Tree: writes[i].Result, Frames: pages}
+	}
+	steps, history, err := ReadFirstParentPathHistory(ctx, repository, start, path, nodes, h)
+	used.History = history
+	if err != nil { return bad(err) }
+	if err := ctx.Err(); err != nil { return bad(err) }
+	return steps, used, nil
 }

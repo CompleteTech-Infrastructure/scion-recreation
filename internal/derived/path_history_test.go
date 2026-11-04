@@ -179,3 +179,55 @@ func TestReadFirstParentPathHistoryCancellationAfterCollectedStep(t *testing.T) 
 	rows, used, err := ReadFirstParentPathHistory(ctx, [16]byte{1}, ids[5], path, nodes, budget)
 	if err != context.Canceled || rows != nil || used.Nodes != 1 || used.Lookup != reads || ctx.calls != ctx.cancelAt { t.Fatalf("late cancellation leaked a collected step: %+v %v", used, err) }
 }
+
+func TestReadCanonicalPathHistoryUsesReplayedMappings(t *testing.T) {
+	ctx := context.Background(); repo := [16]byte{7}
+	path, _ := model.NewPath([]byte("a")); absent, _ := model.NewPath([]byte("missing"))
+	blob, frame := treeCanonicalBlob(t, nil); blobs := map[model.BlobID][]byte{blob: frame}
+	regular, _ := model.NewOperation(path, model.SetRegular, &blob)
+	executable, _ := model.NewOperation(path, model.SetExecutable, &blob)
+	symlink, _ := model.NewOperation(path, model.SetSymlink, &blob)
+	remove, _ := model.NewOperation(path, model.Delete, nil)
+	var sources []TreeSourceFrame
+	var frameBytes, payloadBytes uint64
+	for _, ops := range [][]model.Operation{{remove}, {regular}, nil, {executable}, {remove}, {symlink}} {
+		change := model.ChangesetInput{RepoID: repo, Operations: ops}
+		if len(sources) != 0 { change.Parents = []model.ChangesetID{sources[len(sources)-1].ID} }
+		source := treeReplaySource(t, change); sources = append(sources, source)
+		frameBytes += uint64(len(source.Frame)); payloadBytes += uint64(len(source.Frame)-22)
+	}
+	start := sources[5].ID
+	graph := TreeObjectGraphBudget{graphTestBudget(), 22}
+	step := TreeCheckedWriteBudget{graph, graph, TreeChangesetBudget{TreeRewriteBudget{4096, 4096*MaxTreePageBytes, 4096*MaxTreePageBytes}, 4096, model.MaxChangesetPayload}}
+	replay := TreeReplayBudget{6, frameBytes, 4, 204, step}
+	history := PathHistoryChainBudget{6, payloadBytes, 4, TreeLookupBudget{11, 516}}
+	budget := CanonicalPathHistoryBudget{replay, history}
+	steps, used, err := ReadCanonicalPathHistory(ctx, repo, start, path, sources, blobs, budget)
+	if err != nil || len(steps) != 4 || used.Replay != (TreeReplayUsage{6, frameBytes, 4, 204}) || used.History != (PathHistoryChainUsage{6, payloadBytes, TreeLookupUsage{11, 516}}) { t.Fatalf("canonical history exact budgets: %+v %v", used, err) }
+	before := []model.Operation{{}, executable, regular, {}}
+	after := []model.Operation{symlink, {}, executable, regular}
+	for i, sourceIndex := range []int{5, 4, 3, 1} {
+		s := steps[i]
+		if s.Repository != repo || s.Path != path || s.Changeset != sources[sourceIndex].ID || s.FirstParent != sources[sourceIndex-1].ID || s.Before != before[i] || s.After != after[i] || s.BeforePresent != (i == 1 || i == 2) || s.AfterPresent != (i != 1) { t.Fatalf("canonical event %d has wrong state/identity", i) }
+	}
+	if rows, used, err := ReadCanonicalPathHistory(ctx, repo, start, absent, sources, blobs, budget); err != nil || len(rows) != 0 || used.History.Nodes != 6 { t.Fatal("absent path did not traverse complete canonical history") }
+	for _, which := range []string{"nodes", "source bytes", "changes", "lookup pages", "lookup bytes", "replay pages"} {
+		short := budget
+		switch which { case "nodes": short.History.Nodes--; case "source bytes": short.History.SourceBytes--; case "changes": short.History.Changes--; case "lookup pages": short.History.Lookup.Pages--; case "lookup bytes": short.History.Lookup.ReadBytes--; case "replay pages": short.Replay.Pages-- }
+		if rows, _, err := ReadCanonicalPathHistory(ctx, repo, start, path, sources, blobs, short); err != metadata.ErrResourceExhausted || rows != nil { t.Fatalf("%s exhaustion returned history: %v", which, err) }
+	}
+	if rows, usage, err := ReadCanonicalPathHistory(ctx, repo, sources[4].ID, path, sources, blobs, budget); err != metadata.ErrInvalidArgument || rows != nil || usage != (CanonicalPathHistoryUsage{}) { t.Fatal("selected source substitution reached replay") }
+	invalid := budget; invalid.History.Lookup.Pages = 0
+	if rows, usage, err := ReadCanonicalPathHistory(ctx, repo, start, path, sources, blobs, invalid); err != metadata.ErrInvalidArgument || rows != nil || usage != (CanonicalPathHistoryUsage{}) { t.Fatal("invalid history budget reached replay") }
+	badSources := append([]TreeSourceFrame(nil), sources...)
+	badSources[5].Frame = append([]byte(nil), badSources[5].Frame...); badSources[5].Frame[len(badSources[5].Frame)-1] ^= 1
+	if rows, usage, err := ReadCanonicalPathHistory(ctx, repo, start, path, badSources, blobs, budget); err == nil || rows != nil || usage.History != (PathHistoryChainUsage{}) { t.Fatal("bad source exposed history") }
+	if rows, _, err := ReadCanonicalPathHistory(ctx, [16]byte{8}, start, path, sources, blobs, budget); err != metadata.ErrInvalidArgument || rows != nil { t.Fatal("foreign canonical history accepted") }
+	if rows, _, err := ReadCanonicalPathHistory(nil, repo, start, path, sources, blobs, budget); err != metadata.ErrInvalidArgument || rows != nil { t.Fatal("nil context accepted") }
+	// Cancel immediately after the completed replay phase. The wrapper adds
+	// one initial checkpoint; the next is its first payload-admission check.
+	probe := &treePhaseCancelContext{Context: ctx}
+	if _, _, _, err := ReplayCanonicalTreeChain(probe, repo, sources, blobs, replay); err != nil { t.Fatal(err) }
+	cancel := &treePhaseCancelContext{Context: ctx, cancelAt: probe.calls+2}
+	if rows, usage, err := ReadCanonicalPathHistory(cancel, repo, start, path, sources, blobs, budget); err != context.Canceled || rows != nil || usage.Replay.Sources != 6 || usage.History != (PathHistoryChainUsage{}) { t.Fatalf("phase cancellation leaked history: %+v %v", usage, err) }
+}
