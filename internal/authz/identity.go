@@ -132,6 +132,7 @@ func (r *IdentityResolver) validTime(c IdentityClaims) bool {
 // Resolve authenticates only; it establishes no policy rights, delegation or
 // session. All external failures have the same safe shape. Only verified claims
 // reach the revocation dependency, and validity is checked again after lookup.
+// Check cancellation after clock callbacks as well as revocation callbacks.
 func (r *IdentityResolver) Resolve(ctx context.Context, credential *IdentityCredential) (Identity, error) {
 	deny := Identity{}
 	if r == nil || r.now == nil || r.check == nil || r.audience == "" || ctx == nil || ctx.Err() != nil || credential == nil {
@@ -142,11 +143,11 @@ func (r *IdentityResolver) Resolve(ctx context.Context, credential *IdentityCred
 		return deny, ErrUnauthenticated
 	}
 	key := r.keys[c.Issuer][c.KeyID]
-	if len(key) != ed25519.PublicKeySize || !ed25519.Verify(key, identityTranscript(c), credential.Signature) || !r.validTime(c) {
+	if len(key) != ed25519.PublicKeySize || !ed25519.Verify(key, identityTranscript(c), credential.Signature) || !r.validTime(c) || ctx.Err() != nil {
 		return deny, ErrUnauthenticated
 	}
 	state, err := r.check(ctx, c)
-	if err != nil || state != RevocationActive || ctx.Err() != nil || !r.validTime(c) {
+	if err != nil || state != RevocationActive || ctx.Err() != nil || !r.validTime(c) || ctx.Err() != nil {
 		return deny, ErrUnauthenticated
 	}
 	return Identity{Principal: PrincipalID{Issuer: c.Issuer, Subject: c.Subject, Class: c.Class}, Audience: c.Audience, ExpiresAt: time.Unix(c.ExpiresAtUnix, 0)}, nil
