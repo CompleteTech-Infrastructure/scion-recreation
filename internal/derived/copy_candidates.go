@@ -142,3 +142,41 @@ func (index *ExactCopyIndex) CopiesOfPath(ctx context.Context, sourcePath model.
 	if err := ctx.Err(); err != nil { return zero, err }
 	return out, nil
 }
+
+// CanonicalCopyUsage exposes private phase accounting, not successful validation
+// or an authorization signal. Replay and enumeration have independent budgets;
+// total work is their sum, including each admitted replay step's phase limits.
+type CanonicalCopyUsage struct { Replay TreeReplayUsage; Enumeration TreeGraphUsage }
+
+// NewCanonicalExactCopyIndex derives the selected source's tree from a complete
+// supplied canonical DAG, then builds an immutable exact-content index. Every
+// supplied source (including sources after target and other roots) must pass
+// replay, canonical blob verification and same-repository ancestry closure.
+// The target may occur anywhere in the topological input. Parent zero alone
+// supplies each tree's base; nonzero parents are verified but never unioned.
+// No caller-supplied mapping or page graph can substitute for that computation.
+//
+// This establishes local input-to-tree binding, NOT authoritative publication,
+// retention, authorization, similarity or proof of copying. All usage, errors,
+// counts and index results remain PRIVATE. Missing target returns ErrNotFound
+// only after full replay succeeds. Inputs must remain stable. Errors return no
+// index; replay's bounded intermediate pages are not retained by the result.
+// Budgets are logical admission rather than an allocator/RSS guarantee.
+func NewCanonicalExactCopyIndex(ctx context.Context, repository [16]byte, target model.ChangesetID, sources []TreeSourceFrame, blobs map[model.BlobID][]byte, replayBudget TreeReplayBudget, entriesBudget TreeEntriesBudget) (*ExactCopyIndex, CanonicalCopyUsage, error) {
+	var usage CanonicalCopyUsage
+	if ctx == nil || target.Validate() != nil { return nil, usage, metadata.ErrInvalidArgument }
+	if err := ctx.Err(); err != nil { return nil, usage, err }
+	writes, pages, used, err := ReplayCanonicalTreeDAG(ctx, repository, sources, blobs, replayBudget)
+	usage.Replay = used
+	if err != nil { return nil, usage, err }
+	for _, write := range writes {
+		if err := ctx.Err(); err != nil { return nil, usage, err }
+		if write.Result.Identity.Changeset != target { continue }
+		identity := metadata.DerivedIdentity{Repository: repository, Changeset: target, Kind: "TREE", Version: 1}
+		index, enumerated, err := NewTreeExactCopyIndex(ctx, identity, write.Result, pages, entriesBudget)
+		usage.Enumeration = enumerated
+		return index, usage, err
+	}
+	if err := ctx.Err(); err != nil { return nil, usage, err }
+	return nil, usage, metadata.ErrNotFound
+}

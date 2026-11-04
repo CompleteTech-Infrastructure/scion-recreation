@@ -149,3 +149,51 @@ func TestExactCopiesOfPathCancellationDiscardsMatches(t *testing.T) {
 		if err != context.Canceled || got.Source != (model.ChangesetID{}) || got.Paths != nil { t.Fatal(at, got, err) }
 	}
 }
+
+func TestCanonicalExactCopyIndexBindsSelectedSource(t *testing.T) {
+	ctx := context.Background(); repo := [16]byte{7}
+	blob, frame := treeCanonicalBlob(t, []byte("x\x00"))
+	blobs := map[model.BlobID][]byte{blob:frame}
+	a, _ := model.NewPath([]byte("a")); b, _ := model.NewPath([]byte("\xff"))
+	regular, _ := model.NewOperation(a, model.SetRegular, &blob)
+	symlink, _ := model.NewOperation(b, model.SetSymlink, &blob)
+	remove, _ := model.NewOperation(b, model.Delete, nil)
+	root := treeReplaySource(t, model.ChangesetInput{RepoID:repo,Operations:[]model.Operation{regular,symlink}})
+	other := treeReplaySource(t, model.ChangesetInput{RepoID:repo})
+	merge := treeReplaySource(t, model.ChangesetInput{RepoID:repo,Parents:[]model.ChangesetID{root.ID,other.ID}})
+	last := treeReplaySource(t, model.ChangesetInput{RepoID:repo,Parents:[]model.ChangesetID{merge.ID},Operations:[]model.Operation{remove}})
+	sources := []TreeSourceFrame{root,other,merge,last}
+	graph := TreeObjectGraphBudget{graphTestBudget(),1<<20}
+	step := TreeCheckedWriteBudget{graph,graph,TreeChangesetBudget{TreeRewriteBudget{4096,4096*MaxTreePageBytes,4096*MaxTreePageBytes},4096,model.MaxChangesetPayload}}
+	replay := TreeReplayBudget{4,1<<20,4096,4096*MaxTreePageBytes,step}
+	entries := TreeEntriesBudget{graphTestBudget(),2,4}
+	for _, target := range []model.ChangesetID{root.ID,merge.ID} {
+		index, used, err := NewCanonicalExactCopyIndex(ctx,repo,target,sources,blobs,replay,entries)
+		if err != nil || index == nil || used.Replay.Sources != 4 || used.Enumeration.Visits == 0 { t.Fatal(index,used,err) }
+		matches, err := index.CopiesOfPath(ctx,a,1)
+		if err != nil || matches.Source != target || len(matches.Paths) != 1 || matches.Paths[0] != b { t.Fatal(matches,err) }
+	}
+	index, _, err := NewCanonicalExactCopyIndex(ctx,repo,last.ID,sources,blobs,replay,entries)
+	if err != nil { t.Fatal(err) }
+	matches, err := index.CopiesOfPath(ctx,a,1)
+	if err != nil || len(matches.Paths) != 0 || matches.Source != last.ID { t.Fatal(matches,err) }
+	// Later source corruption rejects an already computable earlier target.
+	bad := append([]TreeSourceFrame(nil),sources...)
+	bad[3].Frame = append([]byte(nil),last.Frame...); bad[3].Frame[len(last.Frame)-1] ^= 1
+	if index, _, err := NewCanonicalExactCopyIndex(ctx,repo,root.ID,bad,blobs,replay,entries); err == nil || index != nil { t.Fatal(index,err) }
+	if index, _, err := NewCanonicalExactCopyIndex(ctx,repo,root.ID,sources,nil,replay,entries); err == nil || index != nil { t.Fatal(index,err) }
+	if index, _, err := NewCanonicalExactCopyIndex(ctx,repo,merge.ID,[]TreeSourceFrame{root,merge},blobs,replay,entries); err != metadata.ErrFailedPrecondition || index != nil { t.Fatal(index,err) }
+	missing := treeReplaySource(t,model.ChangesetInput{RepoID:[16]byte{9}})
+	if index, used, err := NewCanonicalExactCopyIndex(ctx,repo,missing.ID,sources,blobs,replay,entries); err != metadata.ErrNotFound || index != nil || used.Replay.Sources != 4 { t.Fatal(index,used,err) }
+	short := entries; short.Entries = 1
+	if index, used, err := NewCanonicalExactCopyIndex(ctx,repo,root.ID,sources,blobs,replay,short); err != metadata.ErrResourceExhausted || index != nil || used.Replay.Sources != 4 { t.Fatal(index,used,err) }
+	shortReplay := replay; shortReplay.Sources = 3
+	if index, _, err := NewCanonicalExactCopyIndex(ctx,repo,root.ID,sources,blobs,shortReplay,entries); err != metadata.ErrResourceExhausted || index != nil { t.Fatal(index,err) }
+	if index, _, err := NewCanonicalExactCopyIndex(nil,repo,root.ID,sources,blobs,replay,entries); err != metadata.ErrInvalidArgument || index != nil { t.Fatal(index,err) }
+	cancelled, cancel := context.WithCancel(ctx); cancel()
+	if index, _, err := NewCanonicalExactCopyIndex(cancelled,repo,root.ID,sources,blobs,replay,entries); err != context.Canceled || index != nil { t.Fatal(index,err) }
+	// Index must not retain mutable supplied blob/source frames.
+	frame[0] ^= 1; sources[0].Frame[0] ^= 1
+	matches, err = index.CopiesOfPath(ctx,a,1)
+	if err != nil || matches.Source != last.ID || len(matches.Paths) != 0 { t.Fatal(matches,err) }
+}
