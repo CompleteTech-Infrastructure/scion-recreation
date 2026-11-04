@@ -1559,3 +1559,63 @@ func TestManifestRootAnchorSurvivesDirectoryRename(t *testing.T) {
 		t.Fatalf("replacement directory user content changed: %x, %v", gotSentinel, err)
 	}
 }
+
+// Individually valid manifests can have a recovery union larger than the
+// record's path cap. Rejection must precede any journal or manifest mutation;
+// the exact boundary must still retain every hint after interrupted publication.
+func TestManifestRecoveryUnionPathBoundary(t *testing.T) {
+	dir := privateMetadataDir(t)
+	old := testManifest(t)
+	old.DirtyPaths = nil
+	for i := 0; i < MaxPaths/2; i++ {
+		old.DirtyPaths = append(old.DirtyPaths, testPath(t, []byte(fmt.Sprintf("old/%04d", i))))
+	}
+	if err := Save(dir, old); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(filepath.Join(dir, "manifest"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := old
+	next.Base = testChangeset(t, "union boundary next")
+	next.DirtyPaths = nil
+	for i := 0; i <= MaxPaths/2; i++ {
+		next.DirtyPaths = append(next.DirtyPaths, testPath(t, []byte(fmt.Sprintf("new/%04d", i))))
+	}
+	if _, err := encode(next); err != nil {
+		t.Fatalf("next manifest must be independently valid: %v", err)
+	}
+	if err := Save(dir, next); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("oversized recovery union = %v, want ErrCorrupt", err)
+	}
+	after, err := os.ReadFile(filepath.Join(dir, "manifest"))
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("rejected update changed prior manifest: %v", err)
+	}
+	for _, name := range []string{"intent", "journal", "next"} {
+		if _, err := os.Lstat(filepath.Join(dir, name)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("rejected update left %s: %v", name, err)
+		}
+	}
+	// Dropping one hint makes the union exactly MaxPaths, without truncation.
+	next.DirtyPaths = next.DirtyPaths[:MaxPaths/2]
+	stop := errors.New("stop after bounded journal publication")
+	if err := save(dir, next, func(stage string) error {
+		if stage == "journal-dir-synced" {
+			return stop
+		}
+		return nil
+	}); !errors.Is(err, stop) {
+		t.Fatalf("exact-boundary save = %v, want checkpoint interruption", err)
+	}
+	got, err := Recover(dir)
+	if err != nil || got.State != Uncertain || got.Base != old.Base || len(got.DirtyPaths) != MaxPaths {
+		t.Fatalf("exact-boundary recovery: state=%v paths=%d error=%v", got.State, len(got.DirtyPaths), err)
+	}
+	for i, path := range append(append([]model.Path(nil), old.DirtyPaths...), next.DirtyPaths...) {
+		if !bytes.Equal(got.DirtyPaths[i].Bytes(), path.Bytes()) {
+			t.Fatalf("recovery union lost or reordered hint %d", i)
+		}
+	}
+}
