@@ -645,3 +645,94 @@ func TestSetTreeLeafSplitPreservesBaseAndAdmitsWrites(t *testing.T) {
 	for id, original := range before { if !bytes.Equal(frames[id], original) { t.Fatal("SET mutated base input") } }
 	if len(frames) != len(before) { t.Fatal("SET changed input map") }
 }
+
+func TestDeleteTreeLeafLiteralHistories(t *testing.T) {
+	b, err := os.ReadFile("../../tests/fixtures/tree_pages_v1.json")
+	if err != nil { t.Fatal(err) }
+	var f struct {
+		Cases []struct {
+			Name string `json:"name"`
+			Initial []json.RawMessage `json:"initial_entries"`
+			Final string `json:"flat_oracle_root_id_hex"`
+			Histories []struct {
+				Operations []struct { Op string `json:"op"`; Path string `json:"path_hex"`; Mode string `json:"mode"`; Payload string `json:"blob_payload_hex"` } `json:"operations"`
+				Checkpoints []struct { Index int `json:"operation_index"`; Root string `json:"root_id_hex"` } `json:"checkpoints"`
+			} `json:"histories"`
+		} `json:"history_cases"`
+	}
+	if err := json.Unmarshal(b, &f); err != nil { t.Fatal(err) }
+	if len(f.Cases) != 4 { t.Fatal("history coverage changed") }
+	budget := TreeRewriteBudget{4096, 4096*MaxTreePageBytes, 4096*MaxTreePageBytes}
+	for _, c := range f.Cases {
+		if len(c.Initial) != 0 { t.Fatal("fixture initial entries changed") }
+		for _, h := range c.Histories {
+			empty, root, err := EncodeTreePageAt(UnlinkedTreePage{}, nil, nil)
+			if err != nil { t.Fatal(err) }
+			frames := map[TreePageID][]byte{root: empty}
+			for i, op := range h.Operations {
+				path, err := model.NewPath(treeHex(t, op.Path))
+				if err != nil { t.Fatal(err) }
+				var added map[TreePageID][]byte
+				switch op.Op {
+				case "insert":
+					payload := treeHex(t, op.Payload)
+					blob, e := model.HashBlob(context.Background(), uint64(len(payload)), bytes.NewReader(payload))
+					if e != nil { t.Fatal(e) }
+					var tag byte
+					switch op.Mode { case "regular": tag = 1; case "executable": tag = 2; case "symlink": tag = 3; default: t.Fatal("unknown mode") }
+					root, added, err = SetTreeLeaf(context.Background(), root, frames, path, tag, blob, budget)
+				case "delete": root, added, err = DeleteTreeLeaf(context.Background(), root, frames, path, budget)
+				default: t.Fatal("unknown operation")
+				}
+				if err != nil { t.Fatalf("%s operation %d: %v", c.Name, i+1, err) }
+				for id, frame := range added {
+					if old, ok := frames[id]; ok && !bytes.Equal(old, frame) { t.Fatal("input frame overwritten") }
+					frames[id] = frame
+				}
+				for _, checkpoint := range h.Checkpoints {
+					if checkpoint.Index != i+1 { continue }
+					want, err := ParseTreePageID(treeHex(t, checkpoint.Root))
+					if err != nil || root != want { t.Fatalf("%s checkpoint %d mismatch", c.Name, i+1) }
+				}
+				if _, err := CheckTreePageGraph(context.Background(), root, frames, graphTestBudget()); err != nil { t.Fatal(err) }
+			}
+			want, err := ParseTreePageID(treeHex(t, c.Final))
+			if err != nil || root != want { t.Fatalf("%s final root mismatch", c.Name) }
+		}
+	}
+}
+
+func TestDeleteTreeLeafNormalizationBudgetsAndNoops(t *testing.T) {
+	tid, _ := model.NewTypedID(model.BlobKind, [32]byte{1})
+	blob, _ := model.NewBlobID(tid)
+	pathAB, _ := model.NewPath([]byte("ab"))
+	pathA, _ := model.NewPath([]byte("a"))
+	originalRoot, frames, err := BuildSingleLeafTree(context.Background(), pathAB, 1, blob, TreeBuildBudget{4096, 4096*MaxTreePageBytes})
+	if err != nil { t.Fatal(err) }
+	budget := TreeRewriteBudget{4096, 4096*MaxTreePageBytes, 4096*MaxTreePageBytes}
+	root, added, err := SetTreeLeaf(context.Background(), originalRoot, frames, pathA, 1, blob, budget)
+	if err != nil { t.Fatal(err) }
+	for id, frame := range added { frames[id] = frame }
+	p, err := DecodeTreePageAt(frames[root], root, nil, nil)
+	if err != nil || len(p.Children) != 1 { t.Fatal("bad prefix fixture") }
+	before := make(map[TreePageID][]byte)
+	for id, frame := range frames { before[id] = append([]byte(nil), frame...) }
+	// Read the target, fetch its sole child for normalization, then compare
+	// the normalized root against its already-occupied identity.
+	exact := TreeRewriteBudget{2, uint64(len(frames[root])+len(frames[p.Children[0].ID])+len(frames[originalRoot])), uint64(len(frames[originalRoot]))}
+	if got, out, err := DeleteTreeLeaf(context.Background(), root, frames, pathA, exact); err != nil || got != originalRoot || len(out) != 0 { t.Fatalf("exact normalization: %v", err) }
+	for _, limit := range []TreeRewriteBudget{{1, exact.ReadBytes, exact.WriteBytes}, {2, exact.ReadBytes-1, exact.WriteBytes}, {2, exact.ReadBytes, exact.WriteBytes-1}} {
+		if id, out, err := DeleteTreeLeaf(context.Background(), root, frames, pathA, limit); err != metadata.ErrResourceExhausted || id != (TreePageID{}) || out != nil { t.Fatal("normalization exceeded budget") }
+	}
+	for _, name := range []string{"absent", "a/child"} {
+		path, _ := model.NewPath([]byte(name))
+		if got, out, err := DeleteTreeLeaf(context.Background(), root, frames, path, budget); err != nil || got != root || len(out) != 0 { t.Fatal("absent deletion changed root") }
+	}
+	if _, out, err := DeleteTreeLeaf(&treeCancelContext{Context: context.Background()}, root, frames, pathA, budget); err != context.Canceled || out != nil { t.Fatal("mid-normalization cancellation lost") }
+	for id, frame := range before { if !bytes.Equal(frames[id], frame) { t.Fatal("delete mutated input") } }
+	dirPath, _ := model.NewPath([]byte("dir/file"))
+	dirRoot, dirFrames, err := BuildSingleLeafTree(context.Background(), dirPath, 1, blob, TreeBuildBudget{4096, 4096*MaxTreePageBytes})
+	if err != nil { t.Fatal(err) }
+	directory, _ := model.NewPath([]byte("dir"))
+	if got, out, err := DeleteTreeLeaf(context.Background(), dirRoot, dirFrames, directory, budget); err != nil || got != dirRoot || len(out) != 0 { t.Fatal("directory path deleted recursively") }
+}
