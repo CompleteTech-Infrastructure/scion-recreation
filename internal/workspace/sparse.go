@@ -209,3 +209,30 @@ func PlanCanonicalSparseTransition(ctx context.Context, repository [16]byte, sou
 	if err := ctx.Err(); err != nil { return bad(err) }
 	return plan, used, nil
 }
+
+// PlanManifestSparseTransition binds the current base and old selection to one
+// structurally valid Clean manifest, then plans the requested versioned literal
+// selection at that same base. Dirty/Uncertain state requires reconciliation,
+// not an inferred removal plan. Invalid requested syntax also fails before any
+// canonical replay. Only private intents/usage are returned; the manifest and
+// files are never changed, and no new Clean state is manufactured.
+//
+// The caller must obtain the manifest from authoritative local metadata and
+// reconcile actual filesystem state before trusting its Clean claim. A supplied
+// struct cannot prove absence of concurrent edits, current authorization or
+// durability. Locks, durable dirty-before-content journaling and safe checkout
+// remain mandatory external steps. Do not treat this plan as commit permission.
+func PlanManifestSparseTransition(ctx context.Context, repository [16]byte, current Manifest, version uint16, all bool, prefixes []model.Path, sources []derived.TreeSourceFrame, blobs map[model.BlobID][]byte, budget CanonicalSparseBudget) ([]SparseTransition, CanonicalSparseUsage, error) {
+	bad := func(err error) ([]SparseTransition, CanonicalSparseUsage, error) { return nil, CanonicalSparseUsage{}, err }
+	if ctx == nil { return bad(ErrSparseSelection) }
+	if err := ctx.Err(); err != nil { return bad(err) }
+	// Reuse the manifest's exact structural/encoded-size contract. The
+	// temporary encoding is bounded by MaxManifestBytes, not retained.
+	if _, err := encode(current); err != nil { return bad(err) }
+	if current.State != Clean { return bad(ErrRecoveryRequired) }
+	previous, err := CompileSparseSelection(current.SparseVersion, current.SparseAll, current.Sparse)
+	if err != nil { return bad(err) }
+	next, err := CompileSparseSelection(version, all, prefixes)
+	if err != nil { return bad(err) }
+	return PlanCanonicalSparseTransition(ctx, repository, current.Base, sources, blobs, previous, next, budget)
+}
