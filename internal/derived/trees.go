@@ -510,3 +510,181 @@ func BuildSingleLeafTree(ctx context.Context, path model.Path, tag byte, target 
 	if err := ctx.Err(); err != nil { return bad(err) }
 	return root, frames, nil
 }
+
+// SetTreeLeaf applies one SET to a caller-validated retained base graph by
+// anchored radix splitting and path copying. File ancestors/directory targets
+// conflict rather than silently deleting descendants. No DELETE, pruning or
+// simultaneous changeset application is supplied. Output is PRIVATE candidate
+// data, never durable publication, retention or authorization; blob identities
+// are type-checked only. Input maps/frames must not change concurrently.
+// Pages separately caps traversed page fetches and encoded candidate pages
+// (including candidates already occupied by identical bytes). Occupied-identity
+// comparisons consume ReadBytes but are not additional traversal-page charges.
+// ReadBytes includes every compared existing frame, and limits are cumulative
+// within this non-resumable call.
+func SetTreeLeaf(ctx context.Context, root TreePageID, frames map[TreePageID][]byte, path model.Path, tag byte, target model.BlobID, budget TreeRewriteBudget) (TreePageID, map[TreePageID][]byte, error) {
+	bad := func(err error) (TreePageID, map[TreePageID][]byte, error) { return TreePageID{}, nil, err }
+	if ctx == nil || root.Validate() != nil || path.Validate() != nil || tag < 1 || tag > 3 || target.Validate() != nil ||
+		budget.Pages == 0 || budget.Pages > 4096 || budget.ReadBytes == 0 || budget.ReadBytes > 4096*MaxTreePageBytes ||
+		budget.WriteBytes == 0 || budget.WriteBytes > 4096*MaxTreePageBytes { return bad(metadata.ErrInvalidArgument) }
+	raw := path.Bytes()
+	starts := []int{0}
+	for i, b := range raw { if b == '/' { starts = append(starts, i+1) } }
+	endOf := func(i int) int { if i+1 < len(starts) { return starts[i+1]-1 }; return len(raw) }
+	directoryOf := func(i int) []byte { if i == 0 { return nil }; return raw[:starts[i]-1] }
+	var readPages, writePages, readBytes, writeBytes uint64
+	produced := make(map[TreePageID][]byte)
+	compare := func(existing, wanted []byte) error {
+		if len(existing) != len(wanted) { return ErrTreePage }
+		if uint64(len(existing)) > budget.ReadBytes-readBytes { return metadata.ErrResourceExhausted }
+		readBytes += uint64(len(existing))
+		if !bytes.Equal(existing, wanted) { return ErrTreePage }
+		return nil
+	}
+	emit := func(p UnlinkedTreePage, dir, prefix []byte) (TreePageID, error) {
+		if err := ctx.Err(); err != nil { return TreePageID{}, err }
+		n := uint64(24+len(p.Label)+40*len(p.Children))
+		if p.Tag >= 1 && p.Tag <= 3 { n += model.TypedIDSize } else if p.Tag == 4 { n += TreePageIDSize }
+		if writePages == budget.Pages || n > budget.WriteBytes-writeBytes { return TreePageID{}, metadata.ErrResourceExhausted }
+		writePages++
+		writeBytes += n
+		b, id, err := EncodeTreePageAt(p, dir, prefix)
+		if err != nil { return TreePageID{}, err }
+		if old, ok := frames[id]; ok { err = compare(old, b) } else if old, ok := produced[id]; ok { err = compare(old, b) } else { produced[id] = b }
+		return id, err
+	}
+	// Construct only a missing suffix, retaining absolute fragment endpoints
+	// in its first component rather than restarting the 255-byte schedule.
+	suffix := func(first, firstOffset int) (TreePageID, error) {
+		var result TreePageID
+		for i := len(starts)-1; i >= first; i-- {
+			component := raw[starts[i]:endOf(i)]
+			begin := 0
+			if i == first { begin = firstOffset }
+			offset := len(component)/256*256
+			if offset < begin { offset = begin }
+			var continuation TreePageID
+			for {
+				last := offset+255-offset%256
+				var p UnlinkedTreePage
+				if last >= len(component) {
+					p.Label = component[offset:]
+					if i == len(starts)-1 { p.Tag, p.Blob = tag, target } else { p.Tag, p.Directory = 4, result }
+				} else {
+					p.Label = component[offset:last]
+					p.Children = []TreePageChild{{Edge: component[last], ID: continuation}}
+				}
+				id, err := emit(p, directoryOf(i), component[:offset])
+				if err != nil { return TreePageID{}, err }
+				continuation = id
+				if offset == begin { break }
+				offset -= 256
+				if offset < begin { offset = begin }
+			}
+			result = continuation
+		}
+		return result, nil
+	}
+	type ancestor struct { page UnlinkedTreePage; dir, prefix []byte; child int; directory bool }
+	var chain []ancestor
+	current := root
+	ci, pos := 0, 0
+	var replacement TreePageID
+	for {
+		if err := ctx.Err(); err != nil { return bad(err) }
+		if readPages == budget.Pages { return bad(metadata.ErrResourceExhausted) }
+		frame, ok := frames[current]
+		if !ok { return bad(ErrTreePageMissing) }
+		if len(frame) > MaxTreePageBytes { return bad(ErrTreePage) }
+		if uint64(len(frame)) > budget.ReadBytes-readBytes { return bad(metadata.ErrResourceExhausted) }
+		readPages++
+		readBytes += uint64(len(frame))
+		end, dir, prefix := endOf(ci), directoryOf(ci), raw[starts[ci]:pos]
+		p, err := DecodeTreePageAt(frame, current, dir, prefix)
+		if err != nil { return bad(err) }
+		common := 0
+		for common < len(p.Label) && pos+common < end && p.Label[common] == raw[pos+common] { common++ }
+		if common < len(p.Label) {
+			oldEdge := p.Label[common]
+			oldPrefix := make([]byte, len(prefix)+common+1)
+			copy(oldPrefix, prefix)
+			copy(oldPrefix[len(prefix):], p.Label[:common+1])
+			old := p
+			old.Label = p.Label[common+1:]
+			oldID, err := emit(old, dir, oldPrefix)
+			if err != nil { return bad(err) }
+			parent := UnlinkedTreePage{Label: p.Label[:common], Children: []TreePageChild{{oldEdge, oldID}}}
+			pos += common
+			if pos == end {
+				if ci == len(starts)-1 { parent.Tag, parent.Blob = tag, target } else {
+					parent.Tag = 4
+					parent.Directory, err = suffix(ci+1, 0)
+				}
+			} else {
+				newID, e := suffix(ci, pos+1-starts[ci])
+				err = e
+				parent.Children = append(parent.Children, TreePageChild{raw[pos], newID})
+				if parent.Children[0].Edge > parent.Children[1].Edge { parent.Children[0], parent.Children[1] = parent.Children[1], parent.Children[0] }
+			}
+			if err != nil { return bad(err) }
+			replacement, err = emit(parent, dir, prefix)
+			if err != nil { return bad(err) }
+			break
+		}
+		pos += len(p.Label)
+		if pos == end {
+			if ci == len(starts)-1 {
+				if p.Tag == 4 { return bad(metadata.ErrConflict) }
+				if p.Tag == tag && p.Blob == target {
+					if err := ctx.Err(); err != nil { return bad(err) }
+					return root, nil, nil
+				}
+				p.Tag, p.Blob = tag, target
+			} else {
+				if p.Tag >= 1 && p.Tag <= 3 { return bad(metadata.ErrConflict) }
+				if p.Tag == 4 {
+					chain = append(chain, ancestor{page: p, dir: dir, prefix: prefix, directory: true})
+					current = p.Directory
+					ci++
+					pos = starts[ci]
+					continue
+				}
+				p.Tag = 4
+				p.Directory, err = suffix(ci+1, 0)
+				if err != nil { return bad(err) }
+			}
+			replacement, err = emit(p, dir, prefix)
+			if err != nil { return bad(err) }
+			break
+		}
+		edge := raw[pos]
+		i := sort.Search(len(p.Children), func(i int) bool { return p.Children[i].Edge >= edge })
+		if i < len(p.Children) && p.Children[i].Edge == edge {
+			chain = append(chain, ancestor{page: p, dir: dir, prefix: prefix, child: i})
+			current = p.Children[i].ID
+			pos++
+			continue
+		}
+		if p.Tag == 0 && len(p.Children) == 0 {
+			replacement, err = suffix(ci, pos-starts[ci])
+		} else {
+			newID, e := suffix(ci, pos+1-starts[ci])
+			err = e
+			p.Children = append(p.Children, TreePageChild{})
+			copy(p.Children[i+1:], p.Children[i:])
+			p.Children[i] = TreePageChild{edge, newID}
+			if err == nil { replacement, err = emit(p, dir, prefix) }
+		}
+		if err != nil { return bad(err) }
+		break
+	}
+	for i := len(chain)-1; i >= 0; i-- {
+		c := chain[i]
+		if c.directory { c.page.Directory = replacement } else { c.page.Children[c.child].ID = replacement }
+		var err error
+		replacement, err = emit(c.page, c.dir, c.prefix)
+		if err != nil { return bad(err) }
+	}
+	if err := ctx.Err(); err != nil { return bad(err) }
+	return replacement, produced, nil
+}

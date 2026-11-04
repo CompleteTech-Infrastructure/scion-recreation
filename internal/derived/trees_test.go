@@ -525,3 +525,123 @@ func TestBuildSingleLeafModesAndCancellation(t *testing.T) {
 	if _, _, err := BuildSingleLeafTree(context.Background(), model.Path{}, 1, blob, budget); err != metadata.ErrInvalidArgument { t.Fatal("empty path accepted") }
 	if _, _, err := BuildSingleLeafTree(context.Background(), path, 4, blob, budget); err != metadata.ErrInvalidArgument { t.Fatal("directory as file accepted") }
 }
+
+func TestSetTreeLeafLiteralPermutations(t *testing.T) {
+	b, err := os.ReadFile("../../tests/fixtures/tree_pages_v1.json")
+	if err != nil { t.Fatal(err) }
+	var f struct {
+		Pages []treeLiteral `json:"pages"`
+		Positive []struct {
+			Name string `json:"name"`
+			Root string `json:"root_id_hex"`
+			PageIDs []string `json:"page_ids"`
+			Entries []struct { Path string `json:"path_hex"`; Mode string `json:"mode"`; Payload string `json:"blob_payload_hex"` } `json:"entries"`
+		} `json:"positive_vectors"`
+	}
+	if err := json.Unmarshal(b, &f); err != nil { t.Fatal(err) }
+	literals := make(map[string][]byte)
+	for _, p := range f.Pages { literals[p.IDHex] = treeHex(t, p.FrameHex) }
+	budget := TreeRewriteBudget{4096, 4096*MaxTreePageBytes, 4096*MaxTreePageBytes}
+	for _, row := range f.Positive {
+		for _, reverse := range []bool{false, true} {
+			empty, root, err := EncodeTreePageAt(UnlinkedTreePage{}, nil, nil)
+			if err != nil { t.Fatal(err) }
+			frames := map[TreePageID][]byte{root: empty}
+			for j := range row.Entries {
+				i := j
+				if reverse { i = len(row.Entries)-1-j }
+				e := row.Entries[i]
+				path, err := model.NewPath(treeHex(t, e.Path))
+				if err != nil { t.Fatal(err) }
+				payload := treeHex(t, e.Payload)
+				blob, err := model.HashBlob(context.Background(), uint64(len(payload)), bytes.NewReader(payload))
+				if err != nil { t.Fatal(err) }
+				var tag byte
+				switch e.Mode { case "regular": tag = 1; case "executable": tag = 2; case "symlink": tag = 3; default: t.Fatal("unknown fixture mode") }
+				next, added, err := SetTreeLeaf(context.Background(), root, frames, path, tag, blob, budget)
+				if err != nil { t.Fatalf("%s entry %d reverse=%v: %v", row.Name, i, reverse, err) }
+				for id, frame := range added {
+					if old, ok := frames[id]; ok && !bytes.Equal(old, frame) { t.Fatal("old identity overwritten") }
+					frames[id] = frame
+				}
+				root = next
+				same, none, err := SetTreeLeaf(context.Background(), root, frames, path, tag, blob, budget)
+				if err != nil || same != root || len(none) != 0 { t.Fatal("identical SET changed identity") }
+			}
+			expected, err := ParseTreePageID(treeHex(t, row.Root))
+			if err != nil || root != expected { t.Fatalf("%s final root differs, reverse=%v", row.Name, reverse) }
+			for _, text := range row.PageIDs {
+				id, err := ParseTreePageID(treeHex(t, text))
+				if err != nil || !bytes.Equal(frames[id], literals[text]) { t.Fatalf("%s final page differs", row.Name) }
+			}
+		}
+	}
+}
+
+func TestSetTreeLeafConflictsAndOccupiedBudgets(t *testing.T) {
+	tid, _ := model.NewTypedID(model.BlobKind, [32]byte{1})
+	blob, _ := model.NewBlobID(tid)
+	budget := TreeRewriteBudget{4096, 4096*MaxTreePageBytes, 4096*MaxTreePageBytes}
+	build := TreeBuildBudget{4096, 4096*MaxTreePageBytes}
+	for _, pair := range [][2]string{{"a", "a/b"}, {"a/b", "a"}} {
+		basePath, _ := model.NewPath([]byte(pair[0]))
+		path, _ := model.NewPath([]byte(pair[1]))
+		root, frames, err := BuildSingleLeafTree(context.Background(), basePath, 1, blob, build)
+		if err != nil { t.Fatal(err) }
+		id, out, err := SetTreeLeaf(context.Background(), root, frames, path, 1, blob, budget)
+		if err != metadata.ErrConflict || id != (TreePageID{}) || out != nil { t.Fatal("file ancestor/directory conflict lost") }
+	}
+	empty, root, err := EncodeTreePageAt(UnlinkedTreePage{}, nil, nil)
+	if err != nil { t.Fatal(err) }
+	frames := map[TreePageID][]byte{root: empty}
+	path, _ := model.NewPath([]byte("new"))
+	next, out, err := SetTreeLeaf(context.Background(), root, frames, path, 1, blob, budget)
+	if err != nil || len(out) != 1 { t.Fatal(err) }
+	for id, frame := range out { frames[id] = frame }
+	exact := TreeRewriteBudget{1, uint64(len(empty)+len(frames[next])), uint64(len(frames[next]))}
+	if got, out, err := SetTreeLeaf(context.Background(), root, frames, path, 1, blob, exact); err != nil || got != next || len(out) != 0 { t.Fatal("exact occupied read budget failed") }
+	exact.ReadBytes--
+	if id, out, err := SetTreeLeaf(context.Background(), root, frames, path, 1, blob, exact); err != metadata.ErrResourceExhausted || id != (TreePageID{}) || out != nil { t.Fatal("unadmitted comparison succeeded") }
+	ctx, cancel := context.WithCancel(context.Background()); cancel()
+	if _, out, err := SetTreeLeaf(ctx, root, frames, path, 1, blob, budget); err != context.Canceled || out != nil { t.Fatal("canceled SET returned output") }
+	longPath, _ := model.NewPath(bytes.Repeat([]byte{'x'}, 1024))
+	if _, out, err := SetTreeLeaf(&treeCancelContext{Context: context.Background()}, root, frames, longPath, 1, blob, budget); err != context.Canceled || out != nil { t.Fatal("mid-SET cancellation lost") }
+}
+
+func TestSetTreeLeafSplitPreservesBaseAndAdmitsWrites(t *testing.T) {
+	tid, _ := model.NewTypedID(model.BlobKind, [32]byte{1})
+	oldBlob, _ := model.NewBlobID(tid)
+	tid, _ = model.NewTypedID(model.BlobKind, [32]byte{2})
+	newBlob, _ := model.NewBlobID(tid)
+	budget := TreeRewriteBudget{4096, 4096*MaxTreePageBytes, 4096*MaxTreePageBytes}
+	path, _ := model.NewPath([]byte("abc"))
+	root, frames, err := BuildSingleLeafTree(context.Background(), path, 1, oldBlob, TreeBuildBudget{4096, 4096*MaxTreePageBytes})
+	if err != nil { t.Fatal(err) }
+	path, _ = model.NewPath([]byte("abcz"))
+	root, added, err := SetTreeLeaf(context.Background(), root, frames, path, 1, oldBlob, budget)
+	if err != nil { t.Fatal(err) }
+	for id, frame := range added { frames[id] = frame }
+	oldPage, err := DecodeTreePageAt(frames[root], root, nil, nil)
+	if err != nil || len(oldPage.Children) != 1 { t.Fatal("bad branching base") }
+	untouched := oldPage.Children[0].ID
+	before := make(map[TreePageID][]byte)
+	for id, frame := range frames { before[id] = append([]byte(nil), frame...) }
+	path, _ = model.NewPath([]byte("axy"))
+	next, produced, err := SetTreeLeaf(context.Background(), root, frames, path, 1, newBlob, budget)
+	if err != nil || len(produced) != 3 { t.Fatalf("split output: %d %v", len(produced), err) }
+	if _, ok := produced[untouched]; ok { t.Fatal("unrelated continuation rewritten") }
+	parent, err := DecodeTreePageAt(produced[next], next, nil, nil)
+	if err != nil || len(parent.Children) != 2 || parent.Children[0].Edge != 'b' { t.Fatal("wrong split parent") }
+	oldID := parent.Children[0].ID
+	oldBranch, err := DecodeTreePageAt(produced[oldID], oldID, nil, []byte("ab"))
+	if err != nil || len(oldBranch.Children) != 1 || oldBranch.Children[0].ID != untouched { t.Fatal("split lost unrelated identity") }
+	var bytesWritten uint64
+	for _, frame := range produced { bytesWritten += uint64(len(frame)) }
+	exact := TreeRewriteBudget{3, uint64(len(frames[root])), bytesWritten}
+	if got, out, err := SetTreeLeaf(context.Background(), root, frames, path, 1, newBlob, exact); err != nil || got != next || len(out) != 3 { t.Fatalf("exact split budget: %v", err) }
+	for _, limit := range []TreeRewriteBudget{{2, exact.ReadBytes, exact.WriteBytes}, {3, exact.ReadBytes, exact.WriteBytes-1}} {
+		if id, out, err := SetTreeLeaf(context.Background(), root, frames, path, 1, newBlob, limit); err != metadata.ErrResourceExhausted || id != (TreePageID{}) || out != nil { t.Fatal("split exceeded production budget") }
+	}
+	for id, original := range before { if !bytes.Equal(frames[id], original) { t.Fatal("SET mutated base input") } }
+	if len(frames) != len(before) { t.Fatal("SET changed input map") }
+}
