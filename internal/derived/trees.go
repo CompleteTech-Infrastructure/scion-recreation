@@ -283,6 +283,10 @@ func CheckTreePageGraph(ctx context.Context, root TreePageID, frames map[TreePag
 }
 
 func walkTreePageGraph(ctx context.Context, root TreePageID, frames map[TreePageID][]byte, budget TreeGraphBudget, leaf func([]byte, []byte, UnlinkedTreePage) error) (TreeGraphUsage, error) {
+	return walkTreePageView(ctx, root, treeFrameView{base: frames}, budget, leaf)
+}
+
+func walkTreePageView(ctx context.Context, root TreePageID, frames treeFrameView, budget TreeGraphBudget, leaf func([]byte, []byte, UnlinkedTreePage) error) (TreeGraphUsage, error) {
 	var used TreeGraphUsage
 	if ctx == nil || root.Validate() != nil || budget.Visits == 0 || budget.Visits > 4096 ||
 		budget.PageBytes == 0 || budget.PageBytes > 4096*MaxTreePageBytes || budget.ContextBytes == 0 || budget.ContextBytes > 64<<20 {
@@ -326,7 +330,7 @@ func walkTreePageGraph(ctx context.Context, root TreePageID, frames map[TreePage
 		if w.base > len(path) { return used, ErrTreePage }
 		path = path[:w.base]
 		if w.appendEdge && !appendContext([]byte{w.edge}) { return used, metadata.ErrResourceExhausted }
-		frame, ok := frames[w.id]
+		frame, ok := frames.lookup(w.id)
 		if !ok { return used, ErrTreePageMissing }
 		if len(frame) > MaxTreePageBytes { return used, ErrTreePage }
 		if uint64(len(frame)) > budget.PageBytes-used.PageBytes { return used, metadata.ErrResourceExhausted }
@@ -932,7 +936,13 @@ func ApplyTreeChangeset(ctx context.Context, root TreePageID, frames map[TreePag
 // concurrently. InputBytes bounds canonical payload, not allocation/RSS or CPU;
 // validation and canonical hashing add bounded passes separate from page I/O.
 func PrepareTreeWrite(ctx context.Context, identity metadata.DerivedIdentity, change model.ChangesetInput, parent *metadata.DerivedResult, frames map[TreePageID][]byte, budget TreeChangesetBudget) (metadata.DerivedWrite, map[TreePageID][]byte, error) {
-	bad := func(err error) (metadata.DerivedWrite, map[TreePageID][]byte, error) { return metadata.DerivedWrite{}, nil, err }
+	root, parents, err := bindTreeInput(ctx, identity, change, parent, budget)
+	if err != nil { return metadata.DerivedWrite{}, nil, err }
+	return applyBoundTreeWrite(ctx, root, parents, identity, change, frames, budget)
+}
+
+func bindTreeInput(ctx context.Context, identity metadata.DerivedIdentity, change model.ChangesetInput, parent *metadata.DerivedResult, budget TreeChangesetBudget) (TreePageID, []metadata.DerivedResult, error) {
+	bad := func(err error) (TreePageID, []metadata.DerivedResult, error) { return TreePageID{}, nil, err }
 	b := budget.Rewrite
 	if ctx == nil || identity.Validate() != nil || identity.Kind != "TREE" || identity.Version != 1 ||
 		budget.Operations == 0 || budget.Operations > 4096 || budget.InputBytes == 0 || budget.InputBytes > model.MaxChangesetPayload ||
@@ -962,6 +972,11 @@ func PrepareTreeWrite(ctx context.Context, identity metadata.DerivedIdentity, ch
 		if err != nil { return bad(metadata.ErrInvalidArgument) }
 		parents = []metadata.DerivedResult{*parent}
 	}
+	return root, parents, nil
+}
+
+func applyBoundTreeWrite(ctx context.Context, root TreePageID, parents []metadata.DerivedResult, identity metadata.DerivedIdentity, change model.ChangesetInput, frames map[TreePageID][]byte, budget TreeChangesetBudget) (metadata.DerivedWrite, map[TreePageID][]byte, error) {
+	bad := func(err error) (metadata.DerivedWrite, map[TreePageID][]byte, error) { return metadata.DerivedWrite{}, nil, err }
 	root, added, err := ApplyTreeChangeset(ctx, root, frames, change, budget)
 	if err != nil { return bad(err) }
 	raw, err := root.MarshalBinary()
@@ -1124,9 +1139,13 @@ type TreeObjectGraphUsage struct {
 // large blobs can exhaust this non-resumable attempt and need a separate bounded
 // resumable validator, never a false corruption/absence/completion claim.
 func CheckTreeObjectGraph(ctx context.Context, root TreePageID, pageFrames map[TreePageID][]byte, blobFrames map[model.BlobID][]byte, budget TreeObjectGraphBudget) (TreeObjectGraphUsage, error) {
+	return checkTreeObjectView(ctx, root, treeFrameView{base: pageFrames}, blobFrames, budget)
+}
+
+func checkTreeObjectView(ctx context.Context, root TreePageID, pageFrames treeFrameView, blobFrames map[model.BlobID][]byte, budget TreeObjectGraphBudget) (TreeObjectGraphUsage, error) {
 	var used TreeObjectGraphUsage
 	if budget.BlobBytes == 0 || budget.BlobBytes > 1<<20 { return used, metadata.ErrInvalidArgument }
-	graph, err := walkTreePageGraph(ctx, root, pageFrames, budget.Graph, func(_ []byte, _ []byte, page UnlinkedTreePage) error {
+	graph, err := walkTreePageView(ctx, root, pageFrames, budget.Graph, func(_ []byte, _ []byte, page UnlinkedTreePage) error {
 		if err := ctx.Err(); err != nil { return err }
 		used.BlobVisits++
 		frame, ok := blobFrames[page.Blob]
@@ -1140,4 +1159,47 @@ func CheckTreeObjectGraph(ctx context.Context, root TreePageID, pageFrames map[T
 	})
 	used.Graph = graph
 	return used, err
+}
+
+// TreeCheckedWriteBudget explicitly admits two graph-validation quanta plus
+// one rewrite attempt. Total admitted work is bounded by their summed ceilings,
+// not by a single graph quantum. Reused blobs/pages are charged in both phases.
+type TreeCheckedWriteBudget struct {
+	Parent, Candidate TreeObjectGraphBudget
+	Rewrite TreeChangesetBudget
+}
+type TreeCheckedWriteUsage struct { Parent, Candidate TreeObjectGraphUsage }
+
+// PrepareCheckedTreeWrite binds the canonical source and parent-zero mapping,
+// checks all supplied parent page/blob bytes, computes the simultaneous delta,
+// then checks the final reachable candidate page/blob bytes before returning.
+// An overlay resolves new frames without copying the arbitrary caller map.
+// The existing PrepareTreeWrite fast path remains for already-validated bases.
+//
+// This establishes supplied-byte integrity only while inputs remain stable.
+// Mapping provenance, source/parent publication, durable retention, authorization
+// and PutDerived remain separate prerequisites. No provider, storage mutation or
+// transferable validity receipt is created. Errors return no write or frames;
+// usage is private diagnostic data. Returned frames can include unreachable
+// rewrite intermediates: only the candidate root's reachable closure is checked.
+func PrepareCheckedTreeWrite(ctx context.Context, identity metadata.DerivedIdentity, change model.ChangesetInput, parent *metadata.DerivedResult, frames map[TreePageID][]byte, blobs map[model.BlobID][]byte, budget TreeCheckedWriteBudget) (metadata.DerivedWrite, map[TreePageID][]byte, TreeCheckedWriteUsage, error) {
+	var used TreeCheckedWriteUsage
+	bad := func(err error) (metadata.DerivedWrite, map[TreePageID][]byte, TreeCheckedWriteUsage, error) { return metadata.DerivedWrite{}, nil, used, err }
+	admitted := func(b TreeObjectGraphBudget) bool {
+		g := b.Graph
+		return b.BlobBytes > 0 && b.BlobBytes <= 1<<20 && g.Visits > 0 && g.Visits <= 4096 && g.PageBytes > 0 && g.PageBytes <= 4096*MaxTreePageBytes && g.ContextBytes > 0 && g.ContextBytes <= 64<<20
+	}
+	if !admitted(budget.Parent) || !admitted(budget.Candidate) { return bad(metadata.ErrInvalidArgument) }
+	root, parents, err := bindTreeInput(ctx, identity, change, parent, budget.Rewrite)
+	if err != nil { return bad(err) }
+	used.Parent, err = CheckTreeObjectGraph(ctx, root, frames, blobs, budget.Parent)
+	if err != nil { return bad(err) }
+	candidate, added, err := applyBoundTreeWrite(ctx, root, parents, identity, change, frames, budget.Rewrite)
+	if err != nil { return bad(err) }
+	resultRoot, err := ParseTreePageID(candidate.Result.Value.Bytes())
+	if err != nil { return bad(err) }
+	used.Candidate, err = checkTreeObjectView(ctx, resultRoot, treeFrameView{base: frames, staged: added}, blobs, budget.Candidate)
+	if err != nil { return bad(err) }
+	if err := ctx.Err(); err != nil { return bad(err) }
+	return candidate, added, used, nil
 }
