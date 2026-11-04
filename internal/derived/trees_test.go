@@ -736,3 +736,127 @@ func TestDeleteTreeLeafNormalizationBudgetsAndNoops(t *testing.T) {
 	directory, _ := model.NewPath([]byte("dir"))
 	if got, out, err := DeleteTreeLeaf(context.Background(), dirRoot, dirFrames, directory, budget); err != nil || got != dirRoot || len(out) != 0 { t.Fatal("directory path deleted recursively") }
 }
+
+func TestApplyTreeChangesetLiteralDeltas(t *testing.T) {
+	b, err := os.ReadFile("../../tests/fixtures/tree_pages_v1.json")
+	if err != nil { t.Fatal(err) }
+	type entry struct { Op string `json:"op"`; Path string `json:"path_hex"`; Mode string `json:"mode"`; Payload string `json:"blob_payload_hex"` }
+	var f struct { Cases []struct { Name string `json:"name"`; Initial []entry `json:"initial_entries"`; Operations []entry `json:"operations"`; Root string `json:"expected_root_id_hex"`; Reject string `json:"expected_reject"` } `json:"delta_cases"` }
+	if err := json.Unmarshal(b, &f); err != nil { t.Fatal(err) }
+	if len(f.Cases) != 5 { t.Fatal("delta coverage changed") }
+	budget := TreeChangesetBudget{TreeRewriteBudget{4096, 4096*MaxTreePageBytes, 4096*MaxTreePageBytes}, 4096, model.MaxChangesetPayload}
+	tid, _ := model.NewTypedID(model.ChangesetKind, [32]byte{1})
+	parent, _ := model.NewChangesetID(tid)
+	operation := func(e entry) model.Operation {
+		path, err := model.NewPath(treeHex(t, e.Path))
+		if err != nil { t.Fatal(err) }
+		var tag model.OperationTag
+		var target *model.BlobID
+		if e.Op != "delete" {
+			payload := treeHex(t, e.Payload)
+			blob, err := model.HashBlob(context.Background(), uint64(len(payload)), bytes.NewReader(payload))
+			if err != nil { t.Fatal(err) }
+			target = &blob
+			switch e.Mode { case "regular": tag = model.SetRegular; case "executable": tag = model.SetExecutable; case "symlink": tag = model.SetSymlink; default: t.Fatal("unknown mode") }
+		}
+		op, err := model.NewOperation(path, tag, target)
+		if err != nil { t.Fatal(err) }
+		return op
+	}
+	for _, c := range f.Cases {
+		empty, root, err := EncodeTreePageAt(UnlinkedTreePage{}, nil, nil)
+		if err != nil { t.Fatal(err) }
+		frames := map[TreePageID][]byte{root: empty}
+		for _, e := range c.Initial {
+			op := operation(e)
+			blob, _ := op.Target()
+			next, added, err := SetTreeLeaf(context.Background(), root, frames, op.Path(), byte(op.Tag()), blob, budget.Rewrite)
+			if err != nil { t.Fatal(err) }
+			for id, frame := range added { frames[id] = frame }
+			root = next
+		}
+		before := make(map[TreePageID][]byte)
+		for id, frame := range frames { before[id] = append([]byte(nil), frame...) }
+		change := model.ChangesetInput{}
+		if len(c.Initial) != 0 { change.Parents = []model.ChangesetID{parent} }
+		for _, e := range c.Operations { change.Operations = append(change.Operations, operation(e)) }
+		next, added, err := ApplyTreeChangeset(context.Background(), root, frames, change, budget)
+		if c.Reject != "" {
+			if err != metadata.ErrConflict || next != (TreePageID{}) || added != nil { t.Fatalf("%s did not reject atomically: %v", c.Name, err) }
+		} else {
+			want, e := ParseTreePageID(treeHex(t, c.Root))
+			if err != nil || e != nil || next != want { t.Fatalf("%s final root: %v", c.Name, err) }
+		}
+		if len(frames) != len(before) { t.Fatal("batch changed input map") }
+		for id, frame := range before { if !bytes.Equal(frames[id], frame) { t.Fatal("batch mutated input bytes") } }
+	}
+}
+
+func TestApplyTreeChangesetCumulativeBudgetAndValidation(t *testing.T) {
+	empty, root, err := EncodeTreePageAt(UnlinkedTreePage{}, nil, nil)
+	if err != nil { t.Fatal(err) }
+	frames := map[TreePageID][]byte{root: empty}
+	pa, _ := model.NewPath([]byte("a")); pb, _ := model.NewPath([]byte("b"))
+	da, _ := model.NewOperation(pa, model.Delete, nil); db, _ := model.NewOperation(pb, model.Delete, nil)
+	change := model.ChangesetInput{Operations: []model.Operation{da, db}}
+	budget := TreeChangesetBudget{TreeRewriteBudget{2, 48, 1}, 2, model.MaxChangesetPayload}
+	if got, out, err := ApplyTreeChangeset(context.Background(), root, frames, change, budget); err != nil || got != root || len(out) != 0 { t.Fatal("exact cumulative no-op budget failed") }
+	inputSize, err := model.ValidateChangeset(change)
+	if err != nil { t.Fatal(err) }
+	inputLimit := budget; inputLimit.InputBytes = inputSize
+	if _, _, err := ApplyTreeChangeset(context.Background(), root, frames, change, inputLimit); err != nil { t.Fatal("exact input byte budget failed") }
+	inputLimit.InputBytes--
+	if _, out, err := ApplyTreeChangeset(context.Background(), root, frames, change, inputLimit); err != metadata.ErrResourceExhausted || out != nil { t.Fatal("input byte overflow accepted") }
+	inputLimit = budget; inputLimit.Operations = 1
+	if _, out, err := ApplyTreeChangeset(context.Background(), root, frames, change, inputLimit); err != metadata.ErrResourceExhausted || out != nil { t.Fatal("operation count overflow accepted") }
+	for _, limit := range []TreeRewriteBudget{{1, 48, 1}, {2, 47, 1}} {
+		b := budget; b.Rewrite = limit
+		if got, out, err := ApplyTreeChangeset(context.Background(), root, frames, change, b); err != metadata.ErrResourceExhausted || got != (TreePageID{}) || out != nil { t.Fatal("read budget reset between operations") }
+	}
+	for _, ops := range [][]model.Operation{{db, da}, {da, da}, {{}}} {
+		invalid := model.ChangesetInput{Operations: ops}
+		if _, _, err := ApplyTreeChangeset(context.Background(), root, frames, invalid, budget); err != metadata.ErrInvalidArgument { t.Fatal("noncanonical delta accepted") }
+	}
+	var ops []model.Operation
+	for i, path := range []model.Path{pa, pb} {
+		tid, _ := model.NewTypedID(model.BlobKind, [32]byte{byte(i+1)})
+		blob, _ := model.NewBlobID(tid)
+		op, _ := model.NewOperation(path, model.SetRegular, &blob)
+		ops = append(ops, op)
+	}
+	change.Operations = ops
+	// First SET: one 60-byte frame. Second: two 59-byte suffixes and a
+	// 104-byte branch. Reads are the 24-byte empty root then 60-byte leaf.
+	budget.Rewrite = TreeRewriteBudget{4, 84, 282}
+	got, out, err := ApplyTreeChangeset(context.Background(), root, frames, change, budget)
+	if err != nil || got == root || len(out) != 4 { t.Fatalf("exact cumulative writes: %v", err) }
+	for _, limit := range []TreeRewriteBudget{{3, 84, 282}, {4, 84, 281}} {
+		b := budget; b.Rewrite = limit
+		if got, out, err := ApplyTreeChangeset(context.Background(), root, frames, change, b); err != metadata.ErrResourceExhausted || got != (TreePageID{}) || out != nil { t.Fatal("write budget reset between operations") }
+	}
+	if _, out, err := ApplyTreeChangeset(&treeCancelContext{Context: context.Background()}, root, frames, change, budget); err != context.Canceled || out != nil { t.Fatal("batch cancellation lost") }
+	if _, _, err := ApplyTreeChangeset(context.Background(), got, out, model.ChangesetInput{}, budget); err != metadata.ErrInvalidArgument { t.Fatal("parentless change accepted nonempty base") }
+}
+
+func TestApplyTreeChangesetDeleteThenSetBudgetAtomicity(t *testing.T) {
+	pa, _ := model.NewPath([]byte("a")); pb, _ := model.NewPath([]byte("b"))
+	tid, _ := model.NewTypedID(model.BlobKind, [32]byte{1})
+	blob, _ := model.NewBlobID(tid)
+	root, frames, err := BuildSingleLeafTree(context.Background(), pa, 1, blob, TreeBuildBudget{1, 60})
+	if err != nil { t.Fatal(err) }
+	before := append([]byte(nil), frames[root]...)
+	parentID, _ := model.NewTypedID(model.ChangesetKind, [32]byte{1})
+	parent, _ := model.NewChangesetID(parentID)
+	deleteA, _ := model.NewOperation(pa, model.Delete, nil)
+	setB, _ := model.NewOperation(pb, model.SetRegular, &blob)
+	change := model.ChangesetInput{Parents: []model.ChangesetID{parent}, Operations: []model.Operation{deleteA, setB}}
+	// DELETE reads the 60-byte leaf and writes the 24-byte empty root.
+	// SET then reads that staged empty root and writes a new 60-byte leaf.
+	budget := TreeChangesetBudget{TreeRewriteBudget{2, 84, 84}, 2, model.MaxChangesetPayload}
+	want, _, err := BuildSingleLeafTree(context.Background(), pb, 1, blob, TreeBuildBudget{1, 60})
+	if err != nil { t.Fatal(err) }
+	if got, out, err := ApplyTreeChangeset(context.Background(), root, frames, change, budget); err != nil || got != want || len(out) != 2 { t.Fatalf("exact cross-phase budget: %v", err) }
+	budget.Rewrite.WriteBytes--
+	if got, out, err := ApplyTreeChangeset(context.Background(), root, frames, change, budget); err != metadata.ErrResourceExhausted || got != (TreePageID{}) || out != nil { t.Fatal("failed SET exposed successful DELETE") }
+	if len(frames) != 1 || !bytes.Equal(frames[root], before) { t.Fatal("cross-phase failure mutated trusted base") }
+}

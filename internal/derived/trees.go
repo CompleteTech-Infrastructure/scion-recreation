@@ -523,6 +523,11 @@ func BuildSingleLeafTree(ctx context.Context, path model.Path, tag byte, target 
 // ReadBytes includes every compared existing frame, and limits are cumulative
 // within this non-resumable call.
 func SetTreeLeaf(ctx context.Context, root TreePageID, frames map[TreePageID][]byte, path model.Path, tag byte, target model.BlobID, budget TreeRewriteBudget) (TreePageID, map[TreePageID][]byte, error) {
+	return setTreeLeaf(ctx, root, treeFrameView{base: frames}, path, tag, target, &treeRewriteMeter{limit: budget})
+}
+
+func setTreeLeaf(ctx context.Context, root TreePageID, frames treeFrameView, path model.Path, tag byte, target model.BlobID, meter *treeRewriteMeter) (TreePageID, map[TreePageID][]byte, error) {
+	budget := meter.limit
 	bad := func(err error) (TreePageID, map[TreePageID][]byte, error) { return TreePageID{}, nil, err }
 	if ctx == nil || root.Validate() != nil || path.Validate() != nil || tag < 1 || tag > 3 || target.Validate() != nil ||
 		budget.Pages == 0 || budget.Pages > 4096 || budget.ReadBytes == 0 || budget.ReadBytes > 4096*MaxTreePageBytes ||
@@ -532,12 +537,11 @@ func SetTreeLeaf(ctx context.Context, root TreePageID, frames map[TreePageID][]b
 	for i, b := range raw { if b == '/' { starts = append(starts, i+1) } }
 	endOf := func(i int) int { if i+1 < len(starts) { return starts[i+1]-1 }; return len(raw) }
 	directoryOf := func(i int) []byte { if i == 0 { return nil }; return raw[:starts[i]-1] }
-	var readPages, writePages, readBytes, writeBytes uint64
 	produced := make(map[TreePageID][]byte)
 	compare := func(existing, wanted []byte) error {
 		if len(existing) != len(wanted) { return ErrTreePage }
-		if uint64(len(existing)) > budget.ReadBytes-readBytes { return metadata.ErrResourceExhausted }
-		readBytes += uint64(len(existing))
+		if uint64(len(existing)) > budget.ReadBytes-meter.readBytes { return metadata.ErrResourceExhausted }
+		meter.readBytes += uint64(len(existing))
 		if !bytes.Equal(existing, wanted) { return ErrTreePage }
 		return nil
 	}
@@ -545,12 +549,12 @@ func SetTreeLeaf(ctx context.Context, root TreePageID, frames map[TreePageID][]b
 		if err := ctx.Err(); err != nil { return TreePageID{}, err }
 		n := uint64(24+len(p.Label)+40*len(p.Children))
 		if p.Tag >= 1 && p.Tag <= 3 { n += model.TypedIDSize } else if p.Tag == 4 { n += TreePageIDSize }
-		if writePages == budget.Pages || n > budget.WriteBytes-writeBytes { return TreePageID{}, metadata.ErrResourceExhausted }
-		writePages++
-		writeBytes += n
+		if meter.writePages == budget.Pages || n > budget.WriteBytes-meter.writeBytes { return TreePageID{}, metadata.ErrResourceExhausted }
+		meter.writePages++
+		meter.writeBytes += n
 		b, id, err := EncodeTreePageAt(p, dir, prefix)
 		if err != nil { return TreePageID{}, err }
-		if old, ok := frames[id]; ok { err = compare(old, b) } else if old, ok := produced[id]; ok { err = compare(old, b) } else { produced[id] = b }
+		if old, ok := frames.lookup(id); ok { err = compare(old, b) } else if old, ok := produced[id]; ok { err = compare(old, b) } else { produced[id] = b }
 		return id, err
 	}
 	// Construct only a missing suffix, retaining absolute fragment endpoints
@@ -592,13 +596,13 @@ func SetTreeLeaf(ctx context.Context, root TreePageID, frames map[TreePageID][]b
 	var replacement TreePageID
 	for {
 		if err := ctx.Err(); err != nil { return bad(err) }
-		if readPages == budget.Pages { return bad(metadata.ErrResourceExhausted) }
-		frame, ok := frames[current]
+		if meter.readPages == budget.Pages { return bad(metadata.ErrResourceExhausted) }
+		frame, ok := frames.lookup(current)
 		if !ok { return bad(ErrTreePageMissing) }
 		if len(frame) > MaxTreePageBytes { return bad(ErrTreePage) }
-		if uint64(len(frame)) > budget.ReadBytes-readBytes { return bad(metadata.ErrResourceExhausted) }
-		readPages++
-		readBytes += uint64(len(frame))
+		if uint64(len(frame)) > budget.ReadBytes-meter.readBytes { return bad(metadata.ErrResourceExhausted) }
+		meter.readPages++
+		meter.readBytes += uint64(len(frame))
 		end, dir, prefix := endOf(ci), directoryOf(ci), raw[starts[ci]:pos]
 		p, err := DecodeTreePageAt(frame, current, dir, prefix)
 		if err != nil { return bad(err) }
@@ -699,6 +703,11 @@ func SetTreeLeaf(ctx context.Context, root TreePageID, frames map[TreePageID][]b
 // the candidate graph. Inputs must not change concurrently. Budget semantics
 // match SetTreeLeaf, including normalization fetches and occupied comparisons.
 func DeleteTreeLeaf(ctx context.Context, root TreePageID, frames map[TreePageID][]byte, path model.Path, budget TreeRewriteBudget) (TreePageID, map[TreePageID][]byte, error) {
+	return deleteTreeLeaf(ctx, root, treeFrameView{base: frames}, path, &treeRewriteMeter{limit: budget})
+}
+
+func deleteTreeLeaf(ctx context.Context, root TreePageID, frames treeFrameView, path model.Path, meter *treeRewriteMeter) (TreePageID, map[TreePageID][]byte, error) {
+	budget := meter.limit
 	bad := func(err error) (TreePageID, map[TreePageID][]byte, error) { return TreePageID{}, nil, err }
 	if ctx == nil || root.Validate() != nil || path.Validate() != nil || budget.Pages == 0 || budget.Pages > 4096 ||
 		budget.ReadBytes == 0 || budget.ReadBytes > 4096*MaxTreePageBytes || budget.WriteBytes == 0 || budget.WriteBytes > 4096*MaxTreePageBytes { return bad(metadata.ErrInvalidArgument) }
@@ -706,35 +715,34 @@ func DeleteTreeLeaf(ctx context.Context, root TreePageID, frames map[TreePageID]
 		if err := ctx.Err(); err != nil { return bad(err) }
 		return root, nil, nil
 	}
-	var readPages, writePages, readBytes, writeBytes uint64
 	produced := make(map[TreePageID][]byte)
 	read := func(id TreePageID, dir, prefix []byte) (UnlinkedTreePage, error) {
 		if err := ctx.Err(); err != nil { return UnlinkedTreePage{}, err }
-		if readPages == budget.Pages { return UnlinkedTreePage{}, metadata.ErrResourceExhausted }
+		if meter.readPages == budget.Pages { return UnlinkedTreePage{}, metadata.ErrResourceExhausted }
 		b, ok := produced[id]
-		if !ok { b, ok = frames[id] }
+		if !ok { b, ok = frames.lookup(id) }
 		if !ok { return UnlinkedTreePage{}, ErrTreePageMissing }
 		if len(b) > MaxTreePageBytes { return UnlinkedTreePage{}, ErrTreePage }
-		if uint64(len(b)) > budget.ReadBytes-readBytes { return UnlinkedTreePage{}, metadata.ErrResourceExhausted }
-		readPages++
-		readBytes += uint64(len(b))
+		if uint64(len(b)) > budget.ReadBytes-meter.readBytes { return UnlinkedTreePage{}, metadata.ErrResourceExhausted }
+		meter.readPages++
+		meter.readBytes += uint64(len(b))
 		return DecodeTreePageAt(b, id, dir, prefix)
 	}
 	emit := func(p UnlinkedTreePage, dir, prefix []byte) (TreePageID, error) {
 		if err := ctx.Err(); err != nil { return TreePageID{}, err }
 		n := uint64(24+len(p.Label)+40*len(p.Children))
 		if p.Tag >= 1 && p.Tag <= 3 { n += model.TypedIDSize } else if p.Tag == 4 { n += TreePageIDSize }
-		if writePages == budget.Pages || n > budget.WriteBytes-writeBytes { return TreePageID{}, metadata.ErrResourceExhausted }
-		writePages++
-		writeBytes += n
+		if meter.writePages == budget.Pages || n > budget.WriteBytes-meter.writeBytes { return TreePageID{}, metadata.ErrResourceExhausted }
+		meter.writePages++
+		meter.writeBytes += n
 		b, id, err := EncodeTreePageAt(p, dir, prefix)
 		if err != nil { return TreePageID{}, err }
-		old, ok := frames[id]
+		old, ok := frames.lookup(id)
 		if !ok { old, ok = produced[id] }
 		if ok {
 			if len(old) != len(b) { return TreePageID{}, ErrTreePage }
-			if uint64(len(old)) > budget.ReadBytes-readBytes { return TreePageID{}, metadata.ErrResourceExhausted }
-			readBytes += uint64(len(old))
+			if uint64(len(old)) > budget.ReadBytes-meter.readBytes { return TreePageID{}, metadata.ErrResourceExhausted }
+			meter.readBytes += uint64(len(old))
 			if !bytes.Equal(old, b) { return TreePageID{}, ErrTreePage }
 		} else { produced[id] = b }
 		return id, nil
@@ -819,4 +827,75 @@ func DeleteTreeLeaf(ctx context.Context, root TreePageID, frames map[TreePageID]
 	}
 	if err := ctx.Err(); err != nil { return bad(err) }
 	return replacement, produced, nil
+}
+
+
+type treeFrameView struct { base, staged map[TreePageID][]byte }
+func (v treeFrameView) lookup(id TreePageID) ([]byte, bool) {
+ if b, ok := v.staged[id]; ok { return b, true }
+ b, ok := v.base[id]
+ return b, ok
+}
+
+type treeRewriteMeter struct {
+ limit TreeRewriteBudget
+ readPages, writePages, readBytes, writeBytes uint64
+}
+
+type TreeChangesetBudget struct {
+	Rewrite TreeRewriteBudget
+	Operations, InputBytes uint64
+}
+
+// ApplyTreeChangeset validates canonical changeset syntax, removes all exact
+// DELETE leaves, then applies SETs against the parent-zero tree. This implements
+// simultaneous delta semantics, not a union of additional parent trees. The
+// supplied root MUST be the caller-verified retained tree of parent zero (or
+// the literal empty root for no parents). Nonempty parent/repository binding,
+// blob validity/retention, authorization and publication remain unverified.
+//
+// A private overlay and ONE shared meter cover the whole batch, without copying
+// the caller's potentially large frame map or resetting budgets per operation.
+// Failure returns no candidate root/frames; no caller data is changed. Returned
+// frames may include bounded intermediates; only the final root defines content.
+// Inputs must not change concurrently. This is not a resumable transaction or
+// backend commit, and input/path validation is not an interruptible CPU bound.
+func ApplyTreeChangeset(ctx context.Context, root TreePageID, frames map[TreePageID][]byte, change model.ChangesetInput, budget TreeChangesetBudget) (TreePageID, map[TreePageID][]byte, error) {
+	bad := func(err error) (TreePageID, map[TreePageID][]byte, error) { return TreePageID{}, nil, err }
+	b := budget.Rewrite
+	if ctx == nil || root.Validate() != nil || budget.Operations == 0 || budget.Operations > 4096 ||
+		budget.InputBytes == 0 || budget.InputBytes > model.MaxChangesetPayload || b.Pages == 0 || b.Pages > 4096 ||
+		b.ReadBytes == 0 || b.ReadBytes > 4096*MaxTreePageBytes || b.WriteBytes == 0 || b.WriteBytes > 4096*MaxTreePageBytes { return bad(metadata.ErrInvalidArgument) }
+	if err := ctx.Err(); err != nil { return bad(err) }
+	if uint64(len(change.Operations)) > budget.Operations || uint64(len(change.Message)) > budget.InputBytes { return bad(metadata.ErrResourceExhausted) }
+	size, err := model.ValidateChangeset(change)
+	if err != nil { return bad(metadata.ErrInvalidArgument) }
+	if size > budget.InputBytes { return bad(metadata.ErrResourceExhausted) }
+	if len(change.Parents) == 0 {
+		empty := sha256.Sum256([]byte("CANOPY\x00TREE\x00\x00\x01\x01\x00\x00\x00\x05\x00\x00\x00\x00\x00"))
+		if !bytes.Equal(root.raw[7:], empty[:]) { return bad(metadata.ErrInvalidArgument) }
+	}
+	view := treeFrameView{base: frames, staged: make(map[TreePageID][]byte)}
+	meter := &treeRewriteMeter{limit: b}
+	current := root
+	for _, deletions := range []bool{true, false} {
+		for _, op := range change.Operations {
+			if err := ctx.Err(); err != nil { return bad(err) }
+			if (op.Tag() == model.Delete) != deletions { continue }
+			var added map[TreePageID][]byte
+			if deletions { current, added, err = deleteTreeLeaf(ctx, current, view, op.Path(), meter) } else {
+				target, ok := op.Target()
+				if !ok { return bad(metadata.ErrInvalidArgument) }
+				current, added, err = setTreeLeaf(ctx, current, view, op.Path(), byte(op.Tag()), target, meter)
+			}
+			if err != nil { return bad(err) }
+			for id, frame := range added {
+				if err := ctx.Err(); err != nil { return bad(err) }
+				view.staged[id] = frame
+			}
+		}
+	}
+	if err := ctx.Err(); err != nil { return bad(err) }
+	if len(view.staged) == 0 { return current, nil, nil }
+	return current, view.staged, nil
 }
