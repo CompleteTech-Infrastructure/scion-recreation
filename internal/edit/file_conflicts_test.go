@@ -26,9 +26,9 @@ func TestWholeFileMergeDecisions(t *testing.T) {
 	link := fileFixture(t, model.SetSymlink, "../raw\xff")
 	exec := fileFixture(t, model.SetExecutable, "a\r\n")
 	for _, tc := range []struct {
-		name string
+		name                    string
 		base, left, right, want FileVersion
-		conflict bool
+		conflict                bool
 	}{
 		{"unchanged", a, a, a, a, false},
 		{"one-side-edit", a, a, b, b, false},

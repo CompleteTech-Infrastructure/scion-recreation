@@ -8,7 +8,7 @@ import (
 )
 
 var (
-	ErrFileState = errors.New("invalid file conflict state")
+	ErrFileState  = errors.New("invalid file conflict state")
 	ErrFileBudget = errors.New("file conflict byte budget exhausted")
 )
 
