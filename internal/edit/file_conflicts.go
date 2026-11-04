@@ -297,3 +297,54 @@ func PrepareFileOperation(ctx context.Context, path model.Path, version FileVers
 	if err := ctx.Err(); err != nil { return zero, err }
 	return PreparedFileOperation{Operation: op, BlobFrame: frame.Bytes()}, nil
 }
+
+// ResolvedFileEntry binds an explicit resolved state to one canonical path.
+// This is private input, not proof that a conflict was resolved or authorized.
+type ResolvedFileEntry struct { Path model.Path; Version FileVersion }
+
+// FilePreparationBudget bounds the entire batch, not each entry. Entries and
+// PathBytes must be positive and at most 4096 and 64 MiB respectively. Payload
+// may be zero and is capped at 64 MiB. Frames may be zero and is capped at
+// 64 MiB + 4096*22, including each present entry's canonical header. Repeated
+// content counts separately: no implicit deduplication bypasses admission.
+type FilePreparationBudget struct { Entries, PathBytes, Payload, Frames uint64 }
+
+// PrepareFileOperations requires strictly raw-byte-sorted unique paths and
+// preflights all descriptors and aggregate sizes before hashing/encoding any
+// blob. Each result corresponds to its input, preserving SET/DELETE and modes.
+// Empty input succeeds with nil results; any error returns nil results, never
+// a usable prefix. Output frame slices are owned independently of each other.
+//
+// This checks local candidate syntax/admission, NOT whole-tree validity (e.g.
+// file/descendant conflicts), complete changeset canonicality, authorization,
+// conflict resolution, upload/durability or publication. The caller must perform
+// those checks before using these PRIVATE candidates. Aggregate retained output
+// is bounded but temporary copies/allocator overhead are not a measured RSS cap.
+// Inputs must not mutate during the call. No partial resume state is returned.
+func PrepareFileOperations(ctx context.Context, entries []ResolvedFileEntry, budget FilePreparationBudget) ([]PreparedFileOperation, error) {
+	if ctx == nil { return nil, ErrFileState }
+	if err := ctx.Err(); err != nil { return nil, err }
+	if budget.Entries == 0 || budget.Entries > 4096 || budget.PathBytes == 0 || budget.PathBytes > 64<<20 || budget.Payload > 64<<20 || budget.Frames > (64<<20)+4096*22 { return nil, ErrFileBudget }
+	if uint64(len(entries)) > budget.Entries { return nil, ErrFileBudget }
+	var paths, payload, frames uint64
+	for i, entry := range entries {
+		if err := ctx.Err(); err != nil { return nil, err }
+		if entry.Path.Validate() != nil || entry.Version.Validate() != nil || (i > 0 && entries[i-1].Path.Compare(entry.Path) >= 0) { return nil, ErrFileState }
+		n := uint64(len(entry.Path.Bytes()))
+		if n > budget.PathBytes-paths { return nil, ErrFileBudget }; paths += n
+		n = uint64(len(entry.Version.content))
+		if n > budget.Payload-payload { return nil, ErrFileBudget }; payload += n
+		if !entry.Version.IsAbsent() {
+			n += 22
+			if n > budget.Frames-frames { return nil, ErrFileBudget }; frames += n
+		}
+	}
+	var out []PreparedFileOperation
+	for _, entry := range entries {
+		candidate, err := PrepareFileOperation(ctx, entry.Path, entry.Version, uint64(len(entry.Version.content)))
+		if err != nil { return nil, err }
+		out = append(out, candidate)
+	}
+	if err := ctx.Err(); err != nil { return nil, err }
+	return out, nil
+}
