@@ -5,8 +5,10 @@ import (
 	"context"
 	"errors"
 
+	"canopy.local/canopy/internal/derived"
 	"canopy.local/canopy/internal/model"
 	"canopy.local/canopy/internal/query"
+	storage "canopy.local/canopy/internal/storage/metadata"
 )
 
 var ErrStatusInput = errors.New("invalid workspace status snapshot")
@@ -20,6 +22,52 @@ type ObservedFile struct {
 	Path model.Path
 	Tag model.OperationTag
 	Payload []byte
+}
+
+// CanonicalStatusBudget gives replay, complete base enumeration and status
+// comparison separate admission quanta. Total work is their sum, including all
+// replay step limits. It is not one cumulative allocation or CPU-time budget.
+type CanonicalStatusBudget struct {
+	Replay derived.TreeReplayBudget
+	Snapshot derived.TreeEntriesBudget
+	Compare StatusBudget
+}
+type CanonicalStatusUsage struct { Replay derived.TreeReplayUsage; Snapshot derived.TreeGraphUsage }
+
+// CompareCanonicalStatus derives binding.Base from the complete supplied
+// topologically ordered canonical DAG and verified blobs before comparing
+// observed workspace bytes. Every source, including unrelated/later sources and
+// nonzero parents, must verify. Parent zero alone supplies each tree's base.
+// A missing requested source fails only after successful complete replay.
+//
+// This removes caller-asserted base rows, NOT the need for stable complete
+// filesystem observations, trusted manifest provenance, source publication,
+// authorization, or durable clean-state reconciliation. No storage is mutated.
+// All outputs/errors/usage are private. Inputs must remain stable. A failure in
+// any phase returns nil deltas; usage is attempted work, not verified freshness.
+func CompareCanonicalStatus(ctx context.Context, repository [16]byte, binding Manifest, sources []derived.TreeSourceFrame, blobs map[model.BlobID][]byte, observed []ObservedFile, budget CanonicalStatusBudget) ([]query.FileDelta, CanonicalStatusUsage, error) {
+	var used CanonicalStatusUsage
+	bad := func(err error) ([]query.FileDelta, CanonicalStatusUsage, error) { return nil, used, err }
+	// Validate comparison/selection admission before expensive canonical work.
+	if _, err := CompareStatusSnapshot(ctx, binding, binding.Base, nil, nil, budget.Compare); err != nil { return bad(err) }
+	if uint64(len(observed)) > budget.Compare.Entries { return bad(ErrStatusLimit) }
+	writes, pages, replay, err := derived.ReplayCanonicalTreeDAG(ctx, repository, sources, blobs, budget.Replay)
+	used.Replay = replay
+	if err != nil { return bad(err) }
+	for _, write := range writes {
+		if err := ctx.Err(); err != nil { return bad(err) }
+		if write.Result.Identity.Changeset != binding.Base { continue }
+		root, err := derived.ParseTreePageID(write.Result.Value.Bytes())
+		if err != nil { return bad(err) }
+		rows, snapshot, err := derived.ReadTreeEntries(ctx, root, pages, budget.Snapshot)
+		used.Snapshot = snapshot
+		if err != nil { return bad(err) }
+		deltas, err := CompareStatusSnapshot(ctx, binding, binding.Base, rows, observed, budget.Compare)
+		if err != nil { return bad(err) }
+		return deltas, used, nil
+	}
+	if err := ctx.Err(); err != nil { return bad(err) }
+	return bad(storage.ErrNotFound)
 }
 
 // StatusBudget bounds combined input rows/path bytes, selected payload bytes
