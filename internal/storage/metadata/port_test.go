@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"math"
 	"reflect"
 	"testing"
@@ -393,5 +394,43 @@ func TestPortHasDetachedPublishSurface(t *testing.T) {
 		if _, ok := request.FieldByName(name); ok {
 			t.Fatalf("publication request must not require global sequence field %q", name)
 		}
+	}
+}
+
+func TestPublicationFailedStatusRejectsWrappedUncertainty(t *testing.T) {
+	permanent := []error{
+		metadata.ErrInvalidArgument, metadata.ErrUnauthenticated, metadata.ErrPermissionDenied,
+		metadata.ErrNotFound, metadata.ErrConflict, metadata.ErrFailedPrecondition,
+		metadata.ErrResourceExhausted, metadata.ErrCorruptData,
+	}
+	uncertain := []error{
+		metadata.ErrUnavailable, metadata.ErrDeadlineExceeded, metadata.ErrOutcomeUnknown,
+		context.Canceled, context.DeadlineExceeded,
+	}
+	for _, cause := range permanent {
+		// A well-established permanent result remains valid through wrapping.
+		for _, failure := range []error{cause, fmt.Errorf("protected detail: %w", cause)} {
+			status := metadata.PublicationStatus{State: metadata.WriteFailed, Failure: failure}
+			if err := status.Validate(); err != nil {
+				t.Fatalf("permanent failure rejected: %v", err)
+			}
+		}
+		for _, interruption := range uncertain {
+			for _, failure := range []error{
+				errors.Join(cause, interruption),
+				errors.Join(interruption, cause),
+				fmt.Errorf("protected detail: %w", errors.Join(cause, interruption)),
+				errors.Join(fmt.Errorf("permanent: %w", cause), fmt.Errorf("interrupted: %w", interruption)),
+			} {
+				status := metadata.PublicationStatus{State: metadata.WriteFailed, Failure: failure}
+				if err := status.Validate(); err != metadata.ErrInvalidArgument {
+					t.Fatalf("mixed permanent/uncertain status accepted: %v", err)
+				}
+			}
+		}
+	}
+	for _, cause := range uncertain {
+		status := metadata.PublicationStatus{State: metadata.WriteFailed, Failure: cause}
+		expectError(t, status.Validate(), metadata.ErrInvalidArgument)
 	}
 }

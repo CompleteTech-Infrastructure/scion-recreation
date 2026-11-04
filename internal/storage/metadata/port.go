@@ -131,7 +131,12 @@ func (s PublicationStatus) Validate() error {
 			return nil
 		}
 	case WriteFailed:
-		if empty && s.Failure != nil && !errors.Is(s.Failure, ErrUnavailable) && !errors.Is(s.Failure, ErrDeadlineExceeded) && !errors.Is(s.Failure, ErrOutcomeUnknown) {
+		// Native context termination must not disappear inside a joined error
+		// that also carries a permanent sentinel. It does not establish a
+		// permanent write outcome, just like the metadata deadline sentinel.
+		if empty && s.Failure != nil && !errors.Is(s.Failure, ErrUnavailable) &&
+			!errors.Is(s.Failure, ErrDeadlineExceeded) && !errors.Is(s.Failure, ErrOutcomeUnknown) &&
+			!errors.Is(s.Failure, context.Canceled) && !errors.Is(s.Failure, context.DeadlineExceeded) {
 			for _, cause := range []error{ErrInvalidArgument, ErrUnauthenticated, ErrPermissionDenied, ErrNotFound, ErrConflict, ErrFailedPrecondition, ErrResourceExhausted, ErrCorruptData} {
 				if errors.Is(s.Failure, cause) {
 					return nil
