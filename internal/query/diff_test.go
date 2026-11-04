@@ -310,3 +310,45 @@ func TestPrivateTreeDiffMatchesFileEntries(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background()); cancel()
 	if got, _, err := DiffPrivateTrees(ctx, roots, both, privateDiffBudget()); err != context.Canceled || got != nil { t.Fatal(got, err) }
 }
+
+func TestPrivateExactPathDiff(t *testing.T) {
+	path, err := model.NewPath([]byte("dir/\xff")); if err != nil { t.Fatal(err) }
+	makeRow := func(tag model.OperationTag, digest byte) model.Operation {
+		tid, _ := model.NewTypedID(model.BlobKind, [32]byte{digest}); blob, _ := model.NewBlobID(tid)
+		op, err := model.NewOperation(path, tag, &blob); if err != nil { t.Fatal(err) }; return op
+	}
+	regular, executable, symlink := makeRow(model.SetRegular, 1), makeRow(model.SetExecutable, 2), makeRow(model.SetSymlink, 3)
+	states := [][]model.Operation{nil, {regular}, {executable}, {symlink}, {makeRow(model.SetExecutable, 1)}, {makeRow(model.SetRegular, 2)}}
+	budget := [2]derived.TreeLookupBudget{{4096, 4096*derived.MaxTreePageBytes}, {4096, 4096*derived.MaxTreePageBytes}}
+	for _, before := range states {
+		for _, after := range states {
+			var roots [2]derived.TreePageID; var frames [2]map[derived.TreePageID][]byte
+			roots[0], frames[0] = privateDiffTree(t, before); roots[1], frames[1] = privateDiffTree(t, after)
+			want, err := DiffFileEntries(context.Background(), before, after, FileDiffBudget{2, 131070, 1}); if err != nil { t.Fatal(err) }
+			got, usage, err := DiffPrivateTreePath(context.Background(), roots, frames, path, budget)
+			if err != nil || len(got) != len(want) || usage[0].Pages == 0 || usage[1].Pages == 0 { t.Fatal(got, usage, err) }
+			if len(want) == 1 && got[0] != want[0] { t.Fatal(got, want) }
+			if roots[0] == roots[1] {
+				frames[1] = nil
+				if got, _, err := DiffPrivateTreePath(context.Background(), roots, frames, path, budget); got != nil || err != derived.ErrTreePageMissing { t.Fatal(got, err) }
+			}
+		}
+	}
+	root, frames := privateDiffTree(t, []model.Operation{regular})
+	roots, both := [2]derived.TreePageID{root, root}, [2]map[derived.TreePageID][]byte{frames, frames}
+	dir, _ := model.NewPath([]byte("dir"))
+	if got, _, err := DiffPrivateTreePath(context.Background(), roots, both, dir, budget); got != nil || err != nil { t.Fatal("directory is not a file leaf", got, err) }
+	for side := 0; side < 2; side++ {
+		limited := budget; limited[side].ReadBytes = 1
+		if got, _, err := DiffPrivateTreePath(context.Background(), roots, both, path, limited); got != nil || err != metadata.ErrResourceExhausted { t.Fatal(got, err) }
+		bad := [2]map[derived.TreePageID][]byte{frames, frames}
+		bad[side] = make(map[derived.TreePageID][]byte)
+		for id, frame := range frames { bad[side][id] = frame }
+		corrupt := append([]byte(nil), frames[root]...); corrupt[0] ^= 1; bad[side][root] = corrupt
+		if got, _, err := DiffPrivateTreePath(context.Background(), roots, bad, path, budget); got != nil || err != derived.ErrTreePage { t.Fatal(got, err) }
+	}
+	if got, _, err := DiffPrivateTreePath(nil, roots, both, path, budget); got != nil || err != ErrFileDiffInput { t.Fatal(got, err) }
+	if got, _, err := DiffPrivateTreePath(context.Background(), roots, both, model.Path{}, budget); got != nil || err != ErrFileDiffInput { t.Fatal(got, err) }
+	ctx, cancel := context.WithCancel(context.Background()); cancel()
+	if got, _, err := DiffPrivateTreePath(ctx, roots, both, path, budget); got != nil || err != context.Canceled { t.Fatal(got, err) }
+}
