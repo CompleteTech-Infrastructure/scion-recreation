@@ -84,3 +84,98 @@ func TestDerivePathHistoryStepFirstParentTransitions(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background()); cancel()
 	if step, _, err := DerivePathHistoryStep(ctx, lastSource, lastCurrent, &lastParent, frames, frames, path, budget); err != context.Canceled || step != nil { t.Fatal("history cancellation lost") }
 }
+
+func pathHistoryChainFixture(t *testing.T) ([]model.ChangesetID, map[model.ChangesetID]PathHistoryNode, model.Path) {
+	t.Helper()
+	empty, emptyRoot, _ := EncodeTreePageAt(UnlinkedTreePage{}, nil, nil)
+	frames := map[TreePageID][]byte{emptyRoot: empty}
+	path, _ := model.NewPath([]byte("file"))
+	tid, _ := model.NewTypedID(model.BlobKind, [32]byte{1}); blob, _ := model.NewBlobID(tid)
+	rewrite := TreeChangesetBudget{TreeRewriteBudget{4096, 4096*MaxTreePageBytes, 4096*MaxTreePageBytes}, 4096, model.MaxChangesetPayload}
+	nodes := make(map[model.ChangesetID]PathHistoryNode)
+	var ids []model.ChangesetID
+	var parent *metadata.DerivedResult
+	for i, tag := range []model.OperationTag{model.Delete, model.SetRegular, model.SetRegular, model.SetExecutable, model.Delete, model.SetSymlink} {
+		var target *model.BlobID
+		if tag != model.Delete { target = &blob }
+		op, err := model.NewOperation(path, tag, target); if err != nil { t.Fatal(err) }
+		input := model.ChangesetInput{RepoID: [16]byte{1}, Operations: []model.Operation{op}, Message: []byte{byte(i)}}
+		if parent != nil {
+			other, _ := model.NewTypedID(model.ChangesetKind, [32]byte{99}); second, _ := model.NewChangesetID(other)
+			input.Parents = []model.ChangesetID{parent.Identity.Changeset, second}
+		}
+		source, err := model.NewChangeset(input); if err != nil { t.Fatal(err) }
+		id, err := model.HashChangeset(context.Background(), source); if err != nil { t.Fatal(err) }
+		identity := metadata.DerivedIdentity{Repository: input.RepoID, Changeset: id, Kind: "TREE", Version: 1}
+		write, added, err := PrepareTreeWrite(context.Background(), identity, input, parent, frames, rewrite); if err != nil { t.Fatal(err) }
+		for id, frame := range added { frames[id] = frame }
+		nodes[id] = PathHistoryNode{Source: source, Tree: write.Result, Frames: frames}
+		ids = append(ids, id)
+		next := write.Result; parent = &next
+	}
+	return ids, nodes, path
+}
+
+func TestReadFirstParentPathHistoryCompleteOrderAndBudgets(t *testing.T) {
+	ids, nodes, path := pathHistoryChainFixture(t)
+	budget := PathHistoryChainBudget{6, model.MaxChangesetPayload, 4, TreeLookupBudget{4096, 4096*MaxTreePageBytes}}
+	rows, used, err := ReadFirstParentPathHistory(context.Background(), [16]byte{1}, ids[5], path, nodes, budget)
+	if err != nil || len(rows) != 4 || used.Nodes != 6 || used.Lookup.Pages != 11 { t.Fatalf("complete first-parent chain: %+v %v", used, err) }
+	for i, index := range []int{5, 4, 3, 1} {
+		if rows[i].Changeset != ids[index] || rows[i].FirstParent != ids[index-1] || rows[i].Path != path { t.Fatal("history order or first-parent binding changed") }
+	}
+	if rows[0].BeforePresent || !rows[0].AfterPresent || rows[0].After.Tag() != model.SetSymlink { t.Fatal("re-add history lost") }
+	if !rows[1].BeforePresent || rows[1].AfterPresent || rows[1].Before.Tag() != model.SetExecutable { t.Fatal("delete history lost") }
+	if rows[2].Before.Tag() != model.SetRegular || rows[2].After.Tag() != model.SetExecutable { t.Fatal("mode-only history lost") }
+	var payloadBytes uint64
+	for _, id := range ids { payloadBytes += nodes[id].Source.PayloadSize() }
+	if used.SourceBytes != payloadBytes { t.Fatal("source budget did not count every visited source") }
+	exact := PathHistoryChainBudget{used.Nodes, used.SourceBytes, 4, TreeLookupBudget{used.Lookup.Pages, used.Lookup.ReadBytes}}
+	if again, usage, err := ReadFirstParentPathHistory(context.Background(), [16]byte{1}, ids[5], path, nodes, exact); err != nil || len(again) != 4 || usage != used { t.Fatal("exact chain budgets rejected") }
+	for _, dimension := range []string{"nodes", "source", "changes", "pages", "read"} {
+		b := exact
+		switch dimension { case "nodes": b.Nodes--; case "source": b.SourceBytes--; case "changes": b.Changes--; case "pages": b.Lookup.Pages--; case "read": b.Lookup.ReadBytes-- }
+		if rows, _, err := ReadFirstParentPathHistory(context.Background(), [16]byte{1}, ids[5], path, nodes, b); err != metadata.ErrResourceExhausted || rows != nil { t.Fatalf("%s budget leaked incomplete history: %v", dimension, err) }
+	}
+	absent, _ := model.NewPath([]byte("other"))
+	if rows, usage, err := ReadFirstParentPathHistory(context.Background(), [16]byte{1}, ids[5], absent, nodes, budget); err != nil || rows != nil || usage.Nodes != 6 { t.Fatal("absent path caused fabricated history or early completion") }
+	if rows, usage, err := ReadFirstParentPathHistory(context.Background(), [16]byte{1}, ids[0], path, nodes, budget); err != nil || rows != nil || usage.Nodes != 1 { t.Fatal("root DELETE fabricated a transition") }
+}
+
+func TestReadFirstParentPathHistoryMissingAncestorAndSubstitution(t *testing.T) {
+	ids, nodes, path := pathHistoryChainFixture(t)
+	budget := PathHistoryChainBudget{6, model.MaxChangesetPayload, 6, TreeLookupBudget{4096, 4096*MaxTreePageBytes}}
+	root := nodes[ids[0]]; delete(nodes, ids[0])
+	// Several newest changes can be collected before discovering this missing
+	// oldest prerequisite. None may be returned as complete history.
+	if rows, used, err := ReadFirstParentPathHistory(context.Background(), [16]byte{1}, ids[5], path, nodes, budget); err != metadata.ErrFailedPrecondition || rows != nil || used.Nodes < 2 { t.Fatal("missing ancestor fabricated completed history") }
+	nodes[ids[0]] = root
+	if rows, _, err := ReadFirstParentPathHistory(context.Background(), [16]byte{2}, ids[5], path, nodes, budget); err != metadata.ErrInvalidArgument || rows != nil { t.Fatal("cross-repository history admitted") }
+	latest := nodes[ids[5]]; wrong := latest; wrong.Source = nodes[ids[4]].Source; nodes[ids[5]] = wrong
+	if rows, _, err := ReadFirstParentPathHistory(context.Background(), [16]byte{1}, ids[5], path, nodes, budget); err != metadata.ErrCorruptData || rows != nil { t.Fatal("source substitution admitted") }
+	nodes[ids[5]] = latest
+	ctx, cancel := context.WithCancel(context.Background()); cancel()
+	if rows, _, err := ReadFirstParentPathHistory(ctx, [16]byte{1}, ids[5], path, nodes, budget); err != context.Canceled || rows != nil { t.Fatal("chain cancellation lost") }
+}
+
+type historyCountContext struct { context.Context; calls, cancelAt int }
+func (c *historyCountContext) Err() error {
+	c.calls++
+	if c.cancelAt != 0 && c.calls >= c.cancelAt { return context.Canceled }
+	return nil
+}
+
+func TestReadFirstParentPathHistoryCancellationAfterCollectedStep(t *testing.T) {
+	ids, nodes, path := pathHistoryChainFixture(t)
+	current, parent := nodes[ids[5]], nodes[ids[4]]
+	budget := PathHistoryChainBudget{6, model.MaxChangesetPayload, 6, TreeLookupBudget{4096, 4096*MaxTreePageBytes}}
+	// Count the context checkpoints of the exact successful first step, then
+	// cancel on the next chain-loop checkpoint: one chain check precedes the
+	// step and the following check occurs after its row has been appended.
+	probe := &historyCountContext{Context: context.Background()}
+	step, reads, err := DerivePathHistoryStep(probe, current.Source, current.Tree, &parent.Tree, current.Frames, parent.Frames, path, PathHistoryBudget{current.Source.PayloadSize(), budget.Lookup})
+	if err != nil || step == nil { t.Fatal("first-step probe failed") }
+	ctx := &historyCountContext{Context: context.Background(), cancelAt: probe.calls+2}
+	rows, used, err := ReadFirstParentPathHistory(ctx, [16]byte{1}, ids[5], path, nodes, budget)
+	if err != context.Canceled || rows != nil || used.Nodes != 1 || used.Lookup != reads || ctx.calls != ctx.cancelAt { t.Fatalf("late cancellation leaked a collected step: %+v %v", used, err) }
+}

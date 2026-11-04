@@ -76,3 +76,82 @@ func DerivePathHistoryStep(ctx context.Context, source model.Changeset, current 
 	if step.BeforePresent == step.AfterPresent && (!step.BeforePresent || step.Before == step.After) { return nil, used, nil }
 	return step, used, nil
 }
+
+// PathHistoryNode supplies private immutable source data and a caller-trusted
+// complete TREE mapping/retained frame graph. This is not a provider interface
+// or a validity receipt; neither this wrapper nor a map entry proves provenance.
+type PathHistoryNode struct {
+	Source model.Changeset
+	Tree metadata.DerivedResult
+	Frames map[TreePageID][]byte
+}
+
+// PathHistoryChainBudget bounds a complete non-resumable first-parent walk.
+// SourceBytes charges canonical payload once per visited changeset, not every
+// validation/hash/snapshot pass or heap allocation. Lookup I/O is cumulative,
+// including repeated reads of a shared tree as consecutive before/after states.
+type PathHistoryChainBudget struct {
+	Nodes, SourceBytes, Changes uint64
+	Lookup TreeLookupBudget
+}
+type PathHistoryChainUsage struct {
+	Nodes, SourceBytes uint64
+	Lookup TreeLookupUsage
+}
+
+// ReadFirstParentPathHistory returns PRIVATE changed steps newest first, only
+// after reaching a parentless source. It continues through absent/no-op paths:
+// a deletion does not erase earlier history and a re-add does not invent it.
+// Missing ancestors, cycles, corruption, cancellation or any exhausted budget
+// return no partial steps. Unrelated supplied nodes and additional parents are
+// not traversed. All supplied maps/frame bytes must remain unchanged during use.
+//
+// This is bounded computation over supplied trusted mappings, not a durable
+// index, stable pagination/cursor, resumable job or authorized public history.
+// Large valid chains can exhaust these limits. Never represent that as an empty
+// or complete history, or expose private work/error distinctions to readers.
+func ReadFirstParentPathHistory(ctx context.Context, repository [16]byte, start model.ChangesetID, path model.Path, nodes map[model.ChangesetID]PathHistoryNode, budget PathHistoryChainBudget) ([]PathHistoryStep, PathHistoryChainUsage, error) {
+	var used PathHistoryChainUsage
+	bad := func(err error) ([]PathHistoryStep, PathHistoryChainUsage, error) { return nil, used, err }
+	if ctx == nil || start.Validate() != nil || path.Validate() != nil || budget.Nodes == 0 || budget.Nodes > 4096 || budget.Changes == 0 || budget.Changes > budget.Nodes ||
+		budget.SourceBytes == 0 || budget.SourceBytes > model.MaxChangesetPayload || budget.Lookup.Pages == 0 || budget.Lookup.Pages > 4096 || budget.Lookup.ReadBytes == 0 || budget.Lookup.ReadBytes > 4096*MaxTreePageBytes { return bad(metadata.ErrInvalidArgument) }
+	seen := make(map[model.ChangesetID]bool)
+	var steps []PathHistoryStep
+	cursor := start
+	for {
+		if err := ctx.Err(); err != nil { return bad(err) }
+		if seen[cursor] { return bad(metadata.ErrCorruptData) }
+		if used.Nodes == budget.Nodes { return bad(metadata.ErrResourceExhausted) }
+		used.Nodes++
+		seen[cursor] = true
+		node, ok := nodes[cursor]
+		if !ok { return bad(metadata.ErrFailedPrecondition) }
+		if node.Tree.Identity.Repository != repository || node.Tree.Identity.Changeset != cursor { return bad(metadata.ErrInvalidArgument) }
+		size := node.Source.PayloadSize()
+		if size == 0 { return bad(metadata.ErrInvalidArgument) }
+		if size > budget.SourceBytes-used.SourceBytes { return bad(metadata.ErrResourceExhausted) }
+		used.SourceBytes += size
+		input := node.Source.Snapshot()
+		var parent *metadata.DerivedResult
+		var parentFrames map[TreePageID][]byte
+		if len(input.Parents) != 0 {
+			prior, ok := nodes[input.Parents[0]]
+			if !ok { return bad(metadata.ErrFailedPrecondition) }
+			parent, parentFrames = &prior.Tree, prior.Frames
+		}
+		if used.Lookup.Pages == budget.Lookup.Pages || used.Lookup.ReadBytes == budget.Lookup.ReadBytes { return bad(metadata.ErrResourceExhausted) }
+		remaining := TreeLookupBudget{budget.Lookup.Pages-used.Lookup.Pages, budget.Lookup.ReadBytes-used.Lookup.ReadBytes}
+		step, reads, err := DerivePathHistoryStep(ctx, node.Source, node.Tree, parent, node.Frames, parentFrames, path, PathHistoryBudget{size, remaining})
+		used.Lookup.Pages += reads.Pages; used.Lookup.ReadBytes += reads.ReadBytes
+		if err != nil { return bad(err) }
+		if step != nil {
+			if uint64(len(steps)) == budget.Changes { return bad(metadata.ErrResourceExhausted) }
+			steps = append(steps, *step)
+		}
+		if len(input.Parents) == 0 {
+			if err := ctx.Err(); err != nil { return bad(err) }
+			return steps, used, nil
+		}
+		cursor = input.Parents[0]
+	}
+}
