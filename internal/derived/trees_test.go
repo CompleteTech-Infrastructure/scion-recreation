@@ -1236,3 +1236,104 @@ func TestTreeObjectGraphExactQuantumAndMidDecodeCancellation(t *testing.T) {
 	// counter is not evidence that all admitted bytes were read or validated.
 	if err != context.Canceled || ctx.calls != 10 || used.BlobVisits != 1 || used.BlobBytes != 1<<20 || used.Graph.Visits != 1 { t.Fatalf("mid-decode cancellation lost: %+v %v", used, err) }
 }
+
+func TestPrepareCheckedTreeWriteValidatesCandidateBeforeReturn(t *testing.T) {
+	empty, root, _ := EncodeTreePageAt(UnlinkedTreePage{}, nil, nil)
+	frames := map[TreePageID][]byte{root: empty}
+	path, _ := model.NewPath([]byte("a"))
+	blob, blobFrame := treeCanonicalBlob(t, nil)
+	op, _ := model.NewOperation(path, model.SetRegular, &blob)
+	change := model.ChangesetInput{RepoID: [16]byte{1}, Operations: []model.Operation{op}}
+	identity := treeBindingIdentity(t, change)
+	graph := TreeObjectGraphBudget{graphTestBudget(), 22}
+	budget := TreeCheckedWriteBudget{graph, graph, TreeChangesetBudget{TreeRewriteBudget{4096, 4096*MaxTreePageBytes, 4096*MaxTreePageBytes}, 4096, model.MaxChangesetPayload}}
+	blobs := map[model.BlobID][]byte{blob: blobFrame}
+	write, added, used, err := PrepareCheckedTreeWrite(context.Background(), identity, change, nil, frames, blobs, budget)
+	if err != nil || write.Result.Identity != identity || len(added) != 1 || used.Parent.BlobVisits != 0 || used.Candidate.BlobVisits != 1 || used.Candidate.BlobBytes != 22 { t.Fatalf("checked candidate: %+v %v", used, err) }
+	plain, plainFrames, err := PrepareTreeWrite(context.Background(), identity, change, nil, frames, budget.Rewrite)
+	if err != nil || metadata.CompareDerivedWrite(plain, write) != nil || len(plainFrames) != len(added) { t.Fatal("checked computation changed source-bound result") }
+	for id, frame := range added { if !bytes.Equal(frame, plainFrames[id]) { t.Fatal("overlay changed candidate frames") } }
+	for _, invalid := range []map[model.BlobID][]byte{nil, {blob: []byte("corrupt")}} {
+		got, out, usage, err := PrepareCheckedTreeWrite(context.Background(), identity, change, nil, frames, invalid, budget)
+		if err == nil || got.Result != (metadata.DerivedResult{}) || got.Parents != nil || out != nil || usage.Candidate.BlobVisits != 1 { t.Fatal("failed candidate validation exposed private write") }
+	}
+	invalidBudget := budget; invalidBudget.Candidate.Graph.Visits = 0
+	if _, out, usage, err := PrepareCheckedTreeWrite(context.Background(), identity, change, nil, frames, blobs, invalidBudget); err != metadata.ErrInvalidArgument || out != nil || usage.Parent.Graph.Visits != 0 { t.Fatal("invalid later-phase budget admitted earlier work") }
+	short := budget; short.Candidate.BlobBytes = 21
+	if got, out, _, err := PrepareCheckedTreeWrite(context.Background(), identity, change, nil, frames, blobs, short); err != metadata.ErrResourceExhausted || got.Result != (metadata.DerivedResult{}) || out != nil { t.Fatal("candidate budget failure leaked output") }
+	if len(frames) != 1 || !bytes.Equal(frames[root], empty) { t.Fatal("checked write mutated caller map") }
+	changed := change; changed.Message = []byte("different")
+	if got, out, usage, err := PrepareCheckedTreeWrite(context.Background(), identity, changed, nil, frames, blobs, budget); err != metadata.ErrCorruptData || got.Result != (metadata.DerivedResult{}) || out != nil || usage.Parent.Graph.Visits != 0 { t.Fatal("source mismatch reached graph work") }
+}
+
+func TestPrepareCheckedTreeWriteRejectsUnrelatedCorruptParent(t *testing.T) {
+	good, goodFrame := treeCanonicalBlob(t, []byte("good")); other, otherFrame := treeCanonicalBlob(t, []byte("other"))
+	pa, _ := model.NewPath([]byte("a")); pb, _ := model.NewPath([]byte("b"))
+	root, frames, err := BuildSingleLeafTree(context.Background(), pa, 1, good, TreeBuildBudget{4096, 4096*MaxTreePageBytes}); if err != nil { t.Fatal(err) }
+	rewrite := TreeChangesetBudget{TreeRewriteBudget{4096, 4096*MaxTreePageBytes, 4096*MaxTreePageBytes}, 4096, model.MaxChangesetPayload}
+	next, added, err := SetTreeLeaf(context.Background(), root, frames, pb, 1, other, rewrite.Rewrite); if err != nil { t.Fatal(err) }
+	for id, frame := range added { frames[id] = frame }; root = next
+	parentTID, _ := model.NewTypedID(model.ChangesetKind, [32]byte{1}); parentID, _ := model.NewChangesetID(parentTID)
+	raw, _ := root.MarshalBinary(); value, _ := metadata.NewDerivedValueID(raw)
+	parent := metadata.DerivedResult{Identity: metadata.DerivedIdentity{Repository: [16]byte{1}, Changeset: parentID, Kind: "TREE", Version: 1}, Value: value}
+	op, _ := model.NewOperation(pa, model.SetExecutable, &good)
+	change := model.ChangesetInput{RepoID: [16]byte{1}, Parents: []model.ChangesetID{parentID}, Operations: []model.Operation{op}}
+	identity := treeBindingIdentity(t, change)
+	graph := TreeObjectGraphBudget{graphTestBudget(), uint64(len(goodFrame)+len(otherFrame))}
+	budget := TreeCheckedWriteBudget{graph, graph, rewrite}
+	blobs := map[model.BlobID][]byte{good: goodFrame, other: otherFrame}
+	if _, _, used, err := PrepareCheckedTreeWrite(context.Background(), identity, change, &parent, frames, blobs, budget); err != nil || used.Parent.BlobBytes != graph.BlobBytes || used.Candidate.BlobBytes != graph.BlobBytes { t.Fatal("before/after referents not independently charged") }
+	// The delta touches a, but an unrelated corrupt b blob still rejects
+	// the parent preflight before candidate construction/validation.
+	blobs[other] = []byte("bad")
+	if got, out, used, err := PrepareCheckedTreeWrite(context.Background(), identity, change, &parent, frames, blobs, budget); err == nil || got.Result != (metadata.DerivedResult{}) || out != nil || used.Candidate.Graph.Visits != 0 { t.Fatal("unrelated parent corruption was ignored") }
+	ctx, cancel := context.WithCancel(context.Background()); cancel()
+	if got, out, _, err := PrepareCheckedTreeWrite(ctx, identity, change, &parent, frames, blobs, budget); err != context.Canceled || got.Result != (metadata.DerivedResult{}) || out != nil { t.Fatal("checked write ignored cancellation") }
+}
+
+type treePhaseCancelContext struct { context.Context; calls, cancelAt int }
+func (c *treePhaseCancelContext) Err() error {
+	c.calls++
+	if c.cancelAt != 0 && c.calls >= c.cancelAt { return context.Canceled }
+	return nil
+}
+
+func TestPrepareCheckedTreeWriteNoopsEmptyAndPhaseCancellation(t *testing.T) {
+	blob, blobFrame := treeCanonicalBlob(t, nil)
+	path, _ := model.NewPath([]byte("a"))
+	root, frames, err := BuildSingleLeafTree(context.Background(), path, 1, blob, TreeBuildBudget{1, 60}); if err != nil { t.Fatal(err) }
+	parentTID, _ := model.NewTypedID(model.ChangesetKind, [32]byte{1}); parentID, _ := model.NewChangesetID(parentTID)
+	raw, _ := root.MarshalBinary(); value, _ := metadata.NewDerivedValueID(raw)
+	parent := metadata.DerivedResult{Identity: metadata.DerivedIdentity{Repository: [16]byte{1}, Changeset: parentID, Kind: "TREE", Version: 1}, Value: value}
+	graph := TreeObjectGraphBudget{graphTestBudget(), 22}
+	budget := TreeCheckedWriteBudget{graph, graph, TreeChangesetBudget{TreeRewriteBudget{4096, 4096*MaxTreePageBytes, 4096*MaxTreePageBytes}, 4096, model.MaxChangesetPayload}}
+	blobs := map[model.BlobID][]byte{blob: blobFrame}
+	same, _ := model.NewOperation(path, model.SetRegular, &blob); remove, _ := model.NewOperation(path, model.Delete, nil)
+	var deletion model.ChangesetInput
+	var deletionID metadata.DerivedIdentity
+	for i, ops := range [][]model.Operation{nil, {same}, {remove}} {
+		change := model.ChangesetInput{RepoID: [16]byte{1}, Parents: []model.ChangesetID{parentID}, Operations: ops}
+		identity := treeBindingIdentity(t, change)
+		write, added, used, err := PrepareCheckedTreeWrite(context.Background(), identity, change, &parent, frames, blobs, budget)
+		if err != nil || write.Result.Identity != identity || len(write.Parents) != 1 || write.Parents[0] != parent { t.Fatalf("checked no-op/delete: %v", err) }
+		if i < 2 {
+			if write.Result.Value != parent.Value || added != nil || used.Parent.BlobBytes != 22 || used.Candidate.BlobBytes != 22 { t.Fatal("no-op changed root or skipped integrity phases") }
+		} else {
+			_, emptyRoot, _ := EncodeTreePageAt(UnlinkedTreePage{}, nil, nil)
+			if !bytes.Equal(write.Result.Value.Bytes(), emptyRoot.raw[:]) || len(added) != 1 || used.Candidate.Graph.Visits != 1 || used.Candidate.BlobVisits != 0 { t.Fatal("delete-to-empty result/validation incorrect") }
+			deletion, deletionID = change, identity
+		}
+	}
+	for _, afterRewrite := range []bool{false, true} {
+		// Calibrate the exact successful prefix, then cancel at the next
+		// phase's first context checkpoint. No private candidate may escape.
+		probe := &treePhaseCancelContext{Context: context.Background()}
+		base, parents, err := bindTreeInput(probe, deletionID, deletion, &parent, budget.Rewrite); if err != nil { t.Fatal(err) }
+		if _, err := CheckTreeObjectGraph(probe, base, frames, blobs, budget.Parent); err != nil { t.Fatal(err) }
+		if afterRewrite { if _, _, err := applyBoundTreeWrite(probe, base, parents, deletionID, deletion, frames, budget.Rewrite); err != nil { t.Fatal(err) } }
+		ctx := &treePhaseCancelContext{Context: context.Background(), cancelAt: probe.calls+1}
+		got, out, used, err := PrepareCheckedTreeWrite(ctx, deletionID, deletion, &parent, frames, blobs, budget)
+		if err != context.Canceled || got.Result != (metadata.DerivedResult{}) || got.Parents != nil || out != nil || used.Parent.BlobBytes != 22 || used.Candidate.Graph.Visits != 0 || ctx.calls != ctx.cancelAt { t.Fatalf("between-phase cancellation leaked output: %+v %v", used, err) }
+	}
+	if len(frames) != 1 { t.Fatal("checked phases mutated caller map") }
+}
