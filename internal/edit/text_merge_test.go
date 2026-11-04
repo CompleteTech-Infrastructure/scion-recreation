@@ -64,6 +64,23 @@ func TestTextHunkConflicts(t *testing.T) {
 	}
 }
 
+func TestTextHunkBoundaryInsertionFirstConflict(t *testing.T) {
+	adjacent := []TextHunk{{0, 1, []byte("A")}, {1, 2, []byte("B")}}
+	insertion := []TextHunk{{1, 1, []byte("X")}}
+	for _, swap := range []bool{false, true} {
+		t.Run(map[bool]string{false: "left-replacements", true: "right-replacements"}[swap], func(t *testing.T) {
+			left, right := adjacent, insertion
+			if swap {
+				left, right = right, left
+			}
+			out, conflict, err := MergeTextHunks(context.Background(), []byte("ab"), left, right, TextMergeBudget{16, 3})
+			if err != nil || out != nil || conflict == nil || *conflict != (TextConflict{0, 0}) {
+				t.Fatalf("first boundary overlap lost: output=%q conflict=%v err=%v", out, conflict, err)
+			}
+		})
+	}
+}
+
 func TestTextHunkRejectionAndOwnership(t *testing.T) {
 	for _, hunks := range [][]TextHunk{
 		{{2, 1, nil}}, {{0, 4, nil}}, {{1, 2, nil}, {0, 1, nil}},

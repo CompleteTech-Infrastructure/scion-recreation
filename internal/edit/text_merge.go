@@ -92,7 +92,10 @@ func MergeTextHunks(ctx context.Context, base []byte, left, right []TextHunk, bu
 			return nil, nil, err
 		}
 		var next chosen
-		if j == len(right) || (i < len(left) && left[i].Start <= right[j].Start) {
+		// Order equal starts by end before side, so a boundary insertion is
+		// compared with the preceding replacement before an adjacent one.
+		if j == len(right) || (i < len(left) && (left[i].Start < right[j].Start ||
+			left[i].Start == right[j].Start && left[i].End <= right[j].End)) {
 			next = chosen{left[i], 0, i}
 			i++
 		} else {
