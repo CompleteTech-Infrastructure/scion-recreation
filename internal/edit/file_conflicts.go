@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"sort"
 	"strings"
 
 	"canopy.local/canopy/internal/derived"
@@ -317,8 +318,10 @@ type FilePreparationBudget struct { Entries, PathBytes, Payload, Frames uint64 }
 // Empty input succeeds with nil results; any error returns nil results, never
 // a usable prefix. Output frame slices are owned independently of each other.
 //
-// This checks local candidate syntax/admission, NOT whole-tree validity (e.g.
-// file/descendant conflicts), complete changeset canonicality, authorization,
+// Simultaneously present file/descendant paths are intrinsically impossible
+// and rejected before encoding. DELETE ancestors do not block SET descendants.
+// This does NOT validate the entire delta against a parent tree (including
+// retained descendants), complete changeset canonicality, authorization,
 // conflict resolution, upload/durability or publication. The caller must perform
 // those checks before using these PRIVATE candidates. Aggregate retained output
 // is bounded but temporary copies/allocator overhead are not a measured RSS cap.
@@ -340,6 +343,21 @@ func PrepareFileOperations(ctx context.Context, entries []ResolvedFileEntry, bud
 			n += 22
 			if n > budget.Frames-frames { return nil, ErrFileBudget }; frames += n
 		}
+	}
+	// Sorted input keeps the present-only subsequence sorted. Checking only
+	// adjacent rows is insufficient: "a-" sorts between "a" and "a/b".
+	// Path copies are bounded by admitted PathBytes; each search uses one
+	// temporary slash-prefix, not a copy of every ancestor component.
+	var present []string
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil { return nil, err }
+		if !entry.Version.IsAbsent() { present = append(present, string(entry.Path.Bytes())) }
+	}
+	for _, path := range present {
+		if err := ctx.Err(); err != nil { return nil, err }
+		prefix := path + "/"
+		i := sort.SearchStrings(present, prefix)
+		if i < len(present) && strings.HasPrefix(present[i], prefix) { return nil, ErrFileState }
 	}
 	var out []PreparedFileOperation
 	for _, entry := range entries {
