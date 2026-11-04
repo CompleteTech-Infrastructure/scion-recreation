@@ -180,3 +180,51 @@ func TestTextFileMergeErrorsAndOpaqueFastPath(t *testing.T) {
 	// Unchanged/identical whole-file fast paths never parse or normalize bytes.
 	if got, conflict, err := MergeTextFileVersions(context.Background(), a, b, b, ThreeWayTextBudget{100, 100, 100, 100}); err != nil || conflict != nil || got != b { t.Fatal(got, conflict, err) }
 }
+
+func TestCanonicalFileMergeStateMatrix(t *testing.T) {
+	states := []FileVersion{AbsentFile(), fileFixture(t, model.SetRegular, ""), fileFixture(t, model.SetRegular, "a\x00"), fileFixture(t, model.SetExecutable, "a\x00"), fileFixture(t, model.SetSymlink, "../x")}
+	for _, base := range states { for _, left := range states { for _, right := range states {
+		versions := [3]FileVersion{base, left, right}
+		var sides [3]CanonicalFileSide
+		for i, v := range versions {
+			if v.IsAbsent() { continue }
+			content, _ := v.Content(); mode, _ := v.Mode()
+			ids, frames := canonicalMergeInputs(t, [3]string{string(content), "", ""})
+			sides[i] = CanonicalFileSide{true, mode, ids[0], frames[0]}
+		}
+		want, conflict, err := MergeFileVersions(context.Background(), base, left, right, 100); if err != nil { t.Fatal(err) }
+		got, gotConflict, err := MergeCanonicalFileVersions(context.Background(), sides, 100)
+		if err != nil || got != want || (gotConflict == nil) != (conflict == nil) { t.Fatal(versions, got, gotConflict, err) }
+		if conflict != nil && *conflict != *gotConflict { t.Fatal(gotConflict, conflict) }
+	} } }
+}
+
+func TestCanonicalFileMergeRejectsUnverifiedStates(t *testing.T) {
+	ids, frames := canonicalMergeInputs(t, [3]string{"a", "a", "a"})
+	var sides [3]CanonicalFileSide
+	for i := range sides { sides[i] = CanonicalFileSide{true, model.SetRegular, ids[i], frames[i]} }
+	for i := range sides {
+		for mode := 0; mode < 5; mode++ {
+			bad := sides
+			switch mode {
+			case 0: bad[i].Frame = append([]byte(nil), frames[i]...); bad[i].Frame[len(bad[i].Frame)-1] ^= 1
+			case 1: bad[i].Frame = frames[i][:len(frames[i])-1]
+			case 2: bad[i].ID = model.BlobID{}
+			case 3: bad[i].Mode = model.Delete
+			case 4: bad[i].Present = false
+			}
+			got, conflict, err := MergeCanonicalFileVersions(context.Background(), bad, 100)
+			if err == nil || got != (FileVersion{}) || conflict != nil { t.Fatal(i, mode, got, conflict, err) }
+		}
+	}
+	if got, conflict, err := MergeCanonicalFileVersions(context.Background(), sides, 2); err != ErrFileBudget || got != (FileVersion{}) || conflict != nil { t.Fatal(got, conflict, err) }
+	if got, conflict, err := MergeCanonicalFileVersions(context.Background(), sides, 3); err != nil || conflict != nil || got != fileFixture(t, model.SetRegular, "a") { t.Fatal(got, conflict, err) }
+	emptyIDs, emptyFrames := canonicalMergeInputs(t, [3]string{"", "", ""})
+	empty := [3]CanonicalFileSide{{}, {true, model.SetRegular, emptyIDs[1], emptyFrames[1]}, {}}
+	if got, conflict, err := MergeCanonicalFileVersions(context.Background(), empty, 0); err != nil || conflict != nil || got.IsAbsent() || got != fileFixture(t, model.SetRegular, "") { t.Fatal("present-empty became absent", got, conflict, err) }
+	empty[0].Frame = []byte{}
+	if got, conflict, err := MergeCanonicalFileVersions(context.Background(), empty, 0); err != ErrFileState || got != (FileVersion{}) || conflict != nil { t.Fatal(got, conflict, err) }
+	if got, conflict, err := MergeCanonicalFileVersions(nil, sides, 100); err != ErrFileState || got != (FileVersion{}) || conflict != nil { t.Fatal(got, conflict, err) }
+	ctx, cancel := context.WithCancel(context.Background()); cancel()
+	if got, conflict, err := MergeCanonicalFileVersions(ctx, sides, 100); err != context.Canceled || got != (FileVersion{}) || conflict != nil { t.Fatal(got, conflict, err) }
+}
