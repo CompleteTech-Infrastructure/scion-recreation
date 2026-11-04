@@ -314,12 +314,15 @@ func TestTreePageContextIsolatedBoundaries(t *testing.T) {
 	oneByteUnary := makeTreeContextTestFrame(t, []byte("x"), 0, nil, child)
 	emptyContinuation := makeTreeContextTestFrame(t, fullLabel, 0, nil, TreePageChild{Edge: 'b', ID: empty.id})
 	emptyTerminal := makeTreeContextTestFrame(t, nil, 1, blob)
+	dotTerminal := makeTreeContextTestFrame(t, []byte("."), 1, blob)
+	aTerminal := makeTreeContextTestFrame(t, []byte("a"), 1, blob)
 	branch := makeTreeContextTestFrame(t, nil, 0, nil, child, TreePageChild{Edge: 'c', ID: nonempty.id})
 	directoryID, err := nonempty.id.MarshalBinary()
 	if err != nil {
 		t.Fatal(err)
 	}
 	directory := makeTreeContextTestFrame(t, nil, 4, directoryID)
+	dotDirectory := makeTreeContextTestFrame(t, []byte("."), 4, directoryID)
 	namedDirectory := makeTreeContextTestFrame(t, []byte("x"), 4, directoryID)
 	cleanPrefix := bytes.Repeat([]byte{'a'}, 256)
 	slashPrefix := append([]byte(nil), cleanPrefix...)
@@ -345,6 +348,18 @@ func TestTreePageContextIsolatedBoundaries(t *testing.T) {
 		{"nul-prefix-at-offset-256", maximalUnary, nil, nulPrefix, true},
 		{"empty-component-terminal", emptyTerminal, nil, nil, true},
 		{"nonempty-component-empty-label-terminal", emptyTerminal, nil, []byte("a"), false},
+		// A radix edge can consume the dots before this terminal page. Check
+		// the reconstructed component for both files and directory targets.
+		{"dot-prefix-file-terminal", emptyTerminal, nil, []byte("."), true},
+		{"dotdot-prefix-file-terminal", emptyTerminal, nil, []byte(".."), true},
+		{"split-dotdot-file-terminal", dotTerminal, nil, []byte("."), true},
+		{"three-dot-prefix-file-terminal", emptyTerminal, nil, []byte("..."), false},
+		{"dot-a-prefix-file-terminal", emptyTerminal, nil, []byte(".a"), false},
+		{"split-dot-a-file-terminal", aTerminal, nil, []byte("."), false},
+		{"dot-prefix-directory-terminal", directory, nil, []byte("."), true},
+		{"dotdot-prefix-directory-terminal", directory, nil, []byte(".."), true},
+		{"split-dotdot-directory-terminal", dotDirectory, nil, []byte("."), true},
+		{"dot-a-prefix-directory-terminal", directory, nil, []byte(".a"), false},
 		{"empty-repository-root", empty, nil, nil, false},
 		{"empty-nonroot-directory", empty, []byte("a"), nil, true},
 		// A continuation edge itself consumes a byte. The two-child frame
