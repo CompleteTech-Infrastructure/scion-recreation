@@ -104,25 +104,38 @@ func TestLinuxNativeKernelEvents(t *testing.T) {
 
 // The delivery callback runs after drain reaches EAGAIN. Use it only as a
 // scheduling seam to replace the real root before step checks its identity;
-// no inotify events or identity results are injected.
+// no inotify events or identity results are injected. Measure loss delivery
+// from after the trigger's observation, independently of its invalidation.
 func TestLinuxNativeRootIdentityGuardAfterDrain(t *testing.T) {
 	w, n, root, meta := linuxFixture(t)
-	_, before, err := w.Snapshot()
-	watchOK(t, err)
 	old := root + "-old"
 	t.Cleanup(func() { _ = os.RemoveAll(old) })
 	replaced := false
-	err = n.call(context.Background(), func() error {
+	lossDelivered := false
+	var beforeMismatch uint64
+	err := n.call(context.Background(), func() error {
 		prior := n.observe
 		defer func() { n.observe = prior }()
 		n.masks = 0
 		n.observe = func(events []WatchEvent) error {
+			if replaced {
+				for _, event := range events {
+					if event.Kind == WatchLoss {
+						lossDelivered = true
+					}
+				}
+			}
 			if err := prior(events); err != nil {
 				return err
 			}
 			if replaced {
 				return nil
 			}
+			_, generation, err := w.Snapshot()
+			if err != nil {
+				return err
+			}
+			beforeMismatch = generation
 			if err := os.Rename(root, old); err != nil {
 				return err
 			}
@@ -151,7 +164,8 @@ func TestLinuxNativeRootIdentityGuardAfterDrain(t *testing.T) {
 	watchCheck(t, released, "identity mismatch did not fail closed and release resources")
 	_, after, err := w.Snapshot()
 	watchOK(t, err)
-	watchCheck(t, after > before, "identity mismatch did not invalidate generation")
+	watchCheck(t, after > beforeMismatch, "identity mismatch did not invalidate generation")
+	watchCheck(t, lossDelivered, "identity mismatch did not deliver WatchLoss")
 	watchUnknown(t, w, meta)
 }
 
