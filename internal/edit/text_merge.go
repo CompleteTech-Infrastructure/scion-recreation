@@ -152,3 +152,122 @@ func MergeTextHunks(ctx context.Context, base []byte, left, right []TextHunk, bu
 	}
 	return out, nil, nil
 }
+
+// ThreeWayTextBudget bounds combined input bytes and output bytes separately,
+// combined input lines,
+// combined allocated LCS cells (including sentinel row/column), and derived
+// hunks. Limits are local policy: 64 MiB, one million lines/hunks, four million
+// cells maximum. LCS uses uint32 cells and iterative traversal, not recursion.
+type ThreeWayTextBudget struct { Bytes, Lines, Cells, Hunks uint64 }
+
+// MergeText derives deterministic line edits against one explicit base and
+// composes them with MergeTextHunks. Lines retain LF/CRLF and missing-final-LF
+// bytes verbatim; non-UTF-8 bytes are not decoded. NUL input rejects, but that
+// guard is NOT a comprehensive binary classifier. Callers must classify text,
+// establish the correct base and authorize inputs before using this primitive.
+// Inputs must not be mutated during the call. No publication is performed.
+//
+// Matching uses exact line tokens and longest-common-subsequence alignment;
+// equal-score alternatives consume a base line first. Overlaps conservatively
+// conflict under MergeTextHunks rules. Conflict indices refer to the derived
+// left/right hunk sequences, not line numbers. Exhaustion yields no output.
+func MergeText(ctx context.Context, base, left, right []byte, budget ThreeWayTextBudget) ([]byte, *TextConflict, error) {
+	if ctx == nil { return nil, nil, ErrTextInput }
+	if err := ctx.Err(); err != nil { return nil, nil, err }
+	if budget.Bytes == 0 || budget.Bytes > 64<<20 || budget.Lines == 0 || budget.Lines > 1000000 || budget.Cells == 0 || budget.Cells > 4000000 || budget.Hunks == 0 || budget.Hunks > 1000000 {
+		return nil, nil, ErrTextLimit
+	}
+	var used uint64
+	for _, input := range [][]byte{base, left, right} {
+		if uint64(len(input)) > budget.Bytes-used { return nil, nil, ErrTextLimit }
+		used += uint64(len(input))
+		if bytes.IndexByte(input, 0) >= 0 { return nil, nil, ErrTextInput }
+	}
+	type lines struct { offsets []int; tokens []uint32 }
+	// Intern exact strings once per input line. This avoids comparing long
+	// byte strings in every quadratic LCS cell; map equality remains exact.
+	intern := make(map[string]uint32)
+	var lineCount uint64
+	split := func(input []byte) (lines, error) {
+		out := lines{offsets: []int{0}}
+		for start := 0; start < len(input); {
+			if err := ctx.Err(); err != nil { return lines{}, err }
+			if lineCount == budget.Lines { return lines{}, ErrTextLimit }
+			end := len(input)
+			if at := bytes.IndexByte(input[start:], '\n'); at >= 0 { end = start + at + 1 }
+			key := string(input[start:end])
+			token, ok := intern[key]
+			if !ok { token = uint32(len(intern)+1); intern[key] = token }
+			out.tokens = append(out.tokens, token)
+			out.offsets = append(out.offsets, end)
+			lineCount++
+			start = end
+		}
+		return out, nil
+	}
+	b, err := split(base)
+	if err != nil { return nil, nil, err }
+	l, err := split(left)
+	if err != nil { return nil, nil, err }
+	r, err := split(right)
+	if err != nil { return nil, nil, err }
+	var cells, hunkCount uint64
+	diff := func(side lines, data []byte) ([]TextHunk, error) {
+		prefix := 0
+		for prefix < len(b.tokens) && prefix < len(side.tokens) && b.tokens[prefix] == side.tokens[prefix] {
+			if prefix%4096 == 0 { if err := ctx.Err(); err != nil { return nil, err } }
+			prefix++
+		}
+		bend, send := len(b.tokens), len(side.tokens)
+		for bend > prefix && send > prefix && b.tokens[bend-1] == side.tokens[send-1] {
+			if bend%4096 == 0 { if err := ctx.Err(); err != nil { return nil, err } }
+			bend--; send--
+		}
+		n, m := bend-prefix, send-prefix
+		if n == 0 && m == 0 { return nil, nil }
+		cost := uint64(n+1)*uint64(m+1)
+		if cost > budget.Cells-cells { return nil, ErrTextLimit }
+		cells += cost
+		width := m+1
+		table := make([]uint32, int(cost))
+		for i := n-1; i >= 0; i-- {
+			if err := ctx.Err(); err != nil { return nil, err }
+			for j := m-1; j >= 0; j-- {
+				if j%4096 == 0 { if err := ctx.Err(); err != nil { return nil, err } }
+				if b.tokens[prefix+i] == side.tokens[prefix+j] {
+					table[i*width+j] = table[(i+1)*width+j+1]+1
+				} else {
+					table[i*width+j] = max(table[(i+1)*width+j], table[i*width+j+1])
+				}
+			}
+		}
+		var hunks []TextHunk
+		startI, startJ := -1, -1
+		flush := func(i, j int) error {
+			if startI < 0 { return nil }
+			if hunkCount == budget.Hunks { return ErrTextLimit }
+			hunks = append(hunks, TextHunk{uint64(b.offsets[prefix+startI]), uint64(b.offsets[prefix+i]), data[side.offsets[prefix+startJ]:side.offsets[prefix+j]]})
+			hunkCount++
+			startI, startJ = -1, -1
+			return nil
+		}
+		i, j := 0, 0
+		for i < n || j < m {
+			if err := ctx.Err(); err != nil { return nil, err }
+			if i < n && j < m && b.tokens[prefix+i] == side.tokens[prefix+j] {
+				if err := flush(i, j); err != nil { return nil, err }
+				i++; j++
+				continue
+			}
+			if startI < 0 { startI, startJ = i, j }
+			if i < n && (j == m || table[(i+1)*width+j] >= table[i*width+j+1]) { i++ } else { j++ }
+		}
+		if err := flush(i, j); err != nil { return nil, err }
+		return hunks, nil
+	}
+	lh, err := diff(l, left)
+	if err != nil { return nil, nil, err }
+	rh, err := diff(r, right)
+	if err != nil { return nil, nil, err }
+	return MergeTextHunks(ctx, base, lh, rh, TextMergeBudget{Bytes: budget.Bytes, Hunks: budget.Hunks})
+}
