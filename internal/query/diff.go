@@ -313,3 +313,34 @@ func DiffPrivateTrees(ctx context.Context, roots [2]derived.TreePageID, frames [
 	deltas, err := DiffFileEntries(ctx, rows[0], rows[1], budget.Compare)
 	return deltas, usage, err
 }
+
+// DiffPrivateTreePath compares one exact raw-byte file path in two already
+// validated retained graphs. Each side has its own explicit lookup allowance;
+// total traversal is bounded by their sum. It does NOT establish whole-graph
+// validity, retention, source/repository binding or authorization. Unrelated
+// subtrees and blob content are not examined, and symlinks are never followed.
+//
+// Roots/maps/budgets are ordered before, after. Both lookups run even for equal
+// roots. Only ErrTreeLeafAbsent becomes an absent side; missing/corrupt pages,
+// exhaustion and cancellation remain errors with no deltas. Directory-only
+// paths count as absent FILE leaves. Nil deltas means equal file state, not a
+// graph equality proof. Otherwise exactly one owned immutable delta is returned.
+// Path and output storage are bounded by canonical path limits and two entries.
+// All results, absence/error distinctions and usage are private data; callers
+// must authorize both inputs before disclosure. Frames must not mutate in-call.
+func DiffPrivateTreePath(ctx context.Context, roots [2]derived.TreePageID, frames [2]map[derived.TreePageID][]byte, path model.Path, budget [2]derived.TreeLookupBudget) ([]FileDelta, [2]derived.TreeLookupUsage, error) {
+	var usage [2]derived.TreeLookupUsage
+	if ctx == nil { return nil, usage, ErrFileDiffInput }
+	if err := ctx.Err(); err != nil { return nil, usage, err }
+	if path.Validate() != nil { return nil, usage, ErrFileDiffInput }
+	var rows [2][]model.Operation
+	for i := range roots {
+		row, used, err := derived.LookupTreeLeaf(ctx, roots[i], frames[i], path, budget[i])
+		usage[i] = used
+		if err == derived.ErrTreeLeafAbsent { continue }
+		if err != nil { return nil, usage, err }
+		rows[i] = []model.Operation{row}
+	}
+	deltas, err := DiffFileEntries(ctx, rows[0], rows[1], FileDiffBudget{Entries: 2, PathBytes: 2*65535, Changes: 1})
+	return deltas, usage, err
+}
