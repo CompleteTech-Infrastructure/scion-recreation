@@ -277,6 +277,10 @@ type TreeGraphUsage struct { Visits, Terminals, PageBytes, ContextBytes uint64 }
 // Larger graphs need an external resumable validator; retrying this attempt
 // from scratch is not a checkpoint or a route around a whole-job work budget.
 func CheckTreePageGraph(ctx context.Context, root TreePageID, frames map[TreePageID][]byte, budget TreeGraphBudget) (TreeGraphUsage, error) {
+	return walkTreePageGraph(ctx, root, frames, budget, nil)
+}
+
+func walkTreePageGraph(ctx context.Context, root TreePageID, frames map[TreePageID][]byte, budget TreeGraphBudget, leaf func([]byte, []byte, UnlinkedTreePage) error) (TreeGraphUsage, error) {
 	var used TreeGraphUsage
 	if ctx == nil || root.Validate() != nil || budget.Visits == 0 || budget.Visits > 4096 ||
 		budget.PageBytes == 0 || budget.PageBytes > 4096*MaxTreePageBytes || budget.ContextBytes == 0 || budget.ContextBytes > 64<<20 {
@@ -312,6 +316,9 @@ func CheckTreePageGraph(ctx context.Context, root TreePageID, frames map[TreePag
 		component := make([]byte, len(w.component)+len(p.Label))
 		copy(component, w.component)
 		copy(component[len(w.component):], p.Label)
+		if leaf != nil && p.Tag >= 1 && p.Tag <= 3 {
+			if err := leaf(w.directory, component, p); err != nil { return used, err }
+		}
 		// Bound queued frames as well as executed work. Context copies are
 		// charged before allocation. PageBytes counts frame bytes processed,
 		// not heap usage; decoder temporaries are outside ContextBytes.
@@ -954,4 +961,58 @@ func PrepareTreeWrite(ctx context.Context, identity metadata.DerivedIdentity, ch
 	if err := candidate.Validate(); err != nil { return bad(err) }
 	if err := ctx.Err(); err != nil { return bad(err) }
 	return candidate, added, nil
+}
+
+// TreeEntriesBudget limits one complete private enumeration attempt. PathBytes
+// charges both each temporary assembled path and its owned model.Path copy.
+// Graph.ContextBytes separately charges walker contexts; neither is total RSS.
+type TreeEntriesBudget struct {
+	Graph TreeGraphBudget
+	Entries, PathBytes uint64
+}
+
+// ReadTreeEntries verifies the supplied page graph and returns its file leaves
+// as canonical raw-byte-sorted SET operations, including modes and typed blob
+// targets. Directories are implicit; symlinks are leaves, never followed. Shared
+// pages are visited in every context. Unreachable supplied frames are ignored.
+//
+// Results and usage counters are PRIVATE data, not an authorized projection,
+// cursor or public listing. Blob bytes, publication, retention and authorization
+// are not checked. Do not expose hidden paths/counts/timing through this helper.
+// Errors return no partial rows. Large valid trees may exhaust this bounded
+// non-resumable attempt; exhaustion never means absence or graph corruption.
+// Sorting is bounded by admitted entries/paths but not interruptible mid-sort.
+func ReadTreeEntries(ctx context.Context, root TreePageID, frames map[TreePageID][]byte, budget TreeEntriesBudget) ([]model.Operation, TreeGraphUsage, error) {
+	if budget.Entries == 0 || budget.Entries > 4096 || budget.PathBytes == 0 || budget.PathBytes > 64<<20 {
+		return nil, TreeGraphUsage{}, metadata.ErrInvalidArgument
+	}
+	var rows []model.Operation
+	var pathBytes uint64
+	used, err := walkTreePageGraph(ctx, root, frames, budget.Graph, func(directory, component []byte, page UnlinkedTreePage) error {
+		if uint64(len(rows)) == budget.Entries { return metadata.ErrResourceExhausted }
+		n := len(directory)+len(component)
+		if len(directory) != 0 { n++ }
+		if uint64(n)*2 > budget.PathBytes-pathBytes { return metadata.ErrResourceExhausted }
+		pathBytes += uint64(n)*2
+		raw := make([]byte, 0, n)
+		raw = append(raw, directory...)
+		if len(directory) != 0 { raw = append(raw, '/') }
+		raw = append(raw, component...)
+		path, err := model.NewPath(raw)
+		if err != nil { return ErrTreePage }
+		op, err := model.NewOperation(path, model.OperationTag(page.Tag), &page.Blob)
+		if err != nil { return ErrTreePage }
+		rows = append(rows, op)
+		return nil
+	})
+	if err != nil { return nil, used, err }
+	// Directory traversal order is not raw path order: '/' may sort before
+	// or after a same-component continuation edge. Sort the bounded result.
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Path().Compare(rows[j].Path()) < 0 })
+	for i := 1; i < len(rows); i++ {
+		if err := ctx.Err(); err != nil { return nil, used, err }
+		if rows[i-1].Path().Compare(rows[i].Path()) >= 0 { return nil, used, ErrTreePage }
+	}
+	if err := ctx.Err(); err != nil { return nil, used, err }
+	return rows, used, nil
 }
