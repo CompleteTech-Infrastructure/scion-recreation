@@ -1334,3 +1334,85 @@ func replayCanonicalTrees(ctx context.Context, repository [16]byte, sources []Tr
 	if err := ctx.Err(); err != nil { return bad(err) }
 	return writes, pages, used, nil
 }
+
+// TreeUnorderedReplayUsage separates source admission/decoding for ordering
+// from the existing checked replay pass. SourceBytes reserves complete frames;
+// DecodedSources counts attempts, not completed verification. Both passes admit
+// the same explicit source-byte ceiling; their work must be summed, not confused
+// with a single pass or a measured memory bound.
+type TreeUnorderedReplayUsage struct {
+	DecodedSources, SourceBytes uint64
+	Replay TreeReplayUsage
+}
+
+// ReplayUnorderedCanonicalTrees accepts a complete canonical DAG in arbitrary
+// input order. It verifies sources/repository, rejects duplicate IDs or missing
+// parents, computes deterministic topological order (smallest canonical digest
+// among ready nodes), then performs the existing checked DAG replay. Canonical
+// parent order is NEVER changed. Results are in computed topological order.
+//
+// At most 64 sources are admitted. Ordering retains bounded parent-ID lists
+// (each capped by canonical MaxParents) and edge metadata, not decoded file
+// payloads. Canonical decoding/Snapshot adds a bounded pass before replay; the
+// original source count/byte and per-step phase ceilings apply to each pass.
+// No provider, publication, retention, authorization or resumability is added.
+// Inputs must remain stable; their slice order/bytes are not mutated. All errors
+// return nil writes/pages; private usage is not an integrity receipt.
+func ReplayUnorderedCanonicalTrees(ctx context.Context, repository [16]byte, sources []TreeSourceFrame, blobs map[model.BlobID][]byte, budget TreeReplayBudget) ([]metadata.DerivedWrite, map[TreePageID][]byte, TreeUnorderedReplayUsage, error) {
+	var used TreeUnorderedReplayUsage
+	bad := func(err error) ([]metadata.DerivedWrite, map[TreePageID][]byte, TreeUnorderedReplayUsage, error) { return nil, nil, used, err }
+	if ctx == nil || budget.Sources == 0 || budget.Sources > 64 || budget.SourceBytes == 0 || budget.SourceBytes > model.MaxChangesetPayload+64*22 || budget.Pages == 0 || budget.Pages > 4096 || budget.PageBytes == 0 || budget.PageBytes > 4096*MaxTreePageBytes || budget.Step.Rewrite.InputBytes == 0 || budget.Step.Rewrite.InputBytes > model.MaxChangesetPayload { return bad(metadata.ErrInvalidArgument) }
+	if err := ctx.Err(); err != nil { return bad(err) }
+	if len(sources) == 0 { return bad(metadata.ErrInvalidArgument) }
+	if uint64(len(sources)) > budget.Sources { return bad(metadata.ErrResourceExhausted) }
+	index := make(map[model.ChangesetID]int, len(sources))
+	for i, source := range sources {
+		if err := ctx.Err(); err != nil { return bad(err) }
+		if source.ID.Validate() != nil { return bad(metadata.ErrInvalidArgument) }
+		if _, duplicate := index[source.ID]; duplicate { return bad(metadata.ErrInvalidArgument) }
+		index[source.ID] = i
+		n := uint64(len(source.Frame))
+		if n > budget.Step.Rewrite.InputBytes+22 || n > budget.SourceBytes-used.SourceBytes { return bad(metadata.ErrResourceExhausted) }
+		used.SourceBytes += n
+	}
+	parents := make([][]model.ChangesetID, len(sources))
+	for i, source := range sources {
+		if err := ctx.Err(); err != nil { return bad(err) }
+		used.DecodedSources++
+		value, err := model.DecodeChangeset(ctx, bytes.NewReader(source.Frame), source.ID, budget.Step.Rewrite.InputBytes)
+		if err != nil { return bad(err) }
+		change := value.Snapshot()
+		if change.RepoID != repository { return bad(metadata.ErrInvalidArgument) }
+		parents[i] = change.Parents
+	}
+	indegree := make([]int, len(sources))
+	children := make([][]int, len(sources))
+	for i, list := range parents {
+		for _, parent := range list {
+			if err := ctx.Err(); err != nil { return bad(err) }
+			p, exists := index[parent]
+			if !exists { return bad(metadata.ErrFailedPrecondition) }
+			children[p] = append(children[p], i); indegree[i]++
+		}
+	}
+	var ordered []TreeSourceFrame
+	emitted := make([]bool, len(sources))
+	for len(ordered) < len(sources) {
+		if err := ctx.Err(); err != nil { return bad(err) }
+		chosen := -1
+		for i := range sources {
+			if emitted[i] || indegree[i] != 0 { continue }
+			if chosen == -1 { chosen = i; continue }
+			a, b := sources[i].ID.TypedID().Digest(), sources[chosen].ID.TypedID().Digest()
+			if bytes.Compare(a[:], b[:]) < 0 { chosen = i }
+		}
+		if chosen == -1 { return bad(metadata.ErrCorruptData) }
+		emitted[chosen] = true; ordered = append(ordered, sources[chosen])
+		for _, child := range children[chosen] { indegree[child]-- }
+	}
+	writes, pages, replay, err := ReplayCanonicalTreeDAG(ctx, repository, ordered, blobs, budget)
+	used.Replay = replay
+	if err != nil { return bad(err) }
+	if err := ctx.Err(); err != nil { return bad(err) }
+	return writes, pages, used, nil
+}
