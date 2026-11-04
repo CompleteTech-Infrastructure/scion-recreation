@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/rand"
 	"reflect"
 	"strings"
 	"testing"
@@ -434,4 +435,120 @@ func TestNilRegistryReceiversRejectCalls(t *testing.T) {
 	requireZeroPlan(t, plan)
 	_, err = registry.LookupIdentity(metadata.DerivedIdentity{})
 	requireIs(t, err, metadata.ErrInvalidArgument)
+}
+
+// The oracle uses a boolean transitive-closure matrix rather than the registry's
+// DFS or its returned dependency lists. This checks shared prerequisites, unused
+// registrations, ordering and budget accounting across varied deterministic DAGs.
+func TestPlansAgainstIndependentDAGOracle(t *testing.T) {
+	const size = 48
+	for seed := int64(1); seed <= 32; seed++ {
+		t.Run(fmt.Sprintf("seed-%d", seed), func(t *testing.T) {
+			rng := rand.New(rand.NewSource(seed))
+			regs := make([]derived.Registration, size)
+			var edges, reachable [size][size]bool
+			for i := range regs {
+				regs[i] = testRegistration(testKey(fmt.Sprintf("node-%02d", i), 1))
+				n := uint64(i + 1)
+				regs[i].Budget = derived.WorkBudget{
+					Steps: n, MemoryBytes: 2 * n, ReadBytes: 3 * n, WriteBytes: 4 * n,
+					Objects: 5 * n, QueueDepth: 6 * n, Duration: time.Duration(7 * n),
+				}
+				reachable[i][i] = true
+				if i == 0 {
+					continue
+				}
+				// Edges always point to a smaller index, independently proving
+				// acyclicity. Some nodes intentionally have no prerequisites.
+				for count := rng.Intn(9); count > 0; count-- {
+					dep := rng.Intn(i)
+					if !edges[i][dep] {
+						edges[i][dep], reachable[i][dep] = true, true
+						regs[i].Dependencies = append(regs[i].Dependencies, regs[dep].Key)
+					}
+				}
+			}
+			for via := 0; via < size; via++ {
+				for from := 0; from < size; from++ {
+					for to := 0; to < size; to++ {
+						reachable[from][to] = reachable[from][to] || (reachable[from][via] && reachable[via][to])
+					}
+				}
+			}
+			shuffled := make([]derived.Registration, size)
+			for i, source := range rng.Perm(size) {
+				shuffled[i] = regs[source]
+			}
+			registry, err := derived.NewRegistry(shuffled)
+			if err != nil {
+				t.Fatal(err)
+			}
+			other, err := derived.NewRegistry(regs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for root := range regs {
+				plan, err := registry.Plan(regs[root].Key)
+				if err != nil {
+					t.Fatal(err)
+				}
+				positions := make(map[derived.Key]int)
+				for position, item := range plan.Registrations {
+					if _, duplicate := positions[item.Key]; duplicate {
+						t.Fatalf("root %d: duplicate prerequisite %+v", root, item.Key)
+					}
+					positions[item.Key] = position
+				}
+				var weight uint64
+				count := 0
+				for node, registration := range regs {
+					position, present := positions[registration.Key]
+					if present != reachable[root][node] {
+						t.Fatalf("root %d node %d: membership differs from reachability oracle", root, node)
+					}
+					if !present {
+						continue
+					}
+					count++
+					weight += uint64(node + 1)
+					if !reflect.DeepEqual(plan.Registrations[position], registration) {
+						t.Fatalf("root %d node %d: registration changed", root, node)
+					}
+					for dep := range regs {
+						if edges[node][dep] {
+							before, found := positions[regs[dep].Key]
+							if !found || before >= position {
+								t.Fatalf("root %d: dependency %d not before node %d", root, dep, node)
+							}
+						}
+					}
+				}
+				want := derived.WorkBudget{
+					Steps: weight, MemoryBytes: 2 * weight, ReadBytes: 3 * weight, WriteBytes: 4 * weight,
+					Objects: 5 * weight, QueueDepth: 6 * weight, Duration: time.Duration(7 * weight),
+				}
+				if len(plan.Registrations) != count || plan.Budget != want {
+					t.Fatalf("root %d: unrelated registrations or incorrect budget: %+v", root, plan.Budget)
+				}
+				stable, err := other.Plan(regs[root].Key)
+				if err != nil || !reflect.DeepEqual(plan, stable) {
+					t.Fatalf("root %d: input permutation changed deterministic plan", root)
+				}
+			}
+		})
+	}
+}
+
+func TestRegistryRejectsDeepBackEdgeWithoutPartialResult(t *testing.T) {
+	chain := make([]derived.Registration, derived.MaxRegistrations)
+	for i := range chain {
+		chain[i] = testRegistration(testKey(fmt.Sprintf("deep-%04d", i), 1))
+		if i > 0 {
+			chain[i-1].Dependencies = []derived.Key{chain[i].Key}
+		}
+	}
+	// The cycle begins halfway through a maximum-size graph, after a long
+	// acyclic prefix; no partial registry may escape when it is discovered.
+	chain[len(chain)-1].Dependencies = []derived.Key{chain[len(chain)/2].Key}
+	requireRegistryError(t, chain, derived.ErrDependencyCycle)
 }
