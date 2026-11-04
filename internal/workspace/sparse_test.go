@@ -158,8 +158,48 @@ func TestCanonicalSparseTransitionBindsComputedSnapshot(t *testing.T) {
 	}
 	corruptManifest := current; corruptManifest.DirtyPaths = []model.Path{testPath(t, []byte("a/b"))}
 	if out, usage, err := PlanManifestSparseTransition(ctx, repo, corruptManifest, 1, false, requested, nil, nil, budget); err != ErrCorrupt || out != nil || usage != (CanonicalSparseUsage{}) { t.Fatal("invalid clean manifest reached replay") }
-	for _, invalid := range []struct { version uint16; all bool }{{2, false}, {1, true}} {
-		if out, usage, err := PlanManifestSparseTransition(ctx, repo, current, invalid.version, invalid.all, requested, nil, nil, budget); err != ErrSparseSelection || out != nil || usage != (CanonicalSparseUsage{}) { t.Fatal("invalid requested sparse syntax reached replay") }
+	for _, invalid := range []struct {
+		name string
+		version uint16
+		all bool
+		prefixes []model.Path
+	}{
+		{"unknown-version", 2, false, requested},
+		{"all-with-prefix", 1, true, requested},
+		{"invalid-prefix", 1, false, []model.Path{{}}},
+	} {
+		if out, usage, err := PlanManifestSparseTransition(ctx, repo, current, invalid.version, invalid.all, invalid.prefixes, sources, blobs, budget); err != ErrSparseSelection || out != nil || usage != (CanonicalSparseUsage{}) {
+			t.Fatalf("%s requested syntax reached replay: plan=%+v usage=%+v err=%v", invalid.name, out, usage, err)
+		}
+	}
+	for _, tc := range []struct {
+		name string
+		currentAll, requestedAll bool
+		want []SparseTransition
+	}{
+		{"requested-all", false, true, []SparseTransition{{literal, true}, {newRow, true}}},
+		{"current-all", true, false, []SparseTransition{{literal, false}, {oldRow, false}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			manifest := current
+			manifest.SparseAll = tc.currentAll
+			if tc.currentAll { manifest.Sparse = nil }
+			prefixes := requested
+			if tc.requestedAll { prefixes = nil }
+			before, err := CompileSparseSelection(manifest.SparseVersion, manifest.SparseAll, manifest.Sparse)
+			if err != nil { t.Fatal(err) }
+			after, err := CompileSparseSelection(1, tc.requestedAll, prefixes)
+			if err != nil { t.Fatal(err) }
+			canonical, canonicalUsage, err := PlanCanonicalSparseTransition(ctx, repo, manifest.Base, sources, blobs, before, after, budget)
+			if err != nil { t.Fatal(err) }
+			bound, boundUsage, err := PlanManifestSparseTransition(ctx, repo, manifest, 1, tc.requestedAll, prefixes, sources, blobs, budget)
+			if err != nil || len(bound) != len(tc.want) || len(canonical) != len(tc.want) || boundUsage != canonicalUsage || boundUsage.Replay.Sources != 4 || boundUsage.Snapshot.Visits == 0 {
+				t.Fatalf("all selection binding differs: plan=%+v canonical=%+v usage=%+v err=%v", bound, canonical, boundUsage, err)
+			}
+			for i, intent := range tc.want {
+				if bound[i] != intent || canonical[i] != intent { t.Fatalf("all selection intent %d: bound=%+v canonical=%+v want=%+v", i, bound[i], canonical[i], intent) }
+			}
+		})
 	}
 	// Base/old selection originate only in current, not a separately supplied
 	// source ID or selector. Moving the manifest base changes the result.
