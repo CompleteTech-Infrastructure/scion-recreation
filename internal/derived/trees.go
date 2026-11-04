@@ -1226,8 +1226,9 @@ func PrepareCanonicalTreeWrite(ctx context.Context, identity metadata.DerivedIde
 	return PrepareCheckedTreeWrite(ctx, identity, source.Snapshot(), parent, frames, blobs, budget)
 }
 
-// TreeSourceFrame identifies one exact canonical source. Replay requires a root
-// first and then a contiguous parent-zero chain in oldest-to-newest order.
+// TreeSourceFrame identifies one exact canonical source. Chain replay requires
+// a root then contiguous parent-zero successors; DAG replay requires topological
+// order with every parent present earlier in the same supplied batch.
 type TreeSourceFrame struct { ID model.ChangesetID; Frame []byte }
 
 // TreeReplayBudget admits at most Sources independent checked-write attempts.
@@ -1253,6 +1254,24 @@ type TreeReplayUsage struct { Sources, SourceBytes, Pages, PageBytes uint64 }
 // unreachable intermediate pages. Any failure returns nil mappings and pages;
 // private usage describes admitted work, not proof of successful validation.
 func ReplayCanonicalTreeChain(ctx context.Context, repository [16]byte, sources []TreeSourceFrame, blobs map[model.BlobID][]byte, budget TreeReplayBudget) ([]metadata.DerivedWrite, map[TreePageID][]byte, TreeReplayUsage, error) {
+	return replayCanonicalTrees(ctx, repository, sources, blobs, budget, false)
+}
+
+// ReplayCanonicalTreeDAG accepts a complete, topologically ordered supplied
+// canonical DAG. Every parent (including nonzero parents) must already have
+// passed canonical/repository verification and checked tree computation in this
+// call. Multiple roots are allowed; repeated source IDs and unknown/not-yet-seen
+// parents fail. This establishes supplied ancestry closure without fetching or
+// accepting caller mappings. Only parent zero contributes a source's base tree.
+//
+// Budget accounting, private owned outputs and all-or-nothing failure semantics
+// are identical to ReplayCanonicalTreeChain. Verified supplied ancestry still
+// does not establish authoritative publication, retention or authorization.
+func ReplayCanonicalTreeDAG(ctx context.Context, repository [16]byte, sources []TreeSourceFrame, blobs map[model.BlobID][]byte, budget TreeReplayBudget) ([]metadata.DerivedWrite, map[TreePageID][]byte, TreeReplayUsage, error) {
+	return replayCanonicalTrees(ctx, repository, sources, blobs, budget, true)
+}
+
+func replayCanonicalTrees(ctx context.Context, repository [16]byte, sources []TreeSourceFrame, blobs map[model.BlobID][]byte, budget TreeReplayBudget, completeDAG bool) ([]metadata.DerivedWrite, map[TreePageID][]byte, TreeReplayUsage, error) {
 	var used TreeReplayUsage
 	bad := func(err error) ([]metadata.DerivedWrite, map[TreePageID][]byte, TreeReplayUsage, error) { return nil, nil, used, err }
 	if ctx == nil || budget.Sources == 0 || budget.Sources > 64 || budget.SourceBytes == 0 || budget.SourceBytes > model.MaxChangesetPayload+64*22 || budget.Pages == 0 || budget.Pages > 4096 || budget.PageBytes == 0 || budget.PageBytes > 4096*MaxTreePageBytes || budget.Step.Rewrite.InputBytes == 0 || budget.Step.Rewrite.InputBytes > model.MaxChangesetPayload { return bad(metadata.ErrInvalidArgument) }
@@ -1273,6 +1292,8 @@ func ReplayCanonicalTreeChain(ctx context.Context, repository [16]byte, sources 
 	pages := map[TreePageID][]byte{root: empty}
 	used.Pages, used.PageBytes = 1, uint64(len(empty))
 	writes := make([]metadata.DerivedWrite, 0, len(sources))
+	var verified map[model.ChangesetID]metadata.DerivedResult
+	if completeDAG { verified = make(map[model.ChangesetID]metadata.DerivedResult, len(sources)) }
 	for i, source := range sources {
 		if err := ctx.Err(); err != nil { return bad(err) }
 		used.Sources++
@@ -1281,7 +1302,15 @@ func ReplayCanonicalTreeChain(ctx context.Context, repository [16]byte, sources 
 		change := value.Snapshot()
 		if change.RepoID != repository { return bad(metadata.ErrInvalidArgument) }
 		var parent *metadata.DerivedResult
-		if i == 0 {
+		if completeDAG {
+			if _, duplicate := verified[source.ID]; duplicate { return bad(metadata.ErrInvalidArgument) }
+			for j, id := range change.Parents {
+				if err := ctx.Err(); err != nil { return bad(err) }
+				prior, ok := verified[id]
+				if !ok { return bad(metadata.ErrFailedPrecondition) }
+				if j == 0 { parent = &prior }
+			}
+		} else if i == 0 {
 			if len(change.Parents) != 0 { return bad(metadata.ErrFailedPrecondition) }
 		} else {
 			if len(change.Parents) == 0 || change.Parents[0] != sources[i-1].ID { return bad(metadata.ErrFailedPrecondition) }
@@ -1300,6 +1329,7 @@ func ReplayCanonicalTreeChain(ctx context.Context, repository [16]byte, sources 
 			pages[id] = frame
 		}
 		writes = append(writes, write)
+		if completeDAG { verified[source.ID] = write.Result }
 	}
 	if err := ctx.Err(); err != nil { return bad(err) }
 	return writes, pages, used, nil

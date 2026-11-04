@@ -231,3 +231,48 @@ func TestReadCanonicalPathHistoryUsesReplayedMappings(t *testing.T) {
 	cancel := &treePhaseCancelContext{Context: ctx, cancelAt: probe.calls+2}
 	if rows, usage, err := ReadCanonicalPathHistory(cancel, repo, start, path, sources, blobs, budget); err != context.Canceled || rows != nil || usage.Replay.Sources != 6 || usage.History != (PathHistoryChainUsage{}) { t.Fatalf("phase cancellation leaked history: %+v %v", usage, err) }
 }
+
+func TestReadCanonicalDAGPathHistorySelectsOnlyFirstParents(t *testing.T) {
+	ctx := context.Background(); repo := [16]byte{4}
+	blob, frame := treeCanonicalBlob(t, nil); blobs := map[model.BlobID][]byte{blob: frame}
+	path, _ := model.NewPath([]byte("a"))
+	regular, _ := model.NewOperation(path, model.SetRegular, &blob)
+	executable, _ := model.NewOperation(path, model.SetExecutable, &blob)
+	remove, _ := model.NewOperation(path, model.Delete, nil)
+	root := treeReplaySource(t, model.ChangesetInput{RepoID: repo, Operations: []model.Operation{regular}})
+	left := treeReplaySource(t, model.ChangesetInput{RepoID: repo, Parents: []model.ChangesetID{root.ID}, Operations: []model.Operation{executable}})
+	right := treeReplaySource(t, model.ChangesetInput{RepoID: repo, Parents: []model.ChangesetID{root.ID}, Operations: []model.Operation{remove}})
+	merge := treeReplaySource(t, model.ChangesetInput{RepoID: repo, Parents: []model.ChangesetID{left.ID, right.ID}})
+	swapped := treeReplaySource(t, model.ChangesetInput{RepoID: repo, Parents: []model.ChangesetID{right.ID, left.ID}})
+	sources := []TreeSourceFrame{root, left, right, merge, swapped}
+	var frameBytes, payloadBytes uint64
+	for _, s := range sources { frameBytes += uint64(len(s.Frame)); payloadBytes += uint64(len(s.Frame)-22) }
+	graph := TreeObjectGraphBudget{graphTestBudget(), 22}
+	step := TreeCheckedWriteBudget{graph, graph, TreeChangesetBudget{TreeRewriteBudget{4096, 4096*MaxTreePageBytes, 4096*MaxTreePageBytes}, 4096, model.MaxChangesetPayload}}
+	budget := CanonicalPathHistoryBudget{TreeReplayBudget{5, frameBytes, 3, 144, step}, PathHistoryChainBudget{3, payloadBytes, 2, TreeLookupBudget{5, 300}}}
+	for _, target := range []TreeSourceFrame{merge, swapped} {
+		rows, used, err := ReadCanonicalDAGPathHistory(ctx, repo, target.ID, path, sources, blobs, budget)
+		if err != nil || len(rows) != 2 || used.Replay.Sources != 5 || used.History.Nodes != 3 || used.History.Lookup.Pages != 5 || rows[1].Changeset != root.ID || rows[1].BeforePresent || rows[1].After != regular { t.Fatalf("selected DAG history: %+v %v", used, err) }
+		want := left.ID; if target.ID == swapped.ID { want = right.ID }
+		if rows[0].Changeset != want || rows[0].FirstParent != root.ID || rows[0].Before != regular || !rows[0].BeforePresent { t.Fatal("history selected additional-parent branch") }
+		if target.ID == merge.ID { if rows[0].After != executable || !rows[0].AfterPresent { t.Fatal("left mode transition lost") } } else if rows[0].AfterPresent { t.Fatal("right deletion lost") }
+		// Full bridge retains all decoded sources, while history usage charges
+		// only the selected root/branch/merge payloads.
+		branch := left; if target.ID == swapped.ID { branch = right }
+		wantBytes := uint64(len(root.Frame)+len(branch.Frame)+len(target.Frame)-3*22)
+		if used.History.SourceBytes != wantBytes { t.Fatal("history charged unrelated branch as visited") }
+	}
+	rootOnly := budget; rootOnly.History.Nodes = 1; rootOnly.History.Changes = 1; rootOnly.History.Lookup = TreeLookupBudget{1, 60}
+	if rows, used, err := ReadCanonicalDAGPathHistory(ctx, repo, root.ID, path, sources, blobs, rootOnly); err != nil || len(rows) != 1 || used.Replay.Sources != 5 || used.History.Nodes != 1 { t.Fatal("nonfinal root target incorrectly required all DAG nodes in walk budget") }
+	short := budget; short.History.SourceBytes--
+	if rows, used, err := ReadCanonicalDAGPathHistory(ctx, repo, merge.ID, path, sources, blobs, short); err != metadata.ErrResourceExhausted || rows != nil || used.History.Nodes != 0 { t.Fatal("aggregate bridge payload failed to include other branches") }
+	short = budget; short.History.Nodes--
+	if rows, _, err := ReadCanonicalDAGPathHistory(ctx, repo, merge.ID, path, sources, blobs, short); err != metadata.ErrResourceExhausted || rows != nil { t.Fatal("selected walk exhaustion returned partial history") }
+	if rows, _, err := ReadCanonicalDAGPathHistory(ctx, repo, merge.ID, path, []TreeSourceFrame{root, left, merge}, blobs, budget); err != metadata.ErrFailedPrecondition || rows != nil { t.Fatal("missing nonzero-parent source ignored") }
+	corrupt := append([]TreeSourceFrame(nil), sources...); corrupt[2].Frame = append([]byte(nil), corrupt[2].Frame...); corrupt[2].Frame[len(corrupt[2].Frame)-1] ^= 1
+	if rows, used, err := ReadCanonicalDAGPathHistory(ctx, repo, merge.ID, path, corrupt, blobs, budget); err == nil || rows != nil || used.History.Nodes != 0 { t.Fatal("corrupt off-lineage source ignored") }
+	unknown := treeReplaySource(t, model.ChangesetInput{RepoID: repo, Message: []byte("not supplied")})
+	if rows, used, err := ReadCanonicalDAGPathHistory(ctx, repo, unknown.ID, path, sources, blobs, budget); err != metadata.ErrInvalidArgument || rows != nil || used != (CanonicalPathHistoryUsage{}) { t.Fatal("missing target reached replay") }
+	cancelled, cancel := context.WithCancel(ctx); cancel()
+	if rows, _, err := ReadCanonicalDAGPathHistory(cancelled, repo, merge.ID, path, sources, blobs, budget); err != context.Canceled || rows != nil { t.Fatal("DAG history ignored cancellation") }
+}
