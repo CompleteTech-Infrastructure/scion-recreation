@@ -3,6 +3,7 @@ package workspace
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -368,4 +369,310 @@ func TestLinuxNativeOpenArmsObservation(t *testing.T) {
 		case <-tick.C:
 		}
 	}
+}
+
+// The display names on traversal FDs are workspace-relative. Metadata lookup
+// must use the held FD even when those names do not exist in the process CWD.
+func TestLinuxNativeEnumerationOutsideCWD(t *testing.T) {
+	t.Chdir(t.TempDir())
+	for _, hardlink := range []bool{false, true} {
+		t.Run(map[bool]string{false: "nested", true: "hardlink"}[hardlink], func(t *testing.T) {
+			root, meta := t.TempDir(), privateMetadataDir(t)
+			watchOK(t, os.Mkdir(filepath.Join(root, "sub"), 0700))
+			watchFile(t, filepath.Join(root, "sub/file"), "baseline")
+			if hardlink {
+				watchOK(t, os.Link(filepath.Join(root, "sub/file"), filepath.Join(t.TempDir(), "alias")))
+			}
+			watchOK(t, Save(meta, Manifest{Base: testChangeset(t, "cwd coverage"), SparseVersion: 1, SparseAll: true, State: Clean}))
+			limits := WatchLimits{Candidates: 128, CandidateBytes: 4096, Queue: 128, Entries: 256, Bytes: 64 << 10, Depth: 8, Descriptors: 2, Attempts: 32, Duration: 2 * time.Second}
+			w, err := OpenNativeWatch(root, meta, limits)
+			if hardlink {
+				if w != nil {
+					_ = w.Close()
+					t.Fatal("multiply linked descendant accepted")
+				}
+				watchIs(t, err, ErrWatchStale)
+				return
+			}
+			watchOK(t, err)
+			defer w.Close()
+			n := w.backend.(*linuxWatch)
+			watchOK(t, n.call(context.Background(), func() error {
+				for _, path := range []string{".", "sub", "sub/file"} {
+					if _, ok := n.paths[path]; !ok {
+						return ErrWatchStale
+					}
+				}
+				if n.peak > linuxWatchDescriptors {
+					return ErrWatchLimit
+				}
+				return nil
+			}))
+		})
+	}
+}
+
+// No Barrier or reconciliation is allowed after arrival: the periodic observer
+// must register new file inodes before later outside-link changes can be seen.
+func TestLinuxNativeRegularArrivalCoverage(t *testing.T) {
+	for _, moved := range []bool{false, true} {
+		t.Run(map[bool]string{false: "create", true: "move-in"}[moved], func(t *testing.T) {
+			w, n, root, _ := linuxFixture(t)
+			path := filepath.Join(root, "sub/arrived")
+			outside := t.TempDir()
+			if moved {
+				incoming := filepath.Join(outside, "incoming")
+				watchFile(t, incoming, "arrived")
+				watchOK(t, os.Rename(incoming, path))
+			} else {
+				watchFile(t, path, "arrived")
+			}
+			deadline := time.Now().Add(2 * time.Second)
+			for {
+				var covered bool
+				watchOK(t, n.call(context.Background(), func() error {
+					_, covered = n.paths["sub/arrived"]
+					return n.failed
+				}))
+				if covered {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("regular arrival never acquired inode coverage without Barrier")
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			_, before, err := w.Snapshot()
+			watchOK(t, err)
+			alias := filepath.Join(outside, "alias")
+			watchOK(t, os.Link(path, alias))
+			watchFile(t, alias, "outside write")
+			deadline = time.Now().Add(2 * time.Second)
+			for {
+				var failure error
+				watchOK(t, n.call(context.Background(), func() error { failure = n.failed; return nil }))
+				if failure != nil {
+					watchIs(t, failure, ErrWatchStale)
+					_, after, _ := w.Snapshot()
+					watchCheck(t, after > before, "outside link did not invalidate generation")
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("outside hard link did not fail closed")
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+		})
+	}
+}
+
+func TestLinuxNativeCoverageChurn(t *testing.T) {
+	for _, barrier := range []bool{false, true} {
+		t.Run(map[bool]string{false: "background", true: "barrier"}[barrier], func(t *testing.T) {
+			_, n, root, _ := linuxFixture(t)
+			watchOK(t, n.call(context.Background(), func() error {
+				prior := n.observe
+				defer func() { n.observe = prior }()
+				remaining := 6
+				n.observe = func(events []WatchEvent) error {
+					if err := prior(events); err != nil {
+						return err
+					}
+					if remaining > 0 {
+						remaining--
+						return os.WriteFile(filepath.Join(root, "arrival"+string(rune('a'+remaining))), []byte("new"), 0600)
+					}
+					return nil
+				}
+				if err := os.WriteFile(filepath.Join(root, "trigger"), nil, 0600); err != nil {
+					return err
+				}
+				if err := n.step(context.Background(), barrier); err != nil {
+					return err
+				}
+				if n.failed != nil {
+					return n.failed
+				}
+				if !barrier && !n.coverage {
+					return ErrWatchStale
+				}
+				if err := n.step(context.Background(), true); err != nil {
+					return err
+				}
+				for i := 0; i < 6; i++ {
+					if _, ok := n.paths["arrival"+string(rune('a'+i))]; !ok {
+						return ErrWatchStale
+					}
+				}
+				return nil
+			}))
+		})
+	}
+}
+
+func TestLinuxNativeRegularReplacement(t *testing.T) {
+	for _, rotation := range []bool{false, true} {
+		t.Run(map[bool]string{false: "pinned-replacement", true: "rotation"}[rotation], func(t *testing.T) {
+			w, n, root, _ := linuxFixture(t)
+			old, err := os.Open(filepath.Join(root, "sub/file"))
+			watchOK(t, err)
+			defer old.Close()
+			watchFile(t, filepath.Join(root, "sub/other"), "replacement")
+			watchOK(t, n.Barrier(context.Background()))
+			watchOK(t, n.call(context.Background(), func() error {
+				if rotation {
+					if err := os.Rename(filepath.Join(root, "sub/file"), filepath.Join(root, "sub/rotated")); err != nil {
+						return err
+					}
+				}
+				if err := os.Rename(filepath.Join(root, "sub/other"), filepath.Join(root, "sub/file")); err != nil {
+					return err
+				}
+				if err := n.step(context.Background(), true); err != nil {
+					return err
+				}
+				info, err := os.Stat(filepath.Join(root, "sub/file"))
+				if err != nil {
+					return err
+				}
+				wd, ok := n.paths["sub/file"]
+				if !ok || !os.SameFile(info, n.watches[wd].info) {
+					return ErrWatchStale
+				}
+				return nil
+			}))
+			m, _, err := w.Snapshot()
+			watchOK(t, err)
+			want := []string{"sub/file", "sub/other"}
+			if rotation {
+				want = append(want, "sub/rotated")
+			}
+			found := make(map[string]bool)
+			for _, path := range m.DirtyPaths {
+				found[string(path.Bytes())] = true
+			}
+			for _, path := range want {
+				watchCheck(t, found[path], "missing dirty path %s", path)
+			}
+		})
+	}
+}
+
+func TestLinuxNativeVanishedEntry(t *testing.T) {
+	w, n, root, _ := linuxFixture(t)
+	watchOK(t, n.call(context.Background(), func() error {
+		f, err := n.openDir("sub")
+		if err != nil {
+			return err
+		}
+		defer func() { _ = f.Close(); n.descriptors-- }()
+		// Model a name already returned by readdir, then removed before lookup.
+		if err := os.WriteFile(filepath.Join(root, "sub/vanished"), nil, 0600); err != nil {
+			return err
+		}
+		if err := os.Remove(filepath.Join(root, "sub/vanished")); err != nil {
+			return err
+		}
+		info, err := n.entryInfo(f, "vanished")
+		if err != nil {
+			return err
+		}
+		if info != nil {
+			return ErrWatchStale
+		}
+		return nil
+	}))
+	watchOK(t, n.Barrier(context.Background()))
+	m, _, err := w.Snapshot()
+	watchOK(t, err)
+	requirePathBytes(t, m.DirtyPaths, []byte("sub/vanished"))
+}
+
+func TestLinuxNativeUnlinkedPinnedEntry(t *testing.T) {
+	_, n, root, _ := linuxFixture(t)
+	watchOK(t, n.call(context.Background(), func() error {
+		file, err := os.Create(filepath.Join(root, "sub/unlinked"))
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+		before, err := file.Stat()
+		if err != nil {
+			return err
+		}
+		if err := os.Remove(filepath.Join(root, "sub/unlinked")); err != nil {
+			return err
+		}
+		_, err = n.register("sub/unlinked", before, int(file.Fd()))
+		if !errors.Is(err, errLinuxEntryVanished) {
+			return ErrWatchStale
+		}
+		return nil
+	}))
+	watchOK(t, n.Barrier(context.Background()))
+}
+
+func TestLinuxNativeSweepAlreadyRemoved(t *testing.T) {
+	w, n, root, _ := linuxFixture(t)
+	watchOK(t, n.call(context.Background(), func() error {
+		if err := os.Remove(filepath.Join(root, "sub/file")); err != nil {
+			return err
+		}
+		// Deliberately sweep before draining the kernel's queued IN_IGNORED.
+		if err := n.maintain(context.Background()); err != nil {
+			return err
+		}
+		return n.step(context.Background(), true)
+	}))
+	m, _, err := w.Snapshot()
+	watchOK(t, err)
+	requirePathBytes(t, m.DirtyPaths, []byte("sub/file"))
+}
+
+func TestLinuxNativeRegistrationENOENTFailsClosed(t *testing.T) {
+	w, n, root, meta := linuxFixture(t)
+	var attempts int
+	err := n.call(context.Background(), func() error {
+		n.addWatch = func(int, string, uint32) (int, error) {
+			attempts++
+			return -1, syscall.ENOENT
+		}
+		if err := os.WriteFile(filepath.Join(root, "sub/unwatched"), []byte("new"), 0600); err != nil {
+			return err
+		}
+		return n.step(context.Background(), true)
+	})
+	watchIs(t, err, syscall.ENOENT)
+	watchCheck(t, attempts == 1, "registration attempts = %d, want 1", attempts)
+	var failure error
+	var released bool
+	watchOK(t, n.call(context.Background(), func() error {
+		failure = n.failed
+		released = n.fd == -1 && n.descriptors == 0 && len(n.paths) == 0
+		return nil
+	}))
+	watchIs(t, failure, syscall.ENOENT)
+	watchCheck(t, released, "registration failure retained coverage/resources")
+	watchUnknown(t, w, meta)
+}
+
+func TestLinuxNativeVanishedEntryPreservesCloseFailure(t *testing.T) {
+	_, n, root, _ := linuxFixture(t)
+	var result error
+	watchOK(t, n.call(context.Background(), func() error {
+		file, err := os.Open(filepath.Join(root, "sub/file"))
+		if err != nil {
+			return err
+		}
+		n.descriptors++
+		if err := file.Close(); err != nil {
+			n.descriptors--
+			return err
+		}
+		result = n.closeEntry(file, errLinuxEntryVanished)
+		return nil
+	}))
+	watchIs(t, result, errLinuxEntryVanished)
+	watchIs(t, result, os.ErrClosed)
+	watchCheck(t, result != errLinuxEntryVanished, "close failure became a skippable vanished entry")
 }
