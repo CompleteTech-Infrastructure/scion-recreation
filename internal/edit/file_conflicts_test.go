@@ -364,9 +364,9 @@ func TestPrepareFileOperationsLateCancellationDiscardsPrefix(t *testing.T) {
 	budget := FilePreparationBudget{2,2,14,58}
 	baseline := &preparationCancelContext{Context: context.Background()}
 	if out, err := PrepareFileOperations(baseline, []ResolvedFileEntry{{a,state}}, budget); err != nil || len(out) != 1 { t.Fatal(out, err) }
-	// Extra preflight row adds one Err call; the single-call final check is
-	// replaced by the second PrepareFileOperation entry check at this offset.
-	late := &preparationCancelContext{Context: context.Background(), cancelAt: baseline.calls+1}
+	// The second present row adds three pre-encoding checks (admission,
+	// path collection, prefix search). Cancel at second candidate entry.
+	late := &preparationCancelContext{Context: context.Background(), cancelAt: baseline.calls+3}
 	if out, err := PrepareFileOperations(late, []ResolvedFileEntry{{a,state},{b,state}}, budget); err != context.Canceled || out != nil { t.Fatal(out, err) }
 }
 
@@ -585,4 +585,31 @@ func TestResolveFileEntriesRequiresExactCompleteConflictSet(t *testing.T) {
 		if out, err := ResolveFileEntries(ctx,entries,resolutions,budget); err != context.Canceled || out != nil { t.Fatal(at,out,err) }
 	}
 	if out, err := ResolveFileEntries(nil,entries,resolutions,budget); err != ErrFileState || out != nil { t.Fatal(out,err) }
+}
+
+func TestPrepareFileOperationsRejectsImpossiblePresentAncestors(t *testing.T) {
+	path := func(s string) model.Path { p, err := model.NewPath([]byte(s)); if err != nil { t.Fatal(err) }; return p }
+	regular := fileFixture(t,model.SetRegular,"x")
+	budget := FilePreparationBudget{4,100,100,200}
+	for _, mode := range []model.OperationTag{model.SetRegular,model.SetExecutable,model.SetSymlink} {
+		ancestor := fileFixture(t,mode,"")
+		for _, names := range [][]string{{"a","a/b"},{"a","a-","a/b"},{"\xff","\xff-","\xff/b"}} {
+			var entries []ResolvedFileEntry
+			for i, name := range names { state := regular; if i == 0 { state = ancestor }; entries = append(entries,ResolvedFileEntry{path(name),state}) }
+			if out, err := PrepareFileOperations(context.Background(),entries,budget); err != ErrFileState || out != nil { t.Fatal(mode,names,out,err) }
+		}
+	}
+	for _, entries := range [][]ResolvedFileEntry{
+		{{path("a"),AbsentFile()},{path("a/b"),regular}},
+		{{path("a"),regular},{path("a/b"),AbsentFile()}},
+		{{path("a"),regular},{path("a-"),regular},{path("ab"),regular}},
+		{{path("a/b"),regular},{path("a/c"),regular}},
+	} {
+		out, err := PrepareFileOperations(context.Background(),entries,budget)
+		if err != nil || len(out) != len(entries) { t.Fatal(out,err) }
+		for i, entry := range entries {
+			want, err := PrepareFileOperation(context.Background(),entry.Path,entry.Version,100)
+			if err != nil || out[i].Operation != want.Operation || !bytes.Equal(out[i].BlobFrame,want.BlobFrame) { t.Fatal(out[i],want,err) }
+		}
+	}
 }
