@@ -316,3 +316,54 @@ func TestPrepareFileOperationRejectsBeforeOutput(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background()); cancel()
 	if got, err := PrepareFileOperation(ctx, path, version, 3); err != context.Canceled || got.Operation != (model.Operation{}) || got.BlobFrame != nil { t.Fatal(got, err) }
 }
+
+func TestPrepareFileOperationsSharedAdmissionAndOwnership(t *testing.T) {
+	var entries []ResolvedFileEntry
+	for i, state := range []FileVersion{AbsentFile(), fileFixture(t, model.SetRegular, ""), fileFixture(t, model.SetExecutable, "ab"), fileFixture(t, model.SetSymlink, "ab")} {
+		path, err := model.NewPath([]byte{byte('a'+i)}); if err != nil { t.Fatal(err) }
+		entries = append(entries, ResolvedFileEntry{path, state})
+	}
+	budget := FilePreparationBudget{4, 4, 4, 70} // 3 headers + two 2-byte payloads.
+	got, err := PrepareFileOperations(context.Background(), entries, budget)
+	if err != nil || len(got) != 4 { t.Fatal(got, err) }
+	for i, entry := range entries {
+		want, err := PrepareFileOperation(context.Background(), entry.Path, entry.Version, uint64(len(entry.Version.content)))
+		if err != nil || got[i].Operation != want.Operation || !bytes.Equal(got[i].BlobFrame, want.BlobFrame) { t.Fatal(i, got[i], want, err) }
+	}
+	if got[0].BlobFrame != nil || len(got[1].BlobFrame) != 22 { t.Fatal("absence/empty conflated") }
+	left, _ := got[2].Operation.Target(); right, _ := got[3].Operation.Target()
+	if left != right || got[2].Operation.Tag() == got[3].Operation.Tag() { t.Fatal("identity/mode mismatch") }
+	got[2].BlobFrame[0] ^= 1
+	if got[2].BlobFrame[0] == got[3].BlobFrame[0] { t.Fatal("duplicate content shares mutable frame") }
+	for _, b := range []FilePreparationBudget{{3,4,4,70}, {4,3,4,70}, {4,4,3,70}, {4,4,4,69}} {
+		if out, err := PrepareFileOperations(context.Background(), entries, b); err != ErrFileBudget || out != nil { t.Fatal(b, out, err) }
+	}
+	if out, err := PrepareFileOperations(context.Background(), entries[:1], FilePreparationBudget{1,1,0,0}); err != nil || len(out) != 1 || out[0].BlobFrame != nil { t.Fatal(out, err) }
+	if out, err := PrepareFileOperations(context.Background(), nil, FilePreparationBudget{1,1,0,0}); err != nil || out != nil { t.Fatal(out, err) }
+	for _, bad := range [][]ResolvedFileEntry{{entries[0], entries[0]}, {entries[1], entries[0]}, {entries[0], {entries[1].Path, FileVersion{}}}, {{model.Path{}, AbsentFile()}}} {
+		if out, err := PrepareFileOperations(context.Background(), bad, budget); err != ErrFileState || out != nil { t.Fatal(out, err) }
+	}
+	if out, err := PrepareFileOperations(nil, entries, budget); err != ErrFileState || out != nil { t.Fatal(out, err) }
+}
+
+// Cancel after the first complete candidate has been appended; a second entry
+// context check must discard it. The threshold is discovered via a baseline
+// one-entry call, avoiding dependence on codec check counts.
+type preparationCancelContext struct { context.Context; calls, cancelAt int }
+func (c *preparationCancelContext) Err() error {
+	c.calls++
+	if c.cancelAt > 0 && c.calls >= c.cancelAt { return context.Canceled }
+	return nil
+}
+
+func TestPrepareFileOperationsLateCancellationDiscardsPrefix(t *testing.T) {
+	a, _ := model.NewPath([]byte("a")); b, _ := model.NewPath([]byte("b"))
+	state := fileFixture(t, model.SetRegular, "content")
+	budget := FilePreparationBudget{2,2,14,58}
+	baseline := &preparationCancelContext{Context: context.Background()}
+	if out, err := PrepareFileOperations(baseline, []ResolvedFileEntry{{a,state}}, budget); err != nil || len(out) != 1 { t.Fatal(out, err) }
+	// Extra preflight row adds one Err call; the single-call final check is
+	// replaced by the second PrepareFileOperation entry check at this offset.
+	late := &preparationCancelContext{Context: context.Background(), cancelAt: baseline.calls+1}
+	if out, err := PrepareFileOperations(late, []ResolvedFileEntry{{a,state},{b,state}}, budget); err != context.Canceled || out != nil { t.Fatal(out, err) }
+}
