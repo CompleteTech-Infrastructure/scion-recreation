@@ -452,3 +452,111 @@ func TestReplaceExistingTreeLeafCopiesOnlyPath(t *testing.T) {
 	delete(frames, fileID)
 	if _, _, err := ReplaceExistingTreeLeaf(context.Background(), root, frames, path, 2, newBlob, budget); err != ErrTreePageMissing { t.Fatal("missing path page accepted") }
 }
+
+func TestReplaceExistingTreeLeafSecondChildAndOccupiedBytes(t *testing.T) {
+	oldTID, err := model.NewTypedID(model.BlobKind, [32]byte{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldBlob, err := model.NewBlobID(oldTID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newTID, err := model.NewTypedID(model.BlobKind, [32]byte{2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	newBlob, err := model.NewBlobID(newTID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, leafID, err := EncodeTreePageAt(UnlinkedTreePage{Tag: 1, Blob: oldBlob}, nil, []byte("z"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootFrame, root, err := EncodeTreePageAt(UnlinkedTreePage{
+		Children: []TreePageChild{{'a', leafID}, {'z', leafID}},
+	}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frames := map[TreePageID][]byte{root: rootFrame, leafID: leaf}
+	if _, err := CheckTreePageGraph(context.Background(), root, frames, graphTestBudget()); err != nil {
+		t.Fatalf("base graph: %v", err)
+	}
+	path, err := model.NewPath([]byte("z"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pathBytes := uint64(len(rootFrame) + len(leaf))
+	budget := TreeRewriteBudget{Pages: 2, ReadBytes: pathBytes, WriteBytes: pathBytes}
+	next, added, err := ReplaceExistingTreeLeaf(context.Background(), root, frames, path, 2, newBlob, budget)
+	if err != nil || next == root || len(added) != 2 {
+		t.Fatalf("second-child replacement: root=%v frames=%d err=%v", next, len(added), err)
+	}
+	combined := make(map[TreePageID][]byte)
+	for id, frame := range frames {
+		combined[id] = frame
+	}
+	for id, frame := range added {
+		combined[id] = frame
+	}
+	page, err := DecodeTreePageAt(combined[next], next, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Children) != 2 || page.Children[0].Edge != 'a' || page.Children[0].ID != leafID ||
+		page.Children[1].Edge != 'z' || page.Children[1].ID == leafID {
+		t.Fatalf("wrong child rewritten or sibling lost: %+v", page.Children)
+	}
+	replaced, err := DecodeTreePageAt(combined[page.Children[1].ID], page.Children[1].ID, nil, []byte("z"))
+	if err != nil || replaced.Tag != 2 || replaced.Blob != newBlob {
+		t.Fatalf("second-child terminal: tag=%d blob=%v err=%v", replaced.Tag, replaced.Blob, err)
+	}
+	if _, err := CheckTreePageGraph(context.Background(), next, combined, graphTestBudget()); err != nil {
+		t.Fatalf("candidate graph: %v", err)
+	}
+
+	// Occupy only the new root ID, so the additional read is exactly its
+	// candidate frame. The new leaf is still produced by the rewrite.
+	comparisonBudget := budget
+	comparisonBudget.ReadBytes += uint64(len(added[next]))
+	for _, tc := range []struct {
+		name    string
+		corrupt bool
+		short   bool
+		want    error
+	}{
+		{"identical-at-exact-budget", false, false, nil},
+		{"equal-length-corruption-at-exact-budget", true, false, ErrTreePage},
+		{"admission-before-corrupt-byte-comparison", true, true, metadata.ErrResourceExhausted},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			occupied := make(map[TreePageID][]byte)
+			for id, frame := range frames {
+				occupied[id] = frame
+			}
+			candidate := append([]byte(nil), added[next]...)
+			if tc.corrupt {
+				candidate[len(candidate)-1] ^= 1
+			}
+			occupied[next] = candidate
+			expectedOccupied := append([]byte(nil), candidate...)
+			limit := comparisonBudget
+			if tc.short {
+				limit.ReadBytes--
+			}
+			got, output, err := ReplaceExistingTreeLeaf(context.Background(), root, occupied, path, 2, newBlob, limit)
+			if tc.want != nil {
+				if err != tc.want || got != (TreePageID{}) || output != nil {
+					t.Fatalf("wanted %v and no output, got root=%v frames=%d err=%v", tc.want, got, len(output), err)
+				}
+			} else if err != nil || got != next || len(output) != 1 {
+				t.Fatalf("exact occupied comparison: root=%v frames=%d err=%v", got, len(output), err)
+			}
+			if !bytes.Equal(occupied[next], expectedOccupied) {
+				t.Fatal("occupied bytes were overwritten")
+			}
+		})
+	}
+}
