@@ -82,7 +82,7 @@ func MergeTextHunks(ctx context.Context, base []byte, left, right []TextHunk, bu
 	// Indices refer to original inputs; the merged order never retains copies of
 	// replacement bytes. Preflight the complete result before allocating output.
 	type chosen struct {
-		h TextHunk
+		h           TextHunk
 		side, index int
 	}
 	order := make([]chosen, 0, len(left)+len(right))

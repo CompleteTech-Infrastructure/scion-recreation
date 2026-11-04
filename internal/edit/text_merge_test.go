@@ -114,3 +114,54 @@ func TestTextHunkConflictAfterCoalescing(t *testing.T) {
 		}
 	}
 }
+
+type textCancelContext struct {
+	context.Context
+	cancel          context.CancelFunc
+	calls, cancelAt int
+}
+
+func (c *textCancelContext) Err() error {
+	c.calls++
+	if c.calls == c.cancelAt {
+		c.cancel()
+	}
+	return c.Context.Err()
+}
+
+func TestTextHunkCancellationDuringMerge(t *testing.T) {
+	base := bytes.Repeat([]byte("a"), 3*(32<<10)+9)
+	left := []TextHunk{{1, 2, []byte("X")}, {uint64(len(base) - 2), uint64(len(base) - 1), []byte("Y")}}
+	right := []TextHunk{{4, 5, []byte("R")}}
+	budget := TextMergeBudget{uint64(len(base) + 3), 3}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	probe := &textCancelContext{Context: ctx, cancel: cancel}
+	out, conflict, err := MergeTextHunks(probe, base, left, right, budget)
+	if err != nil || conflict != nil || len(out) != len(base) {
+		t.Fatalf("uncanceled merge failed: len=%d conflict=%v err=%v", len(out), conflict, err)
+	}
+	// This fixture reaches validation, ordering, each hunk, four copy chunks
+	// in its long unchanged span, and final completion. Keep a minimum so a
+	// removed cancellation check cannot silently shrink the sweep below.
+	const minimumCheckpoints = 21
+	if probe.calls < minimumCheckpoints {
+		t.Fatalf("cancellation checkpoints lost: got %d, need at least %d", probe.calls, minimumCheckpoints)
+	}
+	for cancelAt := 1; cancelAt <= probe.calls; cancelAt++ {
+		inner, stop := context.WithCancel(context.Background())
+		canceled := &textCancelContext{Context: inner, cancel: stop, cancelAt: cancelAt}
+		out, conflict, err := MergeTextHunks(canceled, base, left, right, budget)
+		stop()
+		if !errors.Is(err, context.Canceled) || out != nil || conflict != nil {
+			t.Fatalf("checkpoint %d: output len=%d conflict=%v err=%v", cancelAt, len(out), conflict, err)
+		}
+	}
+}
+
+func TestTextHunkMaximumBudgetAccepted(t *testing.T) {
+	out, conflict, err := MergeTextHunks(context.Background(), nil, nil, nil, TextMergeBudget{64 << 20, 1000000})
+	if err != nil || conflict != nil || out == nil || len(out) != 0 {
+		t.Fatalf("maximum budget rejected: output=%v conflict=%v err=%v", out, conflict, err)
+	}
+}
