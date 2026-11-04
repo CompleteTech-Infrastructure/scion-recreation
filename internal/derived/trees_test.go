@@ -1195,6 +1195,76 @@ func TestReadTreeEntriesDiscardsLeafBeforeMissingReferent(t *testing.T) {
 	if err != ErrTreePageMissing || rows != nil || used.Visits != 3 || used.Terminals != 1 { t.Fatalf("late missing referent leaked rows: %+v %v", used, err) }
 }
 
+func TestLookupTreeLeafLiteralPaths(t *testing.T) {
+	b, err := os.ReadFile("../../tests/fixtures/tree_pages_v1.json"); if err != nil { t.Fatal(err) }
+	var f struct {
+		Pages []treeLiteral `json:"pages"`
+		Positive []struct {
+			Name string `json:"name"`; Root string `json:"root_id_hex"`
+			Entries []struct { Path string `json:"path_hex"`; Mode string `json:"mode"`; Payload string `json:"blob_payload_hex"` } `json:"entries"`
+		} `json:"positive_vectors"`
+	}
+	if err := json.Unmarshal(b, &f); err != nil { t.Fatal(err) }
+	if len(f.Positive) != 15 { t.Fatal("lookup fixture coverage changed") }
+	frames := make(map[TreePageID][]byte)
+	for _, p := range f.Pages {
+		id, err := ParseTreePageID(treeHex(t, p.IDHex)); if err != nil { t.Fatal(err) }
+		frames[id] = treeHex(t, p.FrameHex)
+	}
+	budget := TreeLookupBudget{4096, 4096*MaxTreePageBytes}
+	for _, c := range f.Positive {
+		root, err := ParseTreePageID(treeHex(t, c.Root)); if err != nil { t.Fatal(err) }
+		if len(c.Entries) == 0 {
+			path, _ := model.NewPath([]byte("absent"))
+			if row, used, err := LookupTreeLeaf(context.Background(), root, frames, path, budget); err != ErrTreeLeafAbsent || row != (model.Operation{}) || used.Pages != 1 || used.ReadBytes != 24 { t.Fatal("empty-root lookup") }
+		}
+		for _, e := range c.Entries {
+			path, err := model.NewPath(treeHex(t, e.Path)); if err != nil { t.Fatal(err) }
+			row, used, err := LookupTreeLeaf(context.Background(), root, frames, path, budget)
+			if err != nil || row.Path().Compare(path) != 0 || used.Pages == 0 { t.Fatalf("%s lookup: %v", c.Name, err) }
+			payload := treeHex(t, e.Payload)
+			blob, err := model.HashBlob(context.Background(), uint64(len(payload)), bytes.NewReader(payload)); if err != nil { t.Fatal(err) }
+			var tag model.OperationTag
+			switch e.Mode { case "regular": tag = model.SetRegular; case "executable": tag = model.SetExecutable; case "symlink": tag = model.SetSymlink; default: t.Fatal("unknown mode") }
+			got, ok := row.Target()
+			if !ok || got != blob || row.Tag() != tag { t.Fatal("lookup mode/target mismatch") }
+			if again, exact, err := LookupTreeLeaf(context.Background(), root, frames, path, TreeLookupBudget{used.Pages, used.ReadBytes}); err != nil || again != row || exact != used { t.Fatal("exact lookup budget rejected") }
+			if got, _, err := LookupTreeLeaf(context.Background(), root, frames, path, TreeLookupBudget{used.Pages, used.ReadBytes-1}); err != metadata.ErrResourceExhausted || got != (model.Operation{}) { t.Fatal("lookup byte budget exceeded") }
+		}
+	}
+}
+
+func TestLookupTreeLeafPrivatePathOnlyAndFailures(t *testing.T) {
+	tid, _ := model.NewTypedID(model.BlobKind, [32]byte{1}); blob, _ := model.NewBlobID(tid)
+	leaf, leafID, err := EncodeTreePageAt(UnlinkedTreePage{Label: []byte("x"), Tag: 3, Blob: blob}, nil, []byte("b"))
+	if err != nil { t.Fatal(err) }
+	_, missingID, err := EncodeTreePageAt(UnlinkedTreePage{Label: []byte("y"), Tag: 1, Blob: blob}, nil, []byte("a"))
+	if err != nil { t.Fatal(err) }
+	frame, root, err := EncodeTreePageAt(UnlinkedTreePage{Children: []TreePageChild{{Edge: 'a', ID: missingID}, {Edge: 'b', ID: leafID}}}, nil, nil)
+	if err != nil { t.Fatal(err) }
+	frames := map[TreePageID][]byte{root: frame, leafID: leaf}
+	path, _ := model.NewPath([]byte("bx"))
+	budget := TreeLookupBudget{2, uint64(len(frame)+len(leaf))}
+	row, used, err := LookupTreeLeaf(context.Background(), root, frames, path, budget)
+	// The trusted-base precondition is external: unrelated missing pages are
+	// not fetched, so this success is NOT evidence of complete graph validity.
+	if err != nil || row.Tag() != model.SetSymlink || used.Pages != 2 || used.ReadBytes != budget.ReadBytes { t.Fatal("point lookup traversed unrelated subtree") }
+	if got, _, err := LookupTreeLeaf(context.Background(), root, frames, path, TreeLookupBudget{1, budget.ReadBytes}); err != metadata.ErrResourceExhausted || got != (model.Operation{}) { t.Fatal("lookup page budget exceeded") }
+	missing, _ := model.NewPath([]byte("ay"))
+	if got, _, err := LookupTreeLeaf(context.Background(), root, frames, missing, budget); err != ErrTreePageMissing || got != (model.Operation{}) { t.Fatal("missing page became absent leaf") }
+	for _, name := range []string{"b", "bz", "c", "bx/child"} {
+		p, _ := model.NewPath([]byte(name))
+		if got, _, err := LookupTreeLeaf(context.Background(), root, frames, p, budget); err != ErrTreeLeafAbsent || got != (model.Operation{}) { t.Fatalf("unexpected presence for %s: %v", name, err) }
+	}
+	corrupt := append([]byte(nil), leaf...); corrupt[len(corrupt)-1] ^= 1
+	if got, _, err := LookupTreeLeaf(context.Background(), root, map[TreePageID][]byte{root: frame, leafID: corrupt}, path, budget); err != ErrTreePage || got != (model.Operation{}) { t.Fatal("corrupt lookup admitted") }
+	if got, _, err := LookupTreeLeaf(&treeCancelContext{Context: context.Background()}, root, frames, path, budget); err != context.Canceled || got != (model.Operation{}) { t.Fatal("mid-lookup cancellation lost") }
+	dirPath, _ := model.NewPath([]byte("dir/file"))
+	dirRoot, dirFrames, err := BuildSingleLeafTree(context.Background(), dirPath, 1, blob, TreeBuildBudget{2, 256}); if err != nil { t.Fatal(err) }
+	dir, _ := model.NewPath([]byte("dir"))
+	if got, _, err := LookupTreeLeaf(context.Background(), dirRoot, dirFrames, dir, TreeLookupBudget{2, 256}); err != ErrTreeLeafAbsent || got != (model.Operation{}) { t.Fatal("implicit directory exposed as file") }
+}
+
 type setTestEntry struct {
 	path string
 	tag  byte
