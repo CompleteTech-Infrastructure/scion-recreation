@@ -6,7 +6,9 @@ import (
 	"errors"
 	"testing"
 
+	"canopy.local/canopy/internal/derived"
 	"canopy.local/canopy/internal/model"
+	"canopy.local/canopy/internal/storage/metadata"
 )
 
 func fileFixture(t *testing.T, mode model.OperationTag, content string) FileVersion {
@@ -467,4 +469,45 @@ func TestCanonicalFileBatchEmptyInvalidAndCancellation(t *testing.T) {
 		ctx := &preparationCancelContext{Context:context.Background(),cancelAt:at}
 		if out, conflicts, err := MergeCanonicalFileEntries(ctx, entries, budget); err != context.Canceled || out != nil || conflicts != nil { t.Fatal(at, out, conflicts, err) }
 	}
+}
+
+func TestCanonicalTreeFileMergeDerivesAllSides(t *testing.T) {
+	ctx := context.Background(); repo := [16]byte{8}
+	ids, frames := canonicalMergeInputs(t,[3]string{"a\x00","b\x00","c\x00"})
+	blobs := map[model.BlobID][]byte{ids[0]:frames[0],ids[1]:frames[1],ids[2]:frames[2]}
+	path, _ := model.NewPath([]byte("\xff"))
+	makeSource := func(parents []model.ChangesetID, tag model.OperationTag, blob *model.BlobID) derived.TreeSourceFrame {
+		op, err := model.NewOperation(path,tag,blob); if err != nil { t.Fatal(err) }
+		v, err := model.NewChangeset(model.ChangesetInput{RepoID:repo,Parents:parents,Operations:[]model.Operation{op}}); if err != nil { t.Fatal(err) }
+		id, err := model.HashChangeset(ctx,v); if err != nil { t.Fatal(err) }
+		var frame bytes.Buffer; if err := model.EncodeChangeset(ctx,&frame,v); err != nil { t.Fatal(err) }
+		return derived.TreeSourceFrame{ID:id,Frame:frame.Bytes()}
+	}
+	base := makeSource(nil,model.SetRegular,&ids[0])
+	left := makeSource([]model.ChangesetID{base.ID},model.SetExecutable,&ids[1])
+	right := makeSource([]model.ChangesetID{base.ID},model.SetSymlink,&ids[2])
+	deleted := makeSource([]model.ChangesetID{left.ID,right.ID},model.Delete,nil)
+	sources := []derived.TreeSourceFrame{base,left,right,deleted}
+	graph := derived.TreeObjectGraphBudget{Graph:derived.TreeGraphBudget{Visits:4096,PageBytes:4096*derived.MaxTreePageBytes,ContextBytes:64<<20},BlobBytes:1<<20}
+	step := derived.TreeCheckedWriteBudget{Parent:graph,Candidate:graph,Rewrite:derived.TreeChangesetBudget{Rewrite:derived.TreeRewriteBudget{Pages:4096,ReadBytes:4096*derived.MaxTreePageBytes,WriteBytes:4096*derived.MaxTreePageBytes},Operations:4096,InputBytes:model.MaxChangesetPayload}}
+	budget := TreeFileMergeBudget{Replay:derived.TreeReplayBudget{Sources:4,SourceBytes:1<<20,Pages:4096,PageBytes:4096*derived.MaxTreePageBytes,Step:step},Lookup:[3]derived.TreeLookupBudget{{Pages:4096,ReadBytes:4096*derived.MaxTreePageBytes},{Pages:4096,ReadBytes:4096*derived.MaxTreePageBytes},{Pages:4096,ReadBytes:4096*derived.MaxTreePageBytes}},Payload:6}
+	for _, selected := range [][3]model.ChangesetID{{base.ID,left.ID,right.ID},{base.ID,left.ID,left.ID},{base.ID,base.ID,right.ID},{base.ID,deleted.ID,right.ID},{deleted.ID,deleted.ID,deleted.ID}} {
+		got, conflict, used, err := MergeCanonicalTreeFile(ctx,repo,selected,path,sources,blobs,budget)
+		if err != nil || used.Replay.Sources != 4 { t.Fatal(got,conflict,used,err) }
+		states := map[model.ChangesetID]FileVersion{base.ID:fileFixture(t,model.SetRegular,"a\x00"),left.ID:fileFixture(t,model.SetExecutable,"b\x00"),right.ID:fileFixture(t,model.SetSymlink,"c\x00"),deleted.ID:AbsentFile()}
+		want, wantConflict, err := MergeFileVersions(ctx,states[selected[0]],states[selected[1]],states[selected[2]],6)
+		if err != nil || got != want || (conflict == nil) != (wantConflict == nil) { t.Fatal(got,conflict,want,wantConflict,err) }
+		if conflict != nil && *conflict != *wantConflict { t.Fatal(conflict,wantConflict) }
+	}
+	selected := [3]model.ChangesetID{base.ID,left.ID,right.ID}
+	bad := append([]derived.TreeSourceFrame(nil),sources...); bad[3].Frame = append([]byte(nil),deleted.Frame...); bad[3].Frame[len(deleted.Frame)-1] ^= 1
+	if got, conflict, _, err := MergeCanonicalTreeFile(ctx,repo,selected,path,bad,blobs,budget); err == nil || got.Validate() == nil || conflict != nil { t.Fatal(got,conflict,err) }
+	if got, conflict, _, err := MergeCanonicalTreeFile(ctx,repo,selected,path,sources,nil,budget); err == nil || got.Validate() == nil || conflict != nil { t.Fatal(got,conflict,err) }
+	short := budget; short.Payload--
+	if got, conflict, _, err := MergeCanonicalTreeFile(ctx,repo,selected,path,sources,blobs,short); err != ErrFileBudget || got.Validate() == nil || conflict != nil { t.Fatal(got,conflict,err) }
+	short = budget; short.Lookup[2].ReadBytes = 1
+	if got, conflict, _, err := MergeCanonicalTreeFile(ctx,repo,selected,path,sources,blobs,short); err != metadata.ErrResourceExhausted || got.Validate() == nil || conflict != nil { t.Fatal(got,conflict,err) }
+	if got, conflict, _, err := MergeCanonicalTreeFile(ctx,repo,selected,path,sources[:2],blobs,budget); err != metadata.ErrNotFound || got.Validate() == nil || conflict != nil { t.Fatal(got,conflict,err) }
+	cancelled, cancel := context.WithCancel(ctx); cancel()
+	if got, conflict, _, err := MergeCanonicalTreeFile(cancelled,repo,selected,path,sources,blobs,budget); err != context.Canceled || got.Validate() == nil || conflict != nil { t.Fatal(got,conflict,err) }
 }

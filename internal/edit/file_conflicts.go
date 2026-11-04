@@ -6,7 +6,9 @@ import (
 	"errors"
 	"strings"
 
+	"canopy.local/canopy/internal/derived"
 	"canopy.local/canopy/internal/model"
+	"canopy.local/canopy/internal/storage/metadata"
 )
 
 var (
@@ -460,4 +462,69 @@ func MergeCanonicalFileEntries(ctx context.Context, entries []CanonicalFileMerge
 		verified = append(verified, FileMergeEntry{entry.Path, versions[0], versions[1], versions[2]})
 	}
 	return MergeFileEntries(ctx, verified, budget)
+}
+
+// TreeFileMergeBudget bounds private replay, each of three exact-path lookups,
+// and combined decoded merge content separately. Work includes all phases;
+// Payload is 0..64 MiB and excludes canonical headers, as for file merging.
+type TreeFileMergeBudget struct {
+	Replay derived.TreeReplayBudget
+	Lookup [3]derived.TreeLookupBudget
+	Payload uint64
+}
+type TreeFileMergeUsage struct { Replay derived.TreeReplayUsage; Lookup [3]derived.TreeLookupUsage }
+
+// MergeCanonicalTreeFile derives base/left/right file states at one exact path
+// from selected canonical sources in a complete supplied DAG. Every supplied
+// source and required blob must pass replay before lookup or merging, including
+// sources unrelated to the selected revisions. All three selected IDs must be
+// present; even identical sides undergo lookup and canonical blob verification.
+// Base is explicitly caller-selected: no ancestry/base-selection policy is
+// inferred. Opaque whole-file equality resolves only identical/unchanged states.
+//
+// This is private single-file computation, NOT whole-tree merge: a directory at
+// path is file-absence, and file/directory interactions require separate handling.
+// Source-byte binding is established in-call; authoritative publication,
+// retention, permission, text merging, renames, resolution and publication are
+// not. Inputs must stay stable. Errors expose neither result nor conflict;
+// private usage may describe work before failure. Returned states are immutable.
+func MergeCanonicalTreeFile(ctx context.Context, repository [16]byte, selected [3]model.ChangesetID, path model.Path, sources []derived.TreeSourceFrame, blobs map[model.BlobID][]byte, budget TreeFileMergeBudget) (FileVersion, *FileConflict, TreeFileMergeUsage, error) {
+	var usage TreeFileMergeUsage
+	bad := func(err error) (FileVersion, *FileConflict, TreeFileMergeUsage, error) { return FileVersion{}, nil, usage, err }
+	if ctx == nil || path.Validate() != nil { return bad(ErrFileState) }
+	if err := ctx.Err(); err != nil { return bad(err) }
+	if budget.Payload > 64<<20 { return bad(ErrFileBudget) }
+	for i, id := range selected {
+		if id.Validate() != nil { return bad(ErrFileState) }
+		b := budget.Lookup[i]
+		if b.Pages == 0 || b.Pages > 4096 || b.ReadBytes == 0 || b.ReadBytes > 4096*derived.MaxTreePageBytes { return bad(metadata.ErrInvalidArgument) }
+	}
+	writes, pages, replayed, err := derived.ReplayCanonicalTreeDAG(ctx, repository, sources, blobs, budget.Replay)
+	usage.Replay = replayed
+	if err != nil { return bad(err) }
+	var sides [3]CanonicalFileSide
+	for i, id := range selected {
+		var found bool
+		for _, write := range writes {
+			if err := ctx.Err(); err != nil { return bad(err) }
+			if write.Result.Identity.Changeset != id { continue }
+			found = true
+			root, err := derived.ParseTreePageID(write.Result.Value.Bytes())
+			if err != nil { return bad(err) }
+			row, used, err := derived.LookupTreeLeaf(ctx, root, pages, path, budget.Lookup[i])
+			usage.Lookup[i] = used
+			if errors.Is(err, derived.ErrTreeLeafAbsent) { break }
+			if err != nil { return bad(err) }
+			blob, ok := row.Target()
+			if !ok { return bad(ErrFileState) }
+			frame, ok := blobs[blob]
+			if !ok { return bad(metadata.ErrFailedPrecondition) }
+			sides[i] = CanonicalFileSide{true,row.Tag(),blob,frame}
+			break
+		}
+		if !found { return bad(metadata.ErrNotFound) }
+	}
+	version, conflict, err := MergeCanonicalFileVersions(ctx, sides, budget.Payload)
+	if err != nil { return bad(err) }
+	return version, conflict, usage, nil
 }
