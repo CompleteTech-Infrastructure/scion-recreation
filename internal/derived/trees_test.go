@@ -1145,3 +1145,94 @@ func TestTreeGraphRestoresSiblingPathsAfterBufferGrowth(t *testing.T) {
 	for i, name := range want { if string(rows[i].Path().Bytes()) != name { t.Fatal("shared path buffer overwrote a sibling or emitted row") } }
 	for id, frame := range before { if !bytes.Equal(frames[id], frame) { t.Fatal("walker mutated input bytes") } }
 }
+
+func treeCanonicalBlob(t *testing.T, payload []byte) (model.BlobID, []byte) {
+	t.Helper()
+	id, err := model.HashBlob(context.Background(), uint64(len(payload)), bytes.NewReader(payload)); if err != nil { t.Fatal(err) }
+	var frame bytes.Buffer
+	if err := model.EncodeBlob(context.Background(), &frame, uint64(len(payload)), bytes.NewReader(payload)); err != nil { t.Fatal(err) }
+	return id, frame.Bytes()
+}
+
+func TestTreeObjectGraphLiteralReferents(t *testing.T) {
+	b, err := os.ReadFile("../../tests/fixtures/tree_pages_v1.json"); if err != nil { t.Fatal(err) }
+	var f struct {
+		Pages []treeLiteral `json:"pages"`
+		Positive []struct { Root string `json:"root_id_hex"`; Entries []struct { Payload string `json:"blob_payload_hex"` } `json:"entries"` } `json:"positive_vectors"`
+	}
+	if err := json.Unmarshal(b, &f); err != nil { t.Fatal(err) }
+	if len(f.Positive) != 15 { t.Fatal("blob referent fixture coverage changed") }
+	pages := make(map[TreePageID][]byte)
+	for _, p := range f.Pages { id, err := ParseTreePageID(treeHex(t, p.IDHex)); if err != nil { t.Fatal(err) }; pages[id] = treeHex(t, p.FrameHex) }
+	blobs := make(map[model.BlobID][]byte)
+	for _, c := range f.Positive { for _, e := range c.Entries { id, frame := treeCanonicalBlob(t, treeHex(t, e.Payload)); blobs[id] = frame } }
+	for _, c := range f.Positive {
+		root, err := ParseTreePageID(treeHex(t, c.Root)); if err != nil { t.Fatal(err) }
+		used, err := CheckTreeObjectGraph(context.Background(), root, pages, blobs, TreeObjectGraphBudget{graphTestBudget(), 1<<20})
+		if err != nil || used.BlobVisits != uint64(len(c.Entries)) { t.Fatalf("literal referent validation: %+v %v", used, err) }
+		var expectedBytes uint64
+		for _, e := range c.Entries { expectedBytes += 22+uint64(len(treeHex(t, e.Payload))) }
+		if used.BlobBytes != expectedBytes { t.Fatal("canonical headers/repeated blobs not charged") }
+	}
+}
+
+func TestTreeObjectGraphRepeatedBlobBudgetsAndIntegrity(t *testing.T) {
+	blob, frame := treeCanonicalBlob(t, []byte{0, 255, '/', 'x'}) // opaque symlink/binary bytes
+	pathA, _ := model.NewPath([]byte("a")); pathB, _ := model.NewPath([]byte("b"))
+	root, pages, err := BuildSingleLeafTree(context.Background(), pathA, 3, blob, TreeBuildBudget{4096, 4096*MaxTreePageBytes}); if err != nil { t.Fatal(err) }
+	next, added, err := SetTreeLeaf(context.Background(), root, pages, pathB, 1, blob, TreeRewriteBudget{4096, 4096*MaxTreePageBytes, 4096*MaxTreePageBytes}); if err != nil { t.Fatal(err) }
+	for id, p := range added { pages[id] = p }; root = next
+	blobs := map[model.BlobID][]byte{blob: frame}
+	budget := TreeObjectGraphBudget{graphTestBudget(), 2*uint64(len(frame))}
+	used, err := CheckTreeObjectGraph(context.Background(), root, pages, blobs, budget)
+	if err != nil || used.BlobVisits != 2 || used.BlobBytes != budget.BlobBytes { t.Fatalf("repeated exact blob admission: %+v %v", used, err) }
+	budget.BlobBytes--
+	if used, err := CheckTreeObjectGraph(context.Background(), root, pages, blobs, budget); err != metadata.ErrResourceExhausted || used.BlobVisits != 2 || used.BlobBytes != uint64(len(frame)) { t.Fatal("blob cache hit bypassed cumulative budget") }
+	budget.BlobBytes = 1<<20
+	otherID, other := treeCanonicalBlob(t, []byte("else")); _ = otherID
+	wrongKind := append([]byte(nil), frame...); wrongKind[13] = byte(model.ChangesetKind)
+	for _, invalid := range [][]byte{nil, frame[:len(frame)-1], append(append([]byte(nil), frame...), 0), wrongKind, other} {
+		if _, err := CheckTreeObjectGraph(context.Background(), root, pages, map[model.BlobID][]byte{blob: invalid}, budget); err == nil { t.Fatal("invalid canonical blob referent admitted") }
+	}
+	if _, err := CheckTreeObjectGraph(context.Background(), root, pages, nil, budget); err != ErrTreeBlobMissing { t.Fatal("missing blob accepted") }
+	ctx, cancel := context.WithCancel(context.Background()); cancel()
+	if used, err := CheckTreeObjectGraph(ctx, root, pages, blobs, budget); err != context.Canceled || used.BlobVisits != 0 { t.Fatal("blob graph work after cancellation") }
+}
+
+func TestTreeObjectGraphLateMissingAndLargeValidBlob(t *testing.T) {
+	good, frame := treeCanonicalBlob(t, nil)
+	missing, _ := treeCanonicalBlob(t, []byte("missing"))
+	pathA, _ := model.NewPath([]byte("a")); pathB, _ := model.NewPath([]byte("b"))
+	root, pages, err := BuildSingleLeafTree(context.Background(), pathA, 1, missing, TreeBuildBudget{4096, 4096*MaxTreePageBytes}); if err != nil { t.Fatal(err) }
+	next, added, err := SetTreeLeaf(context.Background(), root, pages, pathB, 1, good, TreeRewriteBudget{4096, 4096*MaxTreePageBytes, 4096*MaxTreePageBytes}); if err != nil { t.Fatal(err) }
+	for id, p := range added { pages[id] = p }; root = next
+	// LIFO traversal verifies b's exact empty canonical blob, then fails at a.
+	if used, err := CheckTreeObjectGraph(context.Background(), root, pages, map[model.BlobID][]byte{good: frame}, TreeObjectGraphBudget{graphTestBudget(), 22}); err != ErrTreeBlobMissing || used.BlobVisits != 2 || used.BlobBytes != 22 { t.Fatalf("late missing blob: %+v %v", used, err) }
+	large, largeFrame := treeCanonicalBlob(t, bytes.Repeat([]byte{'x'}, 1<<20))
+	largeRoot, largePages, err := BuildSingleLeafTree(context.Background(), pathA, 1, large, TreeBuildBudget{1, 60}); if err != nil { t.Fatal(err) }
+	if used, err := CheckTreeObjectGraph(context.Background(), largeRoot, largePages, map[model.BlobID][]byte{large: largeFrame}, TreeObjectGraphBudget{graphTestBudget(), 1<<20}); err != metadata.ErrResourceExhausted || used.BlobBytes != 0 { t.Fatal("valid large blob exceeded quantum or was treated as success") }
+}
+
+type treeBlobDecodeCancelContext struct { context.Context; calls int }
+func (c *treeBlobDecodeCancelContext) Err() error {
+	c.calls++
+	// One walker check, one callback check, three header-read checks and
+	// four first-payload-chunk checks precede the next payload read.
+	if c.calls >= 10 { return context.Canceled }
+	return nil
+}
+
+func TestTreeObjectGraphExactQuantumAndMidDecodeCancellation(t *testing.T) {
+	blob, frame := treeCanonicalBlob(t, bytes.Repeat([]byte{'x'}, (1<<20)-22))
+	if len(frame) != 1<<20 { t.Fatal("canonical quantum fixture changed") }
+	path, _ := model.NewPath([]byte("a"))
+	root, pages, err := BuildSingleLeafTree(context.Background(), path, 1, blob, TreeBuildBudget{1, 60}); if err != nil { t.Fatal(err) }
+	budget := TreeObjectGraphBudget{graphTestBudget(), 1<<20}
+	blobs := map[model.BlobID][]byte{blob: frame}
+	if used, err := CheckTreeObjectGraph(context.Background(), root, pages, blobs, budget); err != nil || used.BlobBytes != 1<<20 || used.BlobVisits != 1 { t.Fatalf("exact canonical blob quantum: %+v %v", used, err) }
+	ctx := &treeBlobDecodeCancelContext{Context: context.Background()}
+	used, err := CheckTreeObjectGraph(ctx, root, pages, blobs, budget)
+	// Admission charges the entire frame before decoding; the private usage
+	// counter is not evidence that all admitted bytes were read or validated.
+	if err != context.Canceled || ctx.calls != 10 || used.BlobVisits != 1 || used.BlobBytes != 1<<20 || used.Graph.Visits != 1 { t.Fatalf("mid-decode cancellation lost: %+v %v", used, err) }
+}

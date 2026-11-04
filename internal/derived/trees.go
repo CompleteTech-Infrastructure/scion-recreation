@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"io"
 	"sort"
 
 	"canopy.local/canopy/internal/model"
@@ -1092,4 +1093,51 @@ func LookupTreeLeaf(ctx context.Context, root TreePageID, frames map[TreePageID]
 		current = page.Children[i].ID
 		pos++
 	}
+}
+
+var ErrTreeBlobMissing = errors.New("referenced canonical blob frame missing")
+
+// TreeObjectGraphBudget adds the frozen 1 MiB per-quantum blob-byte ceiling to
+// graph admission. BlobBytes charges each complete frame before decoding,
+// including the 22-byte header; failure can mean fewer bytes were actually read.
+// Repeated references are charged again. Supplied map/frame
+// storage and decoder temporaries are not measured process-memory counters.
+type TreeObjectGraphBudget struct {
+	Graph TreeGraphBudget
+	BlobBytes uint64
+}
+type TreeObjectGraphUsage struct {
+	Graph TreeGraphUsage
+	BlobVisits, BlobBytes uint64
+}
+
+// CheckTreeObjectGraph validates all supplied reachable page contexts AND the
+// exact canonical bytes/type/digest of every file blob target. It uses existing
+// graph and canonical-object decoders; blob payloads are streamed to io.Discard,
+// never interpreted as paths or followed as symlinks. Every occurrence is checked
+// and charged, even if a typed blob identity was already visited.
+//
+// This is PRIVATE integrity preflight over supplied bytes, not a storage provider,
+// immutable receipt, durable/retained graph, published source or authorization.
+// Caller maps/bytes must not change during the call. Errors cannot establish
+// completion; partial usage is private diagnostic data only. Valid graphs with
+// large blobs can exhaust this non-resumable attempt and need a separate bounded
+// resumable validator, never a false corruption/absence/completion claim.
+func CheckTreeObjectGraph(ctx context.Context, root TreePageID, pageFrames map[TreePageID][]byte, blobFrames map[model.BlobID][]byte, budget TreeObjectGraphBudget) (TreeObjectGraphUsage, error) {
+	var used TreeObjectGraphUsage
+	if budget.BlobBytes == 0 || budget.BlobBytes > 1<<20 { return used, metadata.ErrInvalidArgument }
+	graph, err := walkTreePageGraph(ctx, root, pageFrames, budget.Graph, func(_ []byte, _ []byte, page UnlinkedTreePage) error {
+		if err := ctx.Err(); err != nil { return err }
+		used.BlobVisits++
+		frame, ok := blobFrames[page.Blob]
+		if !ok { return ErrTreeBlobMissing }
+		if uint64(len(frame)) > budget.BlobBytes-used.BlobBytes { return metadata.ErrResourceExhausted }
+		used.BlobBytes += uint64(len(frame))
+		var payloadLimit uint64
+		if len(frame) >= 22 { payloadLimit = uint64(len(frame)-22) }
+		_, err := model.DecodeBlob(ctx, bytes.NewReader(frame), page.Blob, io.Discard, payloadLimit)
+		return err
+	})
+	used.Graph = graph
+	return used, err
 }
