@@ -1,6 +1,7 @@
 package workspace
 
 import (
+	"context"
 	"errors"
 	"sort"
 	"strings"
@@ -97,4 +98,59 @@ func (s *SparseSelection) MayContain(directory model.Path) bool {
 	prefix := path + "/"
 	i := sort.SearchStrings(s.ordered, prefix)
 	return i < len(s.ordered) && strings.HasPrefix(s.ordered[i], prefix)
+}
+
+var ErrSparseBudget = errors.New("sparse transition budget exhausted")
+
+// SparseTransitionBudget caps admitted snapshot rows, aggregate raw path bytes
+// and emitted selection changes. Bounds are local planning limits, not measured
+// heap usage; temporary path copies and the bounded seen-path table remain.
+type SparseTransitionBudget struct { Entries, PathBytes, Changes uint64 }
+
+// SparseTransition is a PRIVATE same-revision selection intent. Entry is the
+// exact immutable canonical SET row. Selected=true enters the new selection;
+// false leaves it. Neither value authorizes a fetch, overwrite or deletion.
+type SparseTransition struct { Entry model.Operation; Selected bool }
+
+// PlanSparseTransition computes changes between two manifest-v1 selections
+// over one complete, already-authorized canonical file snapshot. Rows must be
+// strictly raw-path sorted, unique and prefix-free. It validates every supplied
+// row, even if both selections exclude it, and emits only membership changes
+// in the same raw-path order. Unchanged selected rows produce no action.
+//
+// This does not traverse a tree, infer current local content, compare revisions,
+// apply permissions or touch files/manifest state. Callers must separately
+// establish snapshot completeness/source binding, current visibility and dirty
+// file reconciliation before any materialization or removal. Missing supplied
+// rows cannot prove that local files are absent. No include/exclude syntax or
+// glob rules beyond existing literal-prefix manifest v1 semantics are invented.
+// Errors/cancellation return nil, never a partial plan. Inputs must stay stable.
+func PlanSparseTransition(ctx context.Context, rows []model.Operation, previous, next *SparseSelection, budget SparseTransitionBudget) ([]SparseTransition, error) {
+	if ctx == nil || previous == nil || next == nil { return nil, ErrSparseSelection }
+	if err := ctx.Err(); err != nil { return nil, err }
+	if budget.Entries == 0 || budget.Entries > MaxPaths || budget.PathBytes == 0 || budget.PathBytes > MaxManifestBytes || budget.Changes == 0 || budget.Changes > budget.Entries { return nil, ErrSparseBudget }
+	if uint64(len(rows)) > budget.Entries { return nil, ErrSparseBudget }
+	seen := make(map[string]struct{}, len(rows))
+	var pathBytes uint64
+	var plan []SparseTransition
+	for i, row := range rows {
+		if err := ctx.Err(); err != nil { return nil, err }
+		id, present := row.Target()
+		if row.Path().Validate() != nil || !present || id.Validate() != nil || (i > 0 && rows[i-1].Path().Compare(row.Path()) >= 0) { return nil, ErrSparseSelection }
+		raw := string(row.Path().Bytes())
+		if uint64(len(raw)) > budget.PathBytes-pathBytes { return nil, ErrSparseBudget }
+		pathBytes += uint64(len(raw))
+		// Earlier lexicographic siblings can intervene between a file and
+		// its descendant (a, a-, a/b); adjacent-only checks are insufficient.
+		for j := 0; j < len(raw); j++ {
+			if raw[j] == '/' { if _, fileAncestor := seen[raw[:j]]; fileAncestor { return nil, ErrSparseSelection } }
+		}
+		seen[raw] = struct{}{}
+		was, selected := previous.selects(raw), next.selects(raw)
+		if was == selected { continue }
+		if uint64(len(plan)) == budget.Changes { return nil, ErrSparseBudget }
+		plan = append(plan, SparseTransition{Entry: row, Selected: selected})
+	}
+	if err := ctx.Err(); err != nil { return nil, err }
+	return plan, nil
 }
