@@ -146,6 +146,68 @@ func TestCanonicalSparseTransitionBindsComputedSnapshot(t *testing.T) {
 	budget := CanonicalSparseBudget{Replay: derived.TreeReplayBudget{Sources: 4, SourceBytes: sourceBytes, Pages: 4096, PageBytes: 4096*derived.MaxTreePageBytes, Step: step}, Snapshot: derived.TreeEntriesBudget{Graph: graph, Entries: 3, PathBytes: 20}, Transition: SparseTransitionBudget{3, 10, 2}}
 	plan, used, err := PlanCanonicalSparseTransition(ctx, repo, merge.ID, sources, blobs, old, next, budget)
 	if err != nil || len(plan) != 2 || plan[0] != (SparseTransition{oldRow, false}) || plan[1] != (SparseTransition{newRow, true}) || used.Replay.Sources != 4 || used.Snapshot.Visits == 0 { t.Fatalf("computed sparse intents: %+v %+v %v", plan, used, err) }
+	current := Manifest{Base: merge.ID, SparseVersion: 1, Sparse: []model.Path{testPath(t, []byte("a"))}, State: Clean}
+	requested := []model.Path{testPath(t, []byte("z"))}
+	manifestBytes, err := encode(current); if err != nil { t.Fatal(err) }
+	bound, boundUsage, err := PlanManifestSparseTransition(ctx, repo, current, 1, false, requested, sources, blobs, budget)
+	if err != nil || len(bound) != len(plan) || boundUsage != used { t.Fatal("manifest binding changed canonical planner result") }
+	for i := range plan { if bound[i] != plan[i] { t.Fatal("manifest selection lost exact intent") } }
+	for _, state := range []DirtyState{Dirty, Uncertain} {
+		pending := current; pending.State = state; pending.DirtyPaths = []model.Path{testPath(t, []byte("a/b"))}
+		if out, usage, err := PlanManifestSparseTransition(ctx, repo, pending, 1, false, requested, nil, nil, budget); err != ErrRecoveryRequired || out != nil || usage != (CanonicalSparseUsage{}) { t.Fatal("pending local state reached replay or emitted removals") }
+	}
+	corruptManifest := current; corruptManifest.DirtyPaths = []model.Path{testPath(t, []byte("a/b"))}
+	if out, usage, err := PlanManifestSparseTransition(ctx, repo, corruptManifest, 1, false, requested, nil, nil, budget); err != ErrCorrupt || out != nil || usage != (CanonicalSparseUsage{}) { t.Fatal("invalid clean manifest reached replay") }
+	for _, invalid := range []struct {
+		name string
+		version uint16
+		all bool
+		prefixes []model.Path
+	}{
+		{"unknown-version", 2, false, requested},
+		{"all-with-prefix", 1, true, requested},
+		{"invalid-prefix", 1, false, []model.Path{{}}},
+	} {
+		if out, usage, err := PlanManifestSparseTransition(ctx, repo, current, invalid.version, invalid.all, invalid.prefixes, sources, blobs, budget); err != ErrSparseSelection || out != nil || usage != (CanonicalSparseUsage{}) {
+			t.Fatalf("%s requested syntax reached replay: plan=%+v usage=%+v err=%v", invalid.name, out, usage, err)
+		}
+	}
+	for _, tc := range []struct {
+		name string
+		currentAll, requestedAll bool
+		want []SparseTransition
+	}{
+		{"requested-all", false, true, []SparseTransition{{literal, true}, {newRow, true}}},
+		{"current-all", true, false, []SparseTransition{{literal, false}, {oldRow, false}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			manifest := current
+			manifest.SparseAll = tc.currentAll
+			if tc.currentAll { manifest.Sparse = nil }
+			prefixes := requested
+			if tc.requestedAll { prefixes = nil }
+			before, err := CompileSparseSelection(manifest.SparseVersion, manifest.SparseAll, manifest.Sparse)
+			if err != nil { t.Fatal(err) }
+			after, err := CompileSparseSelection(1, tc.requestedAll, prefixes)
+			if err != nil { t.Fatal(err) }
+			canonical, canonicalUsage, err := PlanCanonicalSparseTransition(ctx, repo, manifest.Base, sources, blobs, before, after, budget)
+			if err != nil { t.Fatal(err) }
+			bound, boundUsage, err := PlanManifestSparseTransition(ctx, repo, manifest, 1, tc.requestedAll, prefixes, sources, blobs, budget)
+			if err != nil || len(bound) != len(tc.want) || len(canonical) != len(tc.want) || boundUsage != canonicalUsage || boundUsage.Replay.Sources != 4 || boundUsage.Snapshot.Visits == 0 {
+				t.Fatalf("all selection binding differs: plan=%+v canonical=%+v usage=%+v err=%v", bound, canonical, boundUsage, err)
+			}
+			for i, intent := range tc.want {
+				if bound[i] != intent || canonical[i] != intent { t.Fatalf("all selection intent %d: bound=%+v canonical=%+v want=%+v", i, bound[i], canonical[i], intent) }
+			}
+		})
+	}
+	// Base/old selection originate only in current, not a separately supplied
+	// source ID or selector. Moving the manifest base changes the result.
+	priorManifest := current; priorManifest.Base = root.ID
+	if out, _, err := PlanManifestSparseTransition(ctx, repo, priorManifest, 1, false, requested, sources, blobs, budget); err != nil || len(out) != 1 || out[0] != (SparseTransition{oldRow, false}) { t.Fatal("manifest base binding ignored") }
+	afterManifest, err := encode(current)
+	if err != nil || !bytes.Equal(afterManifest, manifestBytes) || requested[0] != testPath(t, []byte("z")) { t.Fatal("planning mutated manifest or requested selection") }
+	if out, _, err := PlanManifestSparseTransition(nil, repo, current, 1, false, requested, sources, blobs, budget); err != ErrSparseSelection || out != nil { t.Fatal("nil manifest planning context accepted") }
 	// Selecting an earlier source uses its own map, never a later descendant.
 	if out, _, err := PlanCanonicalSparseTransition(ctx, repo, root.ID, sources, blobs, old, next, budget); err != nil || len(out) != 1 || out[0] != (SparseTransition{oldRow, false}) { t.Fatal("selected revision changed during planning") }
 	if out, used, err := PlanCanonicalSparseTransition(ctx, repo, merge.ID, sources, blobs, old, old, budget); err != nil || len(out) != 0 || used.Replay.Sources != 4 || used.Snapshot.Visits == 0 { t.Fatal("unchanged selection skipped canonical verification") }
