@@ -2,6 +2,7 @@ package derived
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -11,6 +12,7 @@ import (
 	"testing"
 
 	"canopy.local/canopy/internal/model"
+	"canopy.local/canopy/internal/storage/metadata"
 )
 
 type treeLiteral struct {
@@ -433,4 +435,103 @@ func TestTreePageEncoderRejectsInactiveTargetsAndInvalidShapes(t *testing.T) {
 	if err != nil || hex.EncodeToString(empty) != "43414e4f5059005452454500000101000000050000000000" { t.Fatal("wrong empty encoding") }
 	if _, _, err := EncodeTreePageAt(UnlinkedTreePage{}, []byte("dir"), nil); err != ErrTreePage { t.Fatal("encoded empty nonroot") }
 	if _, _, err := EncodeTreePageAt(UnlinkedTreePage{Tag: 4, Label: []byte("dir"), Directory: emptyID}, nil, nil); err != ErrTreePage { t.Fatal("encoded empty directory referent") }
+}
+
+func graphTestBudget() TreeGraphBudget { return TreeGraphBudget{4096, 4096*MaxTreePageBytes, 64<<20} }
+
+func TestTreeGraphLiteralRootsAndMissing(t *testing.T) {
+	b, err := os.ReadFile("../../tests/fixtures/tree_pages_v1.json")
+	if err != nil { t.Fatal(err) }
+	var f struct {
+		Pages []treeLiteral `json:"pages"`
+		Positive []struct { Name string `json:"name"`; Root string `json:"root_id_hex"` } `json:"positive_vectors"`
+		Negative []struct {
+			Name string `json:"name"`
+			Root string `json:"graph_root_id_hex"`
+			Pages []treeLiteral `json:"graph_pages"`
+		} `json:"negative_vectors"`
+	}
+	if err := json.Unmarshal(b, &f); err != nil { t.Fatal(err) }
+	makeFrames := func(rows []treeLiteral) map[TreePageID][]byte {
+		frames := make(map[TreePageID][]byte)
+		for _, row := range rows {
+			id, err := ParseTreePageID(treeHex(t, row.IDHex))
+			if err != nil { t.Fatal(err) }
+			frames[id] = treeHex(t, row.FrameHex)
+		}
+		return frames
+	}
+	frames := makeFrames(f.Pages)
+	for _, row := range f.Positive {
+		id, err := ParseTreePageID(treeHex(t, row.Root))
+		if err != nil { t.Fatal(err) }
+		used, err := CheckTreePageGraph(context.Background(), id, frames, graphTestBudget())
+		// This valid extreme graph needs 81,867,529 cumulative context-copy
+		// bytes. Our bounded non-resumable attempt must report exhaustion,
+		// not misclassify it as corrupt or claim full graph acceptance.
+		if row.Name == "path-length-65535-components-1024" {
+			if err != metadata.ErrResourceExhausted || used.ContextBytes > graphTestBudget().ContextBytes { t.Fatalf("large valid graph: %+v %v", used, err) }
+			continue
+		}
+		if err != nil || used.Visits == 0 || used.PageBytes == 0 { t.Fatalf("positive graph: %+v %v", used, err) }
+	}
+	for _, row := range f.Negative {
+		if row.Root == "" { continue }
+		id, err := ParseTreePageID(treeHex(t, row.Root))
+		if err != nil { t.Fatal(err) }
+		want := ErrTreePage
+		if row.Name == "missing-directory-referent" { want = ErrTreePageMissing }
+		if _, err := CheckTreePageGraph(context.Background(), id, makeFrames(row.Pages), graphTestBudget()); err != want { t.Fatalf("%s: %v", row.Name, err) }
+	}
+}
+
+type treeCancelContext struct { context.Context; calls int }
+func (c *treeCancelContext) Err() error {
+	c.calls++
+	if c.calls >= 4 { return context.Canceled }
+	return nil
+}
+
+func TestTreeGraphChargesRepeatedContextsAndBounds(t *testing.T) {
+	blob, err := model.NewTypedID(model.BlobKind, [32]byte{1})
+	if err != nil { t.Fatal(err) }
+	bid, err := model.NewBlobID(blob)
+	if err != nil { t.Fatal(err) }
+	leaf, leafID, err := EncodeTreePageAt(UnlinkedTreePage{Label: []byte("x"), Tag: 1, Blob: bid}, nil, []byte("a"))
+	if err != nil { t.Fatal(err) }
+	root, rootID, err := EncodeTreePageAt(UnlinkedTreePage{Children: []TreePageChild{{'a', leafID}, {'b', leafID}}}, nil, nil)
+	if err != nil { t.Fatal(err) }
+	frames := map[TreePageID][]byte{rootID: root, leafID: leaf}
+	used, err := CheckTreePageGraph(context.Background(), rootID, frames, graphTestBudget())
+	if err != nil || used.Visits != 3 || used.Terminals != 2 || used.PageBytes != uint64(len(root)+2*len(leaf)) { t.Fatalf("shared contexts: %+v %v", used, err) }
+	exact := TreeGraphBudget{used.Visits, used.PageBytes, used.ContextBytes}
+	if _, err := CheckTreePageGraph(context.Background(), rootID, frames, exact); err != nil { t.Fatal(err) }
+	for dimension := 0; dimension < 3; dimension++ {
+		budget := exact
+		switch dimension { case 0: budget.Visits--; case 1: budget.PageBytes--; case 2: budget.ContextBytes-- }
+		if _, err := CheckTreePageGraph(context.Background(), rootID, frames, budget); err != metadata.ErrResourceExhausted { t.Fatalf("dimension %d: %v", dimension, err) }
+	}
+	if _, err := CheckTreePageGraph(context.Background(), rootID, frames, TreeGraphBudget{}); err != metadata.ErrInvalidArgument { t.Fatal("accepted zero budget") }
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if used, err := CheckTreePageGraph(cancelled, rootID, frames, exact); err != context.Canceled || used.Visits != 0 { t.Fatal("work after cancellation") }
+	if _, err := CheckTreePageGraph(&treeCancelContext{Context: context.Background()}, rootID, frames, exact); err != context.Canceled { t.Fatal("mid-traversal cancellation lost") }
+	delete(frames, leafID)
+	if _, err := CheckTreePageGraph(context.Background(), rootID, frames, graphTestBudget()); err != ErrTreePageMissing { t.Fatal("missing shared page accepted") }
+}
+
+func TestTreeGraphDoesNotDeduplicateDifferentContexts(t *testing.T) {
+	tid, _ := model.NewTypedID(model.BlobKind, [32]byte{1})
+	bid, _ := model.NewBlobID(tid)
+	// The same frame means a legal z. file in one context and the forbidden
+	// dot component a/. in another. The valid context is visited first.
+	leaf, leafID, err := EncodeTreePageAt(UnlinkedTreePage{Label: []byte("."), Tag: 1, Blob: bid}, nil, []byte("z"))
+	if err != nil { t.Fatal(err) }
+	dir, dirID, err := EncodeTreePageAt(UnlinkedTreePage{Tag: 4, Directory: leafID}, nil, []byte("a"))
+	if err != nil { t.Fatal(err) }
+	root, rootID, err := EncodeTreePageAt(UnlinkedTreePage{Children: []TreePageChild{{'a', dirID}, {'z', leafID}}}, nil, nil)
+	if err != nil { t.Fatal(err) }
+	frames := map[TreePageID][]byte{rootID: root, dirID: dir, leafID: leaf}
+	used, err := CheckTreePageGraph(context.Background(), rootID, frames, graphTestBudget())
+	if err != ErrTreePage || used.Visits != 4 { t.Fatalf("second context bypassed: %+v %v", used, err) }
 }

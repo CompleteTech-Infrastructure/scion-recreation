@@ -2,12 +2,14 @@ package derived
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
 
 	"canopy.local/canopy/internal/model"
+	"canopy.local/canopy/internal/storage/metadata"
 )
 
 const (
@@ -157,7 +159,7 @@ func DecodeTreePageAt(frame []byte, expected TreePageID, directoryPrefix, compon
 	}
 	dirBytes, depth := 0, 0
 	if len(directoryPrefix) != 0 {
-		if _, err := model.NewPath(directoryPrefix); err != nil { return bad() }
+		if err := model.ValidatePath(directoryPrefix); err != nil { return bad() }
 		dirBytes = len(directoryPrefix) + 1
 		depth = 1 + bytes.Count(directoryPrefix, []byte{'/'})
 	}
@@ -250,4 +252,87 @@ func EncodeTreePageAt(page UnlinkedTreePage, directoryPrefix, componentPrefix []
 	copy(id.raw[7:], digest[:])
 	if _, err := DecodeTreePageAt(frame, id, directoryPrefix, componentPrefix); err != nil { return bad() }
 	return frame, id, nil
+}
+
+var ErrTreePageMissing = errors.New("incomplete derived page graph")
+
+// TreeGraphBudget bounds one non-resumable private validation attempt, not a
+// whole repository. Visits/PageBytes cannot exceed the contract's work quantum.
+// ContextBytes bounds cumulative walker-owned path copies, not decoder
+// temporaries, input map storage, allocator overhead or total process RSS.
+// The implementation additionally caps this copy counter at 64 MiB.
+// A valid graph exceeding a bound returns resource exhaustion, never corruption.
+type TreeGraphBudget struct { Visits, PageBytes, ContextBytes uint64 }
+
+type TreeGraphUsage struct { Visits, Terminals, PageBytes, ContextBytes uint64 }
+
+// CheckTreePageGraph checks ONLY the page topology reachable from root in an
+// explicitly supplied private frame map. It is not a storage provider or a
+// durable completion receipt: file blobs are NOT fetched/validated/retained,
+// and publication/authentication/authorization are NOT established. Unreachable
+// map entries are ignored. The map and its frames must not change concurrently.
+// Every shared-page context is checked and charged separately. No partial root
+// or success is returned on exhaustion, cancellation, missing or invalid input.
+// Larger graphs need an external resumable validator; retrying this attempt
+// from scratch is not a checkpoint or a route around a whole-job work budget.
+func CheckTreePageGraph(ctx context.Context, root TreePageID, frames map[TreePageID][]byte, budget TreeGraphBudget) (TreeGraphUsage, error) {
+	var used TreeGraphUsage
+	if ctx == nil || root.Validate() != nil || budget.Visits == 0 || budget.Visits > 4096 ||
+		budget.PageBytes == 0 || budget.PageBytes > 4096*MaxTreePageBytes || budget.ContextBytes == 0 || budget.ContextBytes > 64<<20 {
+		return used, metadata.ErrInvalidArgument
+	}
+	type work struct { id TreePageID; directory, component []byte; exit bool }
+	stack := []work{{id: root}}
+	active := make(map[TreePageID]bool)
+	chargeContext := func(n int) bool {
+		if uint64(n) > budget.ContextBytes-used.ContextBytes { return false }
+		used.ContextBytes += uint64(n)
+		return true
+	}
+	for len(stack) != 0 {
+		if err := ctx.Err(); err != nil { return used, err }
+		w := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if w.exit { delete(active, w.id); continue }
+		if used.Visits == budget.Visits { return used, metadata.ErrResourceExhausted }
+		used.Visits++
+		if active[w.id] { return used, ErrTreePage }
+		frame, ok := frames[w.id]
+		if !ok { return used, ErrTreePageMissing }
+		if len(frame) > MaxTreePageBytes { return used, ErrTreePage }
+		if uint64(len(frame)) > budget.PageBytes-used.PageBytes { return used, metadata.ErrResourceExhausted }
+		used.PageBytes += uint64(len(frame))
+		p, err := DecodeTreePageAt(frame, w.id, w.directory, w.component)
+		if err != nil { return used, err }
+		if p.Tag != 0 { used.Terminals++ }
+		active[w.id] = true
+		stack = append(stack, work{id: w.id, exit: true})
+		if !chargeContext(len(w.component)+len(p.Label)) { return used, metadata.ErrResourceExhausted }
+		component := make([]byte, len(w.component)+len(p.Label))
+		copy(component, w.component)
+		copy(component[len(w.component):], p.Label)
+		// Bound queued frames as well as executed work. Context copies are
+		// charged before allocation. PageBytes counts frame bytes processed,
+		// not heap usage; decoder temporaries are outside ContextBytes.
+		for _, child := range p.Children {
+			if err := ctx.Err(); err != nil { return used, err }
+			if len(stack) >= 4096 || !chargeContext(len(component)+1) { return used, metadata.ErrResourceExhausted }
+			prefix := make([]byte, len(component)+1)
+			copy(prefix, component)
+			prefix[len(component)] = child.Edge
+			stack = append(stack, work{id: child.ID, directory: w.directory, component: prefix})
+		}
+		if p.Tag == 4 {
+			n := len(w.directory)+len(component)
+			if len(w.directory) != 0 { n++ }
+			if len(stack) >= 4096 || !chargeContext(n) { return used, metadata.ErrResourceExhausted }
+			directory := make([]byte, 0, n)
+			directory = append(directory, w.directory...)
+			if len(directory) != 0 { directory = append(directory, '/') }
+			directory = append(directory, component...)
+			stack = append(stack, work{id: p.Directory, directory: directory})
+		}
+	}
+	if err := ctx.Err(); err != nil { return used, err }
+	return used, nil
 }
