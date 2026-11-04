@@ -239,3 +239,138 @@ func TestTreePageContextRejectsMalformedPrefixes(t *testing.T) {
 		if _, err := DecodeTreePageAt(frame, id, tc.directory, tc.component); err != ErrTreePage { t.Fatal("accepted invalid context") }
 	}
 }
+
+type treeContextTestFrame struct {
+	frame []byte
+	id    TreePageID
+}
+
+// Encode only the documented frame format. Contextual validity is deliberately
+// left to each case; syntax validity and the complete-frame digest are checked
+// here so a malformed frame cannot mask the contextual condition under test.
+func makeTreeContextTestFrame(t *testing.T, label []byte, tag byte, target []byte, children ...TreePageChild) treeContextTestFrame {
+	t.Helper()
+	payload := binary.BigEndian.AppendUint16(nil, uint16(len(label)))
+	payload = append(payload, label...)
+	payload = append(payload, tag)
+	payload = append(payload, target...)
+	payload = binary.BigEndian.AppendUint16(payload, uint16(len(children)))
+	for _, child := range children {
+		payload = append(payload, child.Edge)
+		encoded, err := child.ID.MarshalBinary()
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload = append(payload, encoded...)
+	}
+	frame := append([]byte("CANOPY\x00TREE\x00\x00\x01\x01"), binary.BigEndian.AppendUint32(nil, uint32(len(payload)))...)
+	frame = append(frame, payload...)
+	digest := sha256.Sum256(frame)
+	rawID := append([]byte("CTP\x00\x00\x01\x01"), digest[:]...)
+	id, err := ParseTreePageID(rawID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeUnlinkedTreePage(frame, id); err != nil {
+		t.Fatalf("context fixture must pass syntax and digest validation: %v", err)
+	}
+	return treeContextTestFrame{frame, id}
+}
+
+func TestTreePageContextIsolatedBoundaries(t *testing.T) {
+	// Reuse an actual corpus Blob TID. The child frame is nonempty and valid at
+	// a directory root; these tests do not claim to perform graph traversal.
+	pages, _, _ := treeFixture(t)
+	var blob []byte
+	for _, row := range pages {
+		id, err := ParseTreePageID(treeHex(t, row.IDHex))
+		if err != nil {
+			t.Fatal(err)
+		}
+		p, err := DecodeUnlinkedTreePage(treeHex(t, row.FrameHex), id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.Tag == 1 {
+			blob, err = p.Blob.TypedID().MarshalBinary()
+			if err != nil {
+				t.Fatal(err)
+			}
+			break
+		}
+	}
+	if blob == nil {
+		t.Fatal("missing regular-file corpus target")
+	}
+	nonempty := makeTreeContextTestFrame(t, []byte("z"), 1, blob)
+	if _, err := DecodeTreePageAt(nonempty.frame, nonempty.id, nil, nil); err != nil {
+		t.Fatalf("nonempty reference control: %v", err)
+	}
+	empty := makeTreeContextTestFrame(t, nil, 0, nil)
+	child := TreePageChild{Edge: 'b', ID: nonempty.id}
+	fullLabel := bytes.Repeat([]byte{'x'}, 255)
+	maximalUnary := makeTreeContextTestFrame(t, fullLabel, 0, nil, child)
+	shortUnary := makeTreeContextTestFrame(t, nil, 0, nil, child)
+	oneByteUnary := makeTreeContextTestFrame(t, []byte("x"), 0, nil, child)
+	emptyContinuation := makeTreeContextTestFrame(t, fullLabel, 0, nil, TreePageChild{Edge: 'b', ID: empty.id})
+	emptyTerminal := makeTreeContextTestFrame(t, nil, 1, blob)
+	branch := makeTreeContextTestFrame(t, nil, 0, nil, child, TreePageChild{Edge: 'c', ID: nonempty.id})
+	directoryID, err := nonempty.id.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := makeTreeContextTestFrame(t, nil, 4, directoryID)
+	namedDirectory := makeTreeContextTestFrame(t, []byte("x"), 4, directoryID)
+	cleanPrefix := bytes.Repeat([]byte{'a'}, 256)
+	slashPrefix := append([]byte(nil), cleanPrefix...)
+	slashPrefix[128] = '/'
+	nulPrefix := append([]byte(nil), cleanPrefix...)
+	nulPrefix[128] = 0
+
+	for _, tc := range []struct {
+		name                 string
+		page                 treeContextTestFrame
+		directory, component []byte
+		reject               bool
+	}{
+		// At offset 254, only one label byte remains before the next anchor.
+		{"short-unary-nonempty-child", shortUnary, nil, bytes.Repeat([]byte{'a'}, 254), true},
+		{"maximal-unary-at-offset-254", oneByteUnary, nil, bytes.Repeat([]byte{'a'}, 254), false},
+		{"empty-continuation-after-maximal-label", emptyContinuation, nil, nil, true},
+		{"nonempty-continuation-after-maximal-label", maximalUnary, nil, nil, false},
+		// All three prefixes have identical length/anchor allowance. Only the
+		// forbidden component byte differs; the label cannot mask rejection.
+		{"clean-prefix-at-offset-256", maximalUnary, nil, cleanPrefix, false},
+		{"slash-prefix-at-offset-256", maximalUnary, nil, slashPrefix, true},
+		{"nul-prefix-at-offset-256", maximalUnary, nil, nulPrefix, true},
+		{"empty-component-terminal", emptyTerminal, nil, nil, true},
+		{"nonempty-component-empty-label-terminal", emptyTerminal, nil, []byte("a"), false},
+		{"empty-repository-root", empty, nil, nil, false},
+		{"empty-nonroot-directory", empty, []byte("a"), nil, true},
+		// A continuation edge itself consumes a byte. The two-child frame
+		// avoids unary compression, so the edge-space guard is decisive.
+		{"component-edge-fits-last-byte", branch, nil, bytes.Repeat([]byte{'a'}, 65534), false},
+		{"component-edge-overflows", branch, nil, bytes.Repeat([]byte{'a'}, 65535), true},
+		{"path-edge-fits-last-byte", branch, []byte("a"), bytes.Repeat([]byte{'a'}, 65532), false},
+		{"path-edge-overflows", branch, []byte("a"), bytes.Repeat([]byte{'a'}, 65533), true},
+		// 1,022 parents leave room for the directory component and one child;
+		// 1,023 parents cannot represent any descendant of that directory.
+		{"directory-depth-leaves-one-child", namedDirectory, []byte(strings.Repeat("a/", 1021) + "a"), nil, false},
+		{"directory-depth-no-child-room", namedDirectory, []byte(strings.Repeat("a/", 1022) + "a"), nil, true},
+		// The parent contributes "a/". A directory also needs "/" and at
+		// least one child byte: total 65,535 fits, total 65,536 does not.
+		{"directory-path-fits-slash-and-child", directory, []byte("a"), bytes.Repeat([]byte{'a'}, 65531), false},
+		{"directory-path-no-child-room", directory, []byte("a"), bytes.Repeat([]byte{'a'}, 65532), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := DecodeTreePageAt(tc.page.frame, tc.page.id, tc.directory, tc.component)
+			if tc.reject {
+				if err != ErrTreePage {
+					t.Fatalf("wanted contextual rejection, got %v", err)
+				}
+			} else if err != nil {
+				t.Fatalf("boundary control rejected: %v", err)
+			}
+		})
+	}
+}
