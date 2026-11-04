@@ -7,7 +7,9 @@ import (
 	"reflect"
 	"testing"
 
+	"canopy.local/canopy/internal/derived"
 	"canopy.local/canopy/internal/model"
+	"canopy.local/canopy/internal/storage/metadata"
 )
 
 func TestDiffTextLiteralHunks(t *testing.T) {
@@ -251,4 +253,60 @@ func TestFileEntryDiffBudgetAdmission(t *testing.T) {
 			t.Fatalf("maximum budget rejected: deltas=%v err=%v", got, err)
 		}
 	})
+}
+
+func privateDiffTree(t *testing.T, rows []model.Operation) (derived.TreePageID, map[derived.TreePageID][]byte) {
+	t.Helper()
+	empty, root, err := derived.EncodeTreePageAt(derived.UnlinkedTreePage{}, nil, nil)
+	if err != nil { t.Fatal(err) }
+	frames := map[derived.TreePageID][]byte{root: empty}
+	for _, row := range rows {
+		blob, _ := row.Target()
+		next, added, err := derived.SetTreeLeaf(context.Background(), root, frames, row.Path(), byte(row.Tag()), blob, derived.TreeRewriteBudget{4096, 4096*derived.MaxTreePageBytes, 4096*derived.MaxTreePageBytes})
+		if err != nil { t.Fatal(err) }
+		for id, frame := range added { frames[id] = frame }; root = next
+	}
+	return root, frames
+}
+
+func privateDiffBudget() PrivateTreeDiffBudget {
+	side := derived.TreeEntriesBudget{Graph: derived.TreeGraphBudget{4096, 4096*derived.MaxTreePageBytes, 64<<20}, Entries: 4096, PathBytes: 64<<20}
+	return PrivateTreeDiffBudget{Side: [2]derived.TreeEntriesBudget{side, side}, Compare: FileDiffBudget{8192, 64<<20, 8192}}
+}
+
+func TestPrivateTreeDiffMatchesFileEntries(t *testing.T) {
+	makeRow := func(path string, tag model.OperationTag, digest byte) model.Operation {
+		p, err := model.NewPath([]byte(path)); if err != nil { t.Fatal(err) }
+		tid, err := model.NewTypedID(model.BlobKind, [32]byte{digest}); if err != nil { t.Fatal(err) }
+		blob, err := model.NewBlobID(tid); if err != nil { t.Fatal(err) }
+		op, err := model.NewOperation(p, tag, &blob); if err != nil { t.Fatal(err) }; return op
+	}
+	before := []model.Operation{makeRow("a.", model.SetRegular, 1), makeRow("a/b", model.SetRegular, 1), makeRow("a0", model.SetSymlink, 2)}
+	after := []model.Operation{makeRow("a/b", model.SetExecutable, 3), makeRow("a0", model.SetSymlink, 2), makeRow("\xff", model.SetRegular, 2)}
+	for _, sides := range [][2][]model.Operation{{nil, nil}, {nil, after}, {before, nil}, {before, after}, {after, before}, {before, before}} {
+		var roots [2]derived.TreePageID; var frames [2]map[derived.TreePageID][]byte
+		for i := range roots { roots[i], frames[i] = privateDiffTree(t, sides[i]) }
+		want, err := DiffFileEntries(context.Background(), sides[0], sides[1], privateDiffBudget().Compare); if err != nil { t.Fatal(err) }
+		got, usage, err := DiffPrivateTrees(context.Background(), roots, frames, privateDiffBudget())
+		if err != nil || len(got) != len(want) || usage[0].Visits == 0 || usage[1].Visits == 0 { t.Fatal(got, usage, err) }
+		for i := range want { if got[i] != want[i] { t.Fatal("tree/entry diff mismatch", got[i], want[i]) } }
+		// Each side must be verified even for equal roots; second map is missing.
+		if roots[0] == roots[1] {
+			frames[1] = nil
+			if got, _, err := DiffPrivateTrees(context.Background(), roots, frames, privateDiffBudget()); err != derived.ErrTreePageMissing || got != nil { t.Fatal(got, err) }
+		}
+	}
+	root, frames := privateDiffTree(t, after)
+	roots, both := [2]derived.TreePageID{root, root}, [2]map[derived.TreePageID][]byte{frames, frames}
+	for side := 0; side < 2; side++ {
+		budget := privateDiffBudget(); budget.Side[side].Entries = 1
+		if got, _, err := DiffPrivateTrees(context.Background(), roots, both, budget); err != metadata.ErrResourceExhausted || got != nil { t.Fatal(side, got, err) }
+	}
+	budget := privateDiffBudget(); budget.Compare.Entries = 1; budget.Compare.Changes = 1
+	if got, usage, err := DiffPrivateTrees(context.Background(), roots, both, budget); err != ErrFileDiffLimit || got != nil || usage[1].Visits == 0 { t.Fatal(got, usage, err) }
+	budget.Compare = FileDiffBudget{}
+	if got, usage, err := DiffPrivateTrees(context.Background(), roots, both, budget); err != ErrFileDiffLimit || got != nil || usage != [2]derived.TreeGraphUsage{} { t.Fatal(got, usage, err) }
+	if got, _, err := DiffPrivateTrees(nil, roots, both, privateDiffBudget()); err != ErrFileDiffInput || got != nil { t.Fatal(got, err) }
+	ctx, cancel := context.WithCancel(context.Background()); cancel()
+	if got, _, err := DiffPrivateTrees(ctx, roots, both, privateDiffBudget()); err != context.Canceled || got != nil { t.Fatal(got, err) }
 }

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 
+	"canopy.local/canopy/internal/derived"
 	"canopy.local/canopy/internal/model"
 )
 
@@ -276,4 +277,39 @@ func DiffCanonicalText(ctx context.Context, oldID, nextID model.BlobID, oldFrame
 	if err != nil { return zero, err }
 	if _, err := model.DecodeBlob(ctx, bytes.NewReader(nextFrame), nextID, &next, budget.InputBytes-used); err != nil { return zero, err }
 	return DiffText(ctx, old.Bytes(), next.Bytes(), budget)
+}
+
+// PrivateTreeDiffBudget gives each side its OWN traversal/output allowance,
+// ordered before then after. Compare separately bounds combined selected rows,
+// combined path bytes and emitted deltas. No allowance is silently reset across
+// sides: total admitted traversal work is bounded by the sum of both Side caps.
+// These are admission limits, not peak-memory or interruptible CPU guarantees.
+type PrivateTreeDiffBudget struct {
+	Side [2]derived.TreeEntriesBudget
+	Compare FileDiffBudget
+}
+
+// DiffPrivateTrees verifies and enumerates two entire supplied private page
+// graphs, then compares their canonical file entries. Both graphs are checked
+// even when root IDs match. Missing/invalid pages and exhaustion are errors,
+// never absence. No partial deltas escape. Usage counters on errors describe
+// attempted private traversal, not public progress or an authorization receipt.
+//
+// This does not validate file blob bytes, establish repository/source binding,
+// publication/retention, authorize output, fetch pages or classify text. Callers
+// must establish provenance and authorize BOTH graphs before any disclosure,
+// including paths, counts and timing. Unreachable map frames are ignored. Maps
+// and frames must not mutate during the call. No resumable cursor is provided.
+func DiffPrivateTrees(ctx context.Context, roots [2]derived.TreePageID, frames [2]map[derived.TreePageID][]byte, budget PrivateTreeDiffBudget) ([]FileDelta, [2]derived.TreeGraphUsage, error) {
+	var usage [2]derived.TreeGraphUsage
+	// Reject invalid comparator/context admission before traversing any graph.
+	if _, err := DiffFileEntries(ctx, nil, nil, budget.Compare); err != nil { return nil, usage, err }
+	var rows [2][]model.Operation
+	for i := range roots {
+		var err error
+		rows[i], usage[i], err = derived.ReadTreeEntries(ctx, roots[i], frames[i], budget.Side[i])
+		if err != nil { return nil, usage, err }
+	}
+	deltas, err := DiffFileEntries(ctx, rows[0], rows[1], budget.Compare)
+	return deltas, usage, err
 }
