@@ -1,6 +1,7 @@
 package edit
 
 import (
+	"bytes"
 	"context"
 	"errors"
 
@@ -162,4 +163,61 @@ func MergeTextFileVersions(ctx context.Context, base, left, right FileVersion, b
 	if err != nil { return FileVersion{}, nil, err }
 	if err := ctx.Err(); err != nil { return FileVersion{}, nil, err }
 	return resolved, nil, nil
+}
+
+// CanonicalFileSide is a private input descriptor, not a trusted file state.
+// Present=false requires zero Mode/ID and nil Frame. Present=true requires a
+// regular/executable/symlink mode, typed blob ID and complete canonical frame.
+// Present-empty has a verified empty blob frame, never an absent descriptor.
+// Mode and presence are NOT authenticated by a blob digest: callers must bind
+// these descriptors to the correct authorized tree/source independently.
+type CanonicalFileSide struct {
+	Present bool
+	Mode model.OperationTag
+	ID model.BlobID
+	Frame []byte
+}
+
+// MergeCanonicalFileVersions verifies every present side before applying the
+// opaque whole-file equality rules of MergeFileVersions. Sides are ordered base,
+// left, right. Matching IDs never skip validation. Binary and symlink payloads
+// remain opaque; concurrent changes yield exact FileConflict states, not text
+// merging or arbitrary winners. This does not authorize, choose a base, fetch
+// blobs, decode envelopes, establish retention or publish anything.
+//
+// maxBytes admits combined decoded payloads, capped at 64 MiB; zero allows only
+// absent/empty content. Canonical headers are excluded. Owned staging and file
+// copies are bounded but this is not a peak-memory ceiling. Frames must not
+// mutate during the call. Any verification error yields zero result/no conflict.
+func MergeCanonicalFileVersions(ctx context.Context, sides [3]CanonicalFileSide, maxBytes uint64) (FileVersion, *FileConflict, error) {
+	if ctx == nil { return FileVersion{}, nil, ErrFileState }
+	if err := ctx.Err(); err != nil { return FileVersion{}, nil, err }
+	if maxBytes > 64<<20 { return FileVersion{}, nil, ErrFileBudget }
+	frameAllowance := maxBytes
+	for _, side := range sides {
+		if !side.Present {
+			if side.Mode != model.Delete || side.ID != (model.BlobID{}) || side.Frame != nil { return FileVersion{}, nil, ErrFileState }
+			continue
+		}
+		if side.Mode < model.SetRegular || side.Mode > model.SetSymlink || side.ID.Validate() != nil { return FileVersion{}, nil, ErrFileState }
+		frameAllowance += 22
+	}
+	for _, side := range sides {
+		if uint64(len(side.Frame)) > frameAllowance { return FileVersion{}, nil, ErrFileBudget }
+		frameAllowance -= uint64(len(side.Frame))
+	}
+	versions := [3]FileVersion{AbsentFile(), AbsentFile(), AbsentFile()}
+	remaining := maxBytes
+	for i, side := range sides {
+		if !side.Present { continue }
+		var content bytes.Buffer
+		n, err := model.DecodeBlob(ctx, bytes.NewReader(side.Frame), side.ID, &content, remaining)
+		if err != nil { return FileVersion{}, nil, err }
+		remaining -= n
+		payload := content.Bytes()
+		if payload == nil { payload = []byte{} }
+		versions[i], err = PresentFile(side.Mode, payload)
+		if err != nil { return FileVersion{}, nil, err }
+	}
+	return MergeFileVersions(ctx, versions[0], versions[1], versions[2], maxBytes)
 }
