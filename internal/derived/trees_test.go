@@ -1534,3 +1534,62 @@ func TestReplayCanonicalTreeDAGVerifiesAllParents(t *testing.T) {
 	cancelled, cancel := context.WithCancel(ctx); cancel()
 	if out, frames, _, err := ReplayCanonicalTreeDAG(cancelled, repo, sources, blobs, budget); err != context.Canceled || out != nil || frames != nil { t.Fatal("DAG replay ignored cancellation") }
 }
+
+func TestUnorderedCanonicalTreeReplayIsDeterministic(t *testing.T) {
+	ctx := context.Background(); repo := [16]byte{6}
+	blob, frame := treeCanonicalBlob(t, nil); blobs := map[model.BlobID][]byte{blob: frame}
+	path, _ := model.NewPath([]byte("a"))
+	regular, _ := model.NewOperation(path, model.SetRegular, &blob); executable, _ := model.NewOperation(path, model.SetExecutable, &blob); remove, _ := model.NewOperation(path, model.Delete, nil)
+	root := treeReplaySource(t, model.ChangesetInput{RepoID: repo, Operations: []model.Operation{regular}})
+	left := treeReplaySource(t, model.ChangesetInput{RepoID: repo, Parents: []model.ChangesetID{root.ID}, Operations: []model.Operation{executable}})
+	right := treeReplaySource(t, model.ChangesetInput{RepoID: repo, Parents: []model.ChangesetID{root.ID}, Operations: []model.Operation{remove}})
+	merge := treeReplaySource(t, model.ChangesetInput{RepoID: repo, Parents: []model.ChangesetID{right.ID, left.ID}})
+	sources := []TreeSourceFrame{root, left, right, merge}
+	sourceBefore := make([]TreeSourceFrame, len(sources))
+	for i, source := range sources { sourceBefore[i] = TreeSourceFrame{source.ID, append([]byte(nil), source.Frame...)} }
+	blobBefore := append([]byte(nil), frame...)
+	var sourceBytes uint64; for _, s := range sources { sourceBytes += uint64(len(s.Frame)) }
+	graph := TreeObjectGraphBudget{graphTestBudget(), 22}
+	step := TreeCheckedWriteBudget{graph, graph, TreeChangesetBudget{TreeRewriteBudget{4096, 4096*MaxTreePageBytes, 4096*MaxTreePageBytes}, 4096, model.MaxChangesetPayload}}
+	budget := TreeReplayBudget{4, sourceBytes, 3, 144, step}
+	want, wantPages, _, err := ReplayCanonicalTreeDAG(ctx, repo, sources, blobs, budget); if err != nil { t.Fatal(err) }
+	byID := make(map[model.ChangesetID]metadata.DerivedWrite); for _, w := range want { byID[w.Result.Identity.Changeset] = w }
+	second, third := left.ID, right.ID
+	ld, rd := left.ID.TypedID().Digest(), right.ID.TypedID().Digest(); if bytes.Compare(rd[:], ld[:]) < 0 { second, third = third, second }
+	order := []model.ChangesetID{root.ID, second, third, merge.ID}
+	// All 24 input permutations must yield the same deterministic order,
+	// source-bound roots and exact page bytes without changing caller order.
+	for a := 0; a < 4; a++ { for b := 0; b < 4; b++ { for c := 0; c < 4; c++ { for d := 0; d < 4; d++ {
+		if a == b || a == c || a == d || b == c || b == d || c == d { continue }
+		input := []TreeSourceFrame{sources[a], sources[b], sources[c], sources[d]}
+		got, pages, used, err := ReplayUnorderedCanonicalTrees(ctx, repo, input, blobs, budget)
+		if err != nil || len(got) != 4 || used.DecodedSources != 4 || used.SourceBytes != sourceBytes || used.Replay != (TreeReplayUsage{4, sourceBytes, 3, 144}) || len(pages) != len(wantPages) { t.Fatalf("unordered replay: %+v %v", used, err) }
+		for i, id := range order { if got[i].Result.Identity.Changeset != id || metadata.CompareDerivedWrite(got[i], byID[id]) != nil { t.Fatal("ordering changed canonical parents/tree mapping") } }
+		for id, frame := range pages { if !bytes.Equal(frame, wantPages[id]) { t.Fatal("ordering changed canonical page bytes") } }
+		for i, index := range []int{a, b, c, d} { if input[i].ID != sourceBefore[index].ID || !bytes.Equal(input[i].Frame, sourceBefore[index].Frame) { t.Fatal("ordering mutated caller input") } }
+		if !bytes.Equal(blobs[blob], blobBefore) { t.Fatal("replay mutated caller blob bytes") }
+	} } } }
+	for _, bad := range [][]TreeSourceFrame{{root, left, merge}, {root, root}, nil} {
+		if out, pages, usage, err := ReplayUnorderedCanonicalTrees(ctx, repo, bad, blobs, budget); err == nil || out != nil || pages != nil || usage.Replay != (TreeReplayUsage{}) { t.Fatal("invalid ordering input reached replay") }
+	}
+	foreign := treeReplaySource(t, model.ChangesetInput{RepoID: [16]byte{7}})
+	if out, pages, used, err := ReplayUnorderedCanonicalTrees(ctx, repo, []TreeSourceFrame{foreign}, blobs, budget); err != metadata.ErrInvalidArgument || out != nil || pages != nil || used.Replay != (TreeReplayUsage{}) { t.Fatal("foreign ordering source reached replay") }
+	short := budget; short.SourceBytes--
+	if out, pages, used, err := ReplayUnorderedCanonicalTrees(ctx, repo, sources, blobs, short); err != metadata.ErrResourceExhausted || out != nil || pages != nil || used.DecodedSources != 0 { t.Fatal("source reservation exceeded before decoding") }
+	short = budget; short.Pages--
+	if out, pages, used, err := ReplayUnorderedCanonicalTrees(ctx, repo, sources, blobs, short); err != metadata.ErrResourceExhausted || out != nil || pages != nil || used.DecodedSources != 4 || used.Replay.Sources == 0 { t.Fatal("later replay failure exposed ordering outputs") }
+	corrupt := append([]TreeSourceFrame(nil), sources...); corrupt[3].Frame = append([]byte(nil), corrupt[3].Frame...); corrupt[3].Frame[len(corrupt[3].Frame)-1] ^= 1
+	if out, pages, used, err := ReplayUnorderedCanonicalTrees(ctx, repo, corrupt, blobs, budget); err == nil || out != nil || pages != nil || used.DecodedSources != 4 || used.Replay != (TreeReplayUsage{}) { t.Fatal("late ordering corruption reached replay") }
+	midDecode := &treePhaseCancelContext{Context: ctx, cancelAt: 8}
+	if out, pages, used, err := ReplayUnorderedCanonicalTrees(midDecode, repo, sources, blobs, budget); err != context.Canceled || out != nil || pages != nil || used.DecodedSources != 1 || used.Replay != (TreeReplayUsage{}) { t.Fatal("ordering decode ignored cancellation") }
+	// Derive the exact boundary from successful runs, then cancel at the
+	// checked replay's first checkpoint after complete ordering verification.
+	probe := &treePhaseCancelContext{Context: ctx}
+	orderedWrites, _, _, err := ReplayUnorderedCanonicalTrees(probe, repo, sources, blobs, budget); if err != nil { t.Fatal(err) }
+	var ordered []TreeSourceFrame
+	for _, w := range orderedWrites { for _, s := range sources { if s.ID == w.Result.Identity.Changeset { ordered = append(ordered, s) } } }
+	replayProbe := &treePhaseCancelContext{Context: ctx}
+	if _, _, _, err := ReplayCanonicalTreeDAG(replayProbe, repo, ordered, blobs, budget); err != nil { t.Fatal(err) }
+	between := &treePhaseCancelContext{Context: ctx, cancelAt: probe.calls-replayProbe.calls}
+	if out, pages, used, err := ReplayUnorderedCanonicalTrees(between, repo, sources, blobs, budget); err != context.Canceled || out != nil || pages != nil || used.DecodedSources != 4 || used.Replay != (TreeReplayUsage{}) { t.Fatal("between-phase cancellation exposed replay output") }
+}
