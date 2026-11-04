@@ -692,3 +692,65 @@ func FuzzGitStreamBounded(f *testing.F) {
 		exerciseBoundedStream(t, b)
 	})
 }
+
+// terminalCancelReader separates delivered bytes from the terminal read, so the
+// cancellation point is deterministic even with bufio read-ahead.
+type terminalCancelReader struct {
+	remaining []byte
+	terminal  error
+	cancel    context.CancelFunc
+	calls     int
+}
+
+func (r *terminalCancelReader) Read(dst []byte) (int, error) {
+	r.calls++
+	if len(r.remaining) != 0 {
+		n := copy(dst, r.remaining)
+		r.remaining = r.remaining[n:]
+		return n, nil
+	}
+	r.cancel()
+	return 0, r.terminal
+}
+
+func TestGitStreamCancellationDuringTerminalRead(t *testing.T) {
+	for _, terminal := range []error{io.EOF, errors.New("private-secret terminal failure")} {
+		for _, prefix := range []string{"", prologue + "blob\ndata 3\nab", prologue + "done\n"} {
+			ctx, cancel := context.WithCancel(context.Background())
+			src := &terminalCancelReader{remaining: []byte(prefix), terminal: terminal, cancel: cancel}
+			p, err := NewGitStream(ctx, src, "sha1", GitStreamHardLimits())
+			if err != nil {
+				cancel()
+				t.Fatal(err)
+			}
+			failed := false
+			for attempt := 0; attempt < 4; attempt++ {
+				record, err := p.Next()
+				if err == nil {
+					continue
+				}
+				if err == io.EOF || !reflect.DeepEqual(record, GitRecord{}) {
+					t.Fatal("canceled read returned successful EOF or partial record")
+				}
+				diagnostic := checkDiagnostic(t, []byte(prefix), p, err)
+				if diagnostic.Code != "cancelled" || !errors.Is(err, context.Canceled) {
+					t.Fatalf("lost cancellation after terminal read: %v", err)
+				}
+				if strings.Contains(err.Error(), "private-secret") {
+					t.Fatal("terminal reader diagnostic leaked")
+				}
+				calls := src.calls
+				_, again := p.Next()
+				if again != err || src.calls != calls {
+					t.Fatal("terminal cancellation was not sticky")
+				}
+				failed = true
+				break
+			}
+			cancel()
+			if !failed {
+				t.Fatal("no terminal cancellation observed")
+			}
+		}
+	}
+}
