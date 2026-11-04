@@ -58,3 +58,63 @@ func TestCanonicalFileReplayPreservesDeclaredDelta(t *testing.T) {
 	cancelled,cancel := context.WithCancel(ctx); cancel()
 	if got, conflict, _, err := PrepareCanonicalFileReplay(cancelled,repo,change.ID,base.ID,base.ID,path,sources,blobs,budget); err != context.Canceled || got.Operation != (model.Operation{}) || got.BlobFrame != nil || conflict != nil { t.Fatal(got,conflict,err) }
 }
+
+func TestCanonicalTextReplayCombinesTargetAndDeclaredDelta(t *testing.T) {
+	ctx := context.Background(); repo := [16]byte{2}; path, _ := model.NewPath([]byte("a"))
+	graph := derived.TreeObjectGraphBudget{Graph:derived.TreeGraphBudget{Visits:4096,PageBytes:4096*derived.MaxTreePageBytes,ContextBytes:64<<20},BlobBytes:1<<20}
+	step := derived.TreeCheckedWriteBudget{Parent:graph,Candidate:graph,Rewrite:derived.TreeChangesetBudget{Rewrite:derived.TreeRewriteBudget{Pages:4096,ReadBytes:4096*derived.MaxTreePageBytes,WriteBytes:4096*derived.MaxTreePageBytes},Operations:4096,InputBytes:model.MaxChangesetPayload}}
+	budget := TreeTextFileMergeBudget{Replay:derived.TreeReplayBudget{Sources:3,SourceBytes:1<<20,Pages:4096,PageBytes:4096*derived.MaxTreePageBytes,Step:step},Lookup:[3]derived.TreeLookupBudget{{Pages:4096,ReadBytes:4096*derived.MaxTreePageBytes},{Pages:4096,ReadBytes:4096*derived.MaxTreePageBytes},{Pages:4096,ReadBytes:4096*derived.MaxTreePageBytes}},Text:ThreeWayTextBudget{12,6,8,2}}
+	for _, tc := range []struct{ content [3]string; want string; conflict bool }{
+		{[3]string{"a\nb\n","A\nb\n","a\nB\n"},"A\nB\n",false},
+		{[3]string{"a\nb\n","A\nb\n","Z\nb\n"},"",true},
+	} {
+		ids, frames := canonicalMergeInputs(t,tc.content)
+		blobs := map[model.BlobID][]byte{}; var selected [3]model.ChangesetID; var sources []derived.TreeSourceFrame
+		for i := range selected {
+			blobs[ids[i]] = frames[i]
+			mode := model.SetRegular; if i == 1 { mode = model.SetExecutable }
+			op, err := model.NewOperation(path,mode,&ids[i]); if err != nil { t.Fatal(err) }
+			change := model.ChangesetInput{RepoID:repo,Operations:[]model.Operation{op}}
+			if i != 0 { change.Parents = []model.ChangesetID{selected[0]} }
+			v, err := model.NewChangeset(change); if err != nil { t.Fatal(err) }
+			selected[i], err = model.HashChangeset(ctx,v); if err != nil { t.Fatal(err) }
+			var frame bytes.Buffer; if err := model.EncodeChangeset(ctx,&frame,v); err != nil { t.Fatal(err) }
+			sources = append(sources,derived.TreeSourceFrame{ID:selected[i],Frame:frame.Bytes()})
+		}
+		got, conflict, used, err := PrepareCanonicalTextFileReplay(ctx,repo,selected[1],selected[0],selected[2],path,sources,blobs,budget)
+		if err != nil || (conflict != nil) != tc.conflict || used.Replay.Sources != 3 { t.Fatal(got,conflict,used,err) }
+		if tc.conflict {
+			if got.Operation != (model.Operation{}) || got.BlobFrame != nil || conflict.Base != fileFixture(t,model.SetRegular,tc.content[0]) || conflict.Left != fileFixture(t,model.SetRegular,tc.content[2]) || conflict.Right != fileFixture(t,model.SetExecutable,tc.content[1]) { t.Fatal(got,conflict) }
+		} else {
+			want, err := PrepareFileOperation(ctx,path,fileFixture(t,model.SetExecutable,tc.want),12)
+			if err != nil || got.Operation != want.Operation || !bytes.Equal(got.BlobFrame,want.BlobFrame) { t.Fatal(got,want,err) }
+		}
+		short := budget; short.Text.Cells--
+		if got, conflict, _, err := PrepareCanonicalTextFileReplay(ctx,repo,selected[1],selected[0],selected[2],path,sources,blobs,short); err != ErrTextLimit || got.Operation != (model.Operation{}) || got.BlobFrame != nil || conflict != nil { t.Fatal(got,conflict,err) }
+		bad := budget; bad.Text.Cells = 0
+		if got, conflict, used, err := PrepareCanonicalTextFileReplay(ctx,repo,selected[1],selected[0],selected[2],path,sources,nil,bad); err != ErrTextLimit || got.Operation != (model.Operation{}) || got.BlobFrame != nil || conflict != nil || used != (TreeFileMergeUsage{}) { t.Fatal(got,conflict,used,err) }
+		corrupt := append([]derived.TreeSourceFrame(nil), sources...)
+		corrupt[1].Frame = append([]byte(nil), sources[1].Frame...)
+		corrupt[1].Frame[len(corrupt[1].Frame)-1] ^= 1
+		for _, check := range []struct {
+			name    string
+			parent  model.ChangesetID
+			sources []derived.TreeSourceFrame
+			budget  TreeTextFileMergeBudget
+			want    error
+		}{
+			{"wrong-actual-parent", selected[2], sources, budget, metadata.ErrFailedPrecondition},
+			{"text-limit-before-parent-membership", selected[2], sources, bad, ErrTextLimit},
+			{"text-limit-before-source-decode", selected[0], corrupt, bad, ErrTextLimit},
+		} {
+			t.Run(check.name, func(t *testing.T) {
+				got, conflict, used, err := PrepareCanonicalTextFileReplay(ctx, repo, selected[1], check.parent, selected[0], path, check.sources, blobs, check.budget)
+				if err != check.want || got.Operation != (model.Operation{}) || got.BlobFrame != nil || conflict != nil || used != (TreeFileMergeUsage{}) {
+					t.Fatalf("wanted %v with no output or usage, got operation=%v blob=%v conflict=%v usage=%+v err=%v", check.want, got.Operation, got.BlobFrame, conflict, used, err)
+				}
+			})
+		}
+		cancelled,cancel := context.WithCancel(ctx); cancel()
+		if got, conflict, _, err := PrepareCanonicalTextFileReplay(cancelled,repo,selected[1],selected[0],selected[2],path,sources,blobs,budget); err != context.Canceled || got.Operation != (model.Operation{}) || got.BlobFrame != nil || conflict != nil { t.Fatal(got,conflict,err) }
+	}
+}
