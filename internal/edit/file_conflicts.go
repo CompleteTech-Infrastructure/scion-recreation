@@ -641,3 +641,90 @@ func ResolveFileEntries(ctx context.Context, entries []FileMergeEntry, resolutio
 	if err := ctx.Err(); err != nil { return nil, err }
 	return out, nil
 }
+
+// TreeFilesMergeBudget admits one complete DAG replay, three independent tree
+// enumerations, then a shared union-path/content merge. Enumeration PathBytes
+// retains its two-copy accounting; Merge.PathBytes charges each union path once.
+// Repeated revisions/content still consume their respective three phase limits.
+type TreeFilesMergeBudget struct {
+	Replay derived.TreeReplayBudget
+	Enumeration [3]derived.TreeEntriesBudget
+	Merge FileMergeBudget
+}
+type TreeFilesMergeUsage struct { Replay derived.TreeReplayUsage; Enumeration [3]derived.TreeGraphUsage }
+
+// MergeCanonicalTreeFiles derives complete file-leaf sets for explicit base,
+// left and right revisions from one verified supplied canonical DAG. It unions
+// raw paths and compares all independent file triples, verifying their canonical
+// blobs under one shared merge budget. Every path conflict is returned together,
+// with no resolved prefix; failures return neither result nor conflict slices.
+// Unchanged and absent winners remain in results; this is not a minimal delta.
+// Empty trees succeed with nil entries; missing source mappings are errors.
+//
+// This is PRIVATE independent-path analysis, NOT a complete valid tree merge.
+// In particular, independent winners can have incompatible file/descendant
+// paths. Full-tree structural validation and explicit conflict resolution must
+// precede any candidate use. Directories are implicit, symlinks remain leaves.
+// Base/ancestry policy, renames, text alignment, authorized disclosure, retention
+// and publication remain outside this helper. No source is fetched or mutated.
+// All supplied sources, including unselected branches, must verify. Inputs must
+// remain stable. Retained enumeration/union/decoded content has explicit phase
+// bounds, not a measured total memory ceiling; no partial resume is provided.
+func MergeCanonicalTreeFiles(ctx context.Context, repository [16]byte, selected [3]model.ChangesetID, sources []derived.TreeSourceFrame, blobs map[model.BlobID][]byte, budget TreeFilesMergeBudget) ([]ResolvedFileEntry, []PathFileConflict, TreeFilesMergeUsage, error) {
+	var usage TreeFilesMergeUsage
+	bad := func(err error) ([]ResolvedFileEntry, []PathFileConflict, TreeFilesMergeUsage, error) { return nil,nil,usage,err }
+	if ctx == nil { return bad(ErrFileState) }
+	if err := ctx.Err(); err != nil { return bad(err) }
+	m := budget.Merge
+	if m.Entries == 0 || m.Entries > 4096 || m.PathBytes == 0 || m.PathBytes > 64<<20 || m.Payload > 64<<20 { return bad(ErrFileBudget) }
+	for i,id := range selected {
+		if id.Validate() != nil { return bad(ErrFileState) }
+		b := budget.Enumeration[i]; g := b.Graph
+		if b.Entries == 0 || b.Entries > 4096 || b.PathBytes == 0 || b.PathBytes > 64<<20 || g.Visits == 0 || g.Visits > 4096 || g.PageBytes == 0 || g.PageBytes > 4096*derived.MaxTreePageBytes || g.ContextBytes == 0 || g.ContextBytes > 64<<20 { return bad(metadata.ErrInvalidArgument) }
+	}
+	writes,pages,replayed,err := derived.ReplayCanonicalTreeDAG(ctx,repository,sources,blobs,budget.Replay)
+	usage.Replay = replayed
+	if err != nil { return bad(err) }
+	var rows [3][]model.Operation
+	for i,id := range selected {
+		found := false
+		for _, write := range writes {
+			if err := ctx.Err(); err != nil { return bad(err) }
+			if write.Result.Identity.Changeset != id { continue }
+			found = true
+			root, err := derived.ParseTreePageID(write.Result.Value.Bytes()); if err != nil { return bad(err) }
+			rows[i],usage.Enumeration[i],err = derived.ReadTreeEntries(ctx,root,pages,budget.Enumeration[i])
+			if err != nil { return bad(err) }; break
+		}
+		if !found { return bad(metadata.ErrNotFound) }
+	}
+	var at [3]int
+	var entries []CanonicalFileMergeEntry
+	var pathBytes uint64
+	for {
+		if err := ctx.Err(); err != nil { return bad(err) }
+		var path model.Path; found := false
+		for i := range rows {
+			if at[i] == len(rows[i]) { continue }
+			p := rows[i][at[i]].Path()
+			if !found || p.Compare(path) < 0 { path,found = p,true }
+		}
+		if !found { break }
+		if uint64(len(entries)) == m.Entries { return bad(ErrFileBudget) }
+		n := uint64(len(path.Bytes()))
+		if n > m.PathBytes-pathBytes { return bad(ErrFileBudget) }; pathBytes += n
+		entry := CanonicalFileMergeEntry{Path:path}
+		for i := range rows {
+			if at[i] == len(rows[i]) || rows[i][at[i]].Path() != path { continue }
+			row := rows[i][at[i]]; at[i]++
+			id, ok := row.Target(); if !ok { return bad(ErrFileState) }
+			frame, ok := blobs[id]; if !ok { return bad(metadata.ErrNotFound) }
+			entry.Sides[i] = CanonicalFileSide{Present:true,Mode:row.Tag(),ID:id,Frame:frame}
+		}
+		entries = append(entries,entry)
+	}
+	resolved,conflicts,err := MergeCanonicalFileEntries(ctx,entries,m)
+	if err != nil { return bad(err) }
+	if err := ctx.Err(); err != nil { return bad(err) }
+	return resolved,conflicts,usage,nil
+}
