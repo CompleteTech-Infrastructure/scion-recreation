@@ -1429,3 +1429,95 @@ func TestAdmissionSessionCloseDuringCopyRejectsLaterWork(t *testing.T) {
 		})
 	}
 }
+
+// Return a one-shot error alongside the byte at failAt. Reads after that point
+// deliberately resume normally, so a discarded error cannot be found by retry.
+type admissionDataErrorReader struct {
+	data   []byte
+	failAt int
+	err    error
+	offset int
+	calls  int
+}
+
+func (r *admissionDataErrorReader) Read(p []byte) (int, error) {
+	r.calls++
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if r.offset == len(r.data) {
+		return 0, io.EOF
+	}
+	n := min(len(p), len(r.data)-r.offset)
+	if r.offset <= r.failAt && r.offset+n > r.failAt {
+		n = r.failAt - r.offset + 1
+	}
+	copy(p, r.data[r.offset:r.offset+n])
+	r.offset += n
+	if r.offset == r.failAt+1 {
+		return n, r.err
+	}
+	return n, nil
+}
+
+func TestAdmissionInputPreservesDataErrors(t *testing.T) {
+	failure := errors.New("source failed with data")
+	for _, terminal := range []error{failure, io.EOF} {
+		src := &admissionDataErrorReader{data: []byte{'x'}, failAt: 0, err: terminal}
+		in := &admissionInput{ctx: context.Background(), src: src, remaining: 1}
+		b, err := in.ReadByte()
+		if terminal == io.EOF {
+			if b != 'x' || err != nil {
+				t.Fatalf("final EOF byte lost: %q %v", b, err)
+			}
+		} else {
+			if !errors.Is(err, failure) {
+				t.Fatalf("byte read lost source error: %v", err)
+			}
+			var next [1]byte
+			if n, err := in.Read(next[:]); n != 0 || !errors.Is(err, failure) || src.calls != 1 {
+				t.Fatalf("source failure not retained: n=%d err=%v calls=%d", n, err, src.calls)
+			}
+		}
+	}
+}
+
+func TestAdmissionGZIPPreservesDataErrors(t *testing.T) {
+	payload := []byte("bounded object")
+	frame := admissionTestFrame(payload)
+	var encoded bytes.Buffer
+	writer := gzip.NewWriter(&encoded)
+	writer.Name = "x" // offset 10 is read through io.ByteReader by gzip.NewReader
+	if _, err := writer.Write(frame); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name   string
+		failAt int
+	}{
+		{"fixed_header", 9},
+		{"name_byte", 10},
+		{"trailer", encoded.Len() - 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := admissionTestNew(t, nil)
+			p := admissionTestAcquire(t, a, admissionTestPrincipal("issuer", tc.name, Human))
+			defer p.Release()
+			failure := errors.New("source failed with compressed data")
+			src := &admissionDataErrorReader{data: encoded.Bytes(), failAt: tc.failAt, err: failure}
+			var out bytes.Buffer
+			_, err := p.CopyObject(context.Background(), &out, src, AdmissionObject{
+				model.BlobKind, uint64(len(payload)), uint64(encoded.Len()), AdmissionGZIP, true,
+			})
+			if !errors.Is(err, failure) {
+				t.Fatalf("gzip hid source error at byte %d: %v", tc.failAt, err)
+			}
+			if out.Len() > len(frame) || src.offset > encoded.Len() {
+				t.Fatal("failed copy exceeded input/output bounds")
+			}
+		})
+	}
+}
