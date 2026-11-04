@@ -667,3 +667,32 @@ func TestValidateOptionalPresence(t *testing.T) {
 		}
 	}
 }
+
+// Cardinality admission precedes element validation: malformed contents must
+// not force a walk beyond a smaller caller budget. No dependency may be called.
+func TestValidateAdmitsCountsBeforeCanonicalWalk(t *testing.T) {
+	for _, name := range []string{"parents", "operations", "alias"} {
+		t.Run(name, func(t *testing.T) {
+			s, in, b := fixture()
+			base := BaseExpectation{Mode: BaseRoot}
+			switch name {
+			case "parents":
+				b.MaxParents = 1
+				in.Parents = []model.ChangesetID{{}, {}}
+				base.Mode = BaseDetached
+			case "operations":
+				b.MaxOperations = 1
+				in.Operations = []model.Operation{{}, {}}
+			case "alias":
+				b.MaxAliasBytes = 1
+				base = BaseExpectation{Mode: BaseAliasAbsent, Alias: "aa"}
+				in.Operations = []model.Operation{{}}
+			}
+			v, err := Validate(context.Background(), s, in, base, b, noCalls(t))
+			assertFailure(t, v, err, metadata.ErrResourceExhausted)
+			if errors.Is(err, metadata.ErrInvalidArgument) {
+				t.Fatal("over-budget input reached canonical validation")
+			}
+		})
+	}
+}
