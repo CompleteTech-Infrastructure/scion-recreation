@@ -489,8 +489,51 @@ type TreeFileMergeUsage struct { Replay derived.TreeReplayUsage; Lookup [3]deriv
 // not. Inputs must stay stable. Errors expose neither result nor conflict;
 // private usage may describe work before failure. Returned states are immutable.
 func MergeCanonicalTreeFile(ctx context.Context, repository [16]byte, selected [3]model.ChangesetID, path model.Path, sources []derived.TreeSourceFrame, blobs map[model.BlobID][]byte, budget TreeFileMergeBudget) (FileVersion, *FileConflict, TreeFileMergeUsage, error) {
+	sides, usage, err := canonicalTreeFileSides(ctx, repository, selected, path, sources, blobs, budget)
+	if err != nil { return FileVersion{}, nil, usage, err }
+	version, conflict, err := MergeCanonicalFileVersions(ctx, sides, budget.Payload)
+	if err != nil { return FileVersion{}, nil, usage, err }
+	return version, conflict, usage, nil
+}
+
+// TreeTextFileMergeBudget replaces opaque payload admission with the existing
+// text byte/line/cell/hunk limits. Replay and three lookups remain independent.
+type TreeTextFileMergeBudget struct {
+	Replay derived.TreeReplayBudget
+	Lookup [3]derived.TreeLookupBudget
+	Text ThreeWayTextBudget
+}
+
+// MergeCanonicalTreeTextFile explicitly selects text processing for the same
+// source-bound exact-file computation as MergeCanonicalTreeFile. All supplied
+// DAG sources are verified before any equality fast path or text analysis.
+// Competing edits enter text analysis only for present regular/executable sides;
+// deletion, addition and symlink/type cases retain exact structured conflicts.
+// Whole-file equality fast paths preserve opaque bytes; NUL rejection in text
+// analysis is a guard, not a classifier. Callers choose text and a valid base.
+//
+// Directory-as-file-absence, private output, stable inputs and all publication,
+// retention/authorization/whole-tree exclusions of MergeCanonicalTreeFile apply.
+// Text limits are validated before replay. Bytes admits combined input payload
+// and bounds output separately; work budgets are not a peak-memory guarantee.
+func MergeCanonicalTreeTextFile(ctx context.Context, repository [16]byte, selected [3]model.ChangesetID, path model.Path, sources []derived.TreeSourceFrame, blobs map[model.BlobID][]byte, budget TreeTextFileMergeBudget) (FileVersion, *FileConflict, TreeFileMergeUsage, error) {
+	var zero TreeFileMergeUsage
+	if ctx == nil { return FileVersion{}, nil, zero, ErrFileState }
+	if err := ctx.Err(); err != nil { return FileVersion{}, nil, zero, err }
+	b := budget.Text
+	if b.Bytes == 0 || b.Bytes > 64<<20 || b.Lines == 0 || b.Lines > 1000000 || b.Cells == 0 || b.Cells > 4000000 || b.Hunks == 0 || b.Hunks > 1000000 { return FileVersion{}, nil, zero, ErrTextLimit }
+	sides, usage, err := canonicalTreeFileSides(ctx, repository, selected, path, sources, blobs, TreeFileMergeBudget{budget.Replay,budget.Lookup,b.Bytes})
+	if err != nil { return FileVersion{}, nil, usage, err }
+	version, conflict, err := MergeCanonicalTextFileVersions(ctx, sides, b)
+	if err != nil { return FileVersion{}, nil, usage, err }
+	return version, conflict, usage, nil
+}
+
+// Side derivation is shared, but content verification/merge remains mandatory
+// in both entry points. Descriptors must never escape as trusted public states.
+func canonicalTreeFileSides(ctx context.Context, repository [16]byte, selected [3]model.ChangesetID, path model.Path, sources []derived.TreeSourceFrame, blobs map[model.BlobID][]byte, budget TreeFileMergeBudget) ([3]CanonicalFileSide, TreeFileMergeUsage, error) {
 	var usage TreeFileMergeUsage
-	bad := func(err error) (FileVersion, *FileConflict, TreeFileMergeUsage, error) { return FileVersion{}, nil, usage, err }
+	bad := func(err error) ([3]CanonicalFileSide, TreeFileMergeUsage, error) { return [3]CanonicalFileSide{}, usage, err }
 	if ctx == nil || path.Validate() != nil { return bad(ErrFileState) }
 	if err := ctx.Err(); err != nil { return bad(err) }
 	if budget.Payload > 64<<20 { return bad(ErrFileBudget) }
@@ -524,7 +567,6 @@ func MergeCanonicalTreeFile(ctx context.Context, repository [16]byte, selected [
 		}
 		if !found { return bad(metadata.ErrNotFound) }
 	}
-	version, conflict, err := MergeCanonicalFileVersions(ctx, sides, budget.Payload)
-	if err != nil { return bad(err) }
-	return version, conflict, usage, nil
+	if err := ctx.Err(); err != nil { return bad(err) }
+	return sides, usage, nil
 }

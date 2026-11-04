@@ -511,3 +511,44 @@ func TestCanonicalTreeFileMergeDerivesAllSides(t *testing.T) {
 	cancelled, cancel := context.WithCancel(ctx); cancel()
 	if got, conflict, _, err := MergeCanonicalTreeFile(cancelled,repo,selected,path,sources,blobs,budget); err != context.Canceled || got.Validate() == nil || conflict != nil { t.Fatal(got,conflict,err) }
 }
+
+func TestCanonicalTreeTextMergeParityAndFailureIsolation(t *testing.T) {
+	ctx := context.Background(); repo := [16]byte{6}; path, _ := model.NewPath([]byte("a"))
+	graph := derived.TreeObjectGraphBudget{Graph:derived.TreeGraphBudget{Visits:4096,PageBytes:4096*derived.MaxTreePageBytes,ContextBytes:64<<20},BlobBytes:1<<20}
+	step := derived.TreeCheckedWriteBudget{Parent:graph,Candidate:graph,Rewrite:derived.TreeChangesetBudget{Rewrite:derived.TreeRewriteBudget{Pages:4096,ReadBytes:4096*derived.MaxTreePageBytes,WriteBytes:4096*derived.MaxTreePageBytes},Operations:4096,InputBytes:model.MaxChangesetPayload}}
+	budget := TreeTextFileMergeBudget{Replay:derived.TreeReplayBudget{Sources:3,SourceBytes:1<<20,Pages:4096,PageBytes:4096*derived.MaxTreePageBytes,Step:step},Lookup:[3]derived.TreeLookupBudget{{Pages:4096,ReadBytes:4096*derived.MaxTreePageBytes},{Pages:4096,ReadBytes:4096*derived.MaxTreePageBytes},{Pages:4096,ReadBytes:4096*derived.MaxTreePageBytes}},Text:ThreeWayTextBudget{100,100,100,100}}
+	for _, tc := range []struct{ content [3]string; tags [3]model.OperationTag }{
+		{[3]string{"a\nb\n","A\nb\n","a\nB\n"},[3]model.OperationTag{model.SetRegular,model.SetExecutable,model.SetRegular}},
+		{[3]string{"a\n","b\n","c\n"},[3]model.OperationTag{model.SetRegular,model.SetRegular,model.SetRegular}},
+		{[3]string{"a","b","c"},[3]model.OperationTag{model.SetRegular,model.Delete,model.SetRegular}},
+		{[3]string{"a","b","c"},[3]model.OperationTag{model.SetSymlink,model.SetSymlink,model.SetSymlink}},
+		{[3]string{"\x00","\x00b","\x00b"},[3]model.OperationTag{model.SetRegular,model.SetRegular,model.SetRegular}},
+		{[3]string{"\x00","\x00b","\x00c"},[3]model.OperationTag{model.SetRegular,model.SetRegular,model.SetRegular}},
+	} {
+		ids, frames := canonicalMergeInputs(t,tc.content)
+		blobs := map[model.BlobID][]byte{}; var sources []derived.TreeSourceFrame; var selected [3]model.ChangesetID; var states [3]FileVersion
+		for i := range selected {
+			blobs[ids[i]] = frames[i]
+			var blob *model.BlobID
+			states[i] = AbsentFile()
+			if tc.tags[i] != model.Delete { blob = &ids[i]; states[i] = fileFixture(t,tc.tags[i],tc.content[i]) }
+			op, err := model.NewOperation(path,tc.tags[i],blob); if err != nil { t.Fatal(err) }
+			change := model.ChangesetInput{RepoID:repo,Operations:[]model.Operation{op}}
+			if i != 0 { change.Parents = []model.ChangesetID{selected[0]} }
+			v, err := model.NewChangeset(change); if err != nil { t.Fatal(err) }
+			selected[i], err = model.HashChangeset(ctx,v); if err != nil { t.Fatal(err) }
+			// Equal left/right revisions need only one canonical DAG entry.
+			if i == 2 && selected[2] == selected[1] { continue }
+			var frame bytes.Buffer; if err := model.EncodeChangeset(ctx,&frame,v); err != nil { t.Fatal(err) }
+			sources = append(sources,derived.TreeSourceFrame{ID:selected[i],Frame:frame.Bytes()})
+		}
+		got, conflict, _, err := MergeCanonicalTreeTextFile(ctx,repo,selected,path,sources,blobs,budget)
+		want, wantConflict, wantErr := MergeTextFileVersions(ctx,states[0],states[1],states[2],budget.Text)
+		if !errors.Is(err,wantErr) || got != want || (conflict == nil) != (wantConflict == nil) { t.Fatal(got,conflict,err,want,wantConflict,wantErr) }
+		if conflict != nil && *conflict != *wantConflict { t.Fatal(conflict,wantConflict) }
+		bad := budget; bad.Text.Cells = 0
+		if got, conflict, used, err := MergeCanonicalTreeTextFile(ctx,repo,selected,path,sources,blobs,bad); err != ErrTextLimit || got.Validate() == nil || conflict != nil || used != (TreeFileMergeUsage{}) { t.Fatal(got,conflict,used,err) }
+		corrupt := append([]derived.TreeSourceFrame(nil),sources...); last := len(corrupt)-1; corrupt[last].Frame = append([]byte(nil),corrupt[last].Frame...); corrupt[last].Frame[len(corrupt[last].Frame)-1] ^= 1
+		if got, conflict, _, err := MergeCanonicalTreeTextFile(ctx,repo,selected,path,corrupt,blobs,budget); err == nil || got.Validate() == nil || conflict != nil { t.Fatal(got,conflict,err) }
+	}
+}
