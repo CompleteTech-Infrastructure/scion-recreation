@@ -3,6 +3,7 @@ package workspace
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -603,7 +604,7 @@ func TestLinuxNativeUnlinkedPinnedEntry(t *testing.T) {
 			return err
 		}
 		_, err = n.register("sub/unlinked", before, int(file.Fd()))
-		if !os.IsNotExist(err) {
+		if !errors.Is(err, errLinuxEntryVanished) {
 			return ErrWatchStale
 		}
 		return nil
@@ -626,4 +627,52 @@ func TestLinuxNativeSweepAlreadyRemoved(t *testing.T) {
 	m, _, err := w.Snapshot()
 	watchOK(t, err)
 	requirePathBytes(t, m.DirtyPaths, []byte("sub/file"))
+}
+
+func TestLinuxNativeRegistrationENOENTFailsClosed(t *testing.T) {
+	w, n, root, meta := linuxFixture(t)
+	var attempts int
+	err := n.call(context.Background(), func() error {
+		n.addWatch = func(int, string, uint32) (int, error) {
+			attempts++
+			return -1, syscall.ENOENT
+		}
+		if err := os.WriteFile(filepath.Join(root, "sub/unwatched"), []byte("new"), 0600); err != nil {
+			return err
+		}
+		return n.step(context.Background(), true)
+	})
+	watchIs(t, err, syscall.ENOENT)
+	watchCheck(t, attempts == 1, "registration attempts = %d, want 1", attempts)
+	var failure error
+	var released bool
+	watchOK(t, n.call(context.Background(), func() error {
+		failure = n.failed
+		released = n.fd == -1 && n.descriptors == 0 && len(n.paths) == 0
+		return nil
+	}))
+	watchIs(t, failure, syscall.ENOENT)
+	watchCheck(t, released, "registration failure retained coverage/resources")
+	watchUnknown(t, w, meta)
+}
+
+func TestLinuxNativeVanishedEntryPreservesCloseFailure(t *testing.T) {
+	_, n, root, _ := linuxFixture(t)
+	var result error
+	watchOK(t, n.call(context.Background(), func() error {
+		file, err := os.Open(filepath.Join(root, "sub/file"))
+		if err != nil {
+			return err
+		}
+		n.descriptors++
+		if err := file.Close(); err != nil {
+			n.descriptors--
+			return err
+		}
+		result = n.closeEntry(file, errLinuxEntryVanished)
+		return nil
+	}))
+	watchIs(t, result, errLinuxEntryVanished)
+	watchIs(t, result, os.ErrClosed)
+	watchCheck(t, result != errLinuxEntryVanished, "close failure became a skippable vanished entry")
 }

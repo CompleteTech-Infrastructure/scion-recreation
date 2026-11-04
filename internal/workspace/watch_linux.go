@@ -30,6 +30,8 @@ const (
 		syscall.IN_DELETE_SELF | syscall.IN_MOVE_SELF | syscall.IN_UNMOUNT
 )
 
+var errLinuxEntryVanished = errors.New("Linux watch entry vanished")
+
 type linuxRegistration struct {
 	path string
 	info os.FileInfo
@@ -57,6 +59,7 @@ type linuxWatch struct {
 	descriptors, peak, registrationCap, pendingCap int
 	readSequence, delivered, watermark             uint64
 	masks                                          uint32
+	addWatch                                       func(int, string, uint32) (int, error)
 }
 
 // OpenNativeWatch uses actual Linux inotify inode notifications. Hints never
@@ -86,7 +89,8 @@ func OpenNativeWatch(root, metadata string, limits WatchLimits) (*Watch, error) 
 
 func newLinuxWatch(root string, limits WatchLimits) (*linuxWatch, error) {
 	n := &linuxWatch{fd: -1, limits: limits, requests: make(chan linuxRequest), done: make(chan struct{}),
-		watches: make(map[int]linuxRegistration), paths: make(map[string]int),
+		addWatch: syscall.InotifyAddWatch,
+		watches:  make(map[int]linuxRegistration), paths: make(map[string]int),
 		registrationCap: min(limits.Entries, linuxWatchRegistrations), pendingCap: min(limits.Queue, linuxWatchPending)}
 	var err error
 	n.name, err = filepath.Abs(root)
@@ -264,7 +268,7 @@ func (n *linuxWatch) register(path string, info os.FileInfo, fd int) (int, error
 	if info.Mode().IsRegular() {
 		stat, ok := info.Sys().(*syscall.Stat_t)
 		if ok && stat.Nlink == 0 {
-			return -1, syscall.ENOENT
+			return -1, errLinuxEntryVanished
 		}
 		if !ok || stat.Nlink != 1 {
 			return -1, ErrWatchStale
@@ -288,7 +292,7 @@ func (n *linuxWatch) register(path string, info os.FileInfo, fd int) (int, error
 	if info.IsDir() {
 		mask |= syscall.IN_ONLYDIR
 	}
-	wd, err := syscall.InotifyAddWatch(n.fd, "/proc/self/fd/"+strconv.Itoa(fd), mask)
+	wd, err := n.addWatch(n.fd, "/proc/self/fd/"+strconv.Itoa(fd), mask)
 	if err != nil {
 		return -1, err
 	}
@@ -301,7 +305,7 @@ func (n *linuxWatch) register(path string, info os.FileInfo, fd int) (int, error
 			return -1, err
 		}
 		if current.Nlink == 0 {
-			return -1, syscall.ENOENT
+			return -1, errLinuxEntryVanished
 		}
 		if current.Mode&syscall.S_IFMT != syscall.S_IFREG || current.Nlink != 1 {
 			return -1, ErrWatchStale
@@ -326,14 +330,24 @@ func (n *linuxWatch) entryInfo(dir *os.File, name string) (os.FileInfo, error) {
 	n.peak = max(n.peak, n.descriptors)
 	file := os.NewFile(uintptr(fd), name)
 	info, err := file.Stat()
-	err = errors.Join(err, file.Close())
-	n.descriptors--
+	err = n.closeEntry(file, err)
 	if err == nil && info.Mode().IsRegular() {
 		if stat, ok := info.Sys().(*syscall.Stat_t); ok && stat.Nlink == 0 {
 			return nil, nil
 		}
 	}
 	return info, err
+}
+
+// Only an exact vanished result may be skipped. In particular, closing the
+// descriptor must not lose its own error when the entry vanished beforehand.
+func (n *linuxWatch) closeEntry(file *os.File, entryErr error) error {
+	closeErr := file.Close()
+	n.descriptors--
+	if closeErr != nil {
+		return errors.Join(entryErr, closeErr)
+	}
+	return entryErr
 }
 
 func (n *linuxWatch) maintain(ctx context.Context) error {
@@ -419,14 +433,13 @@ func (n *linuxWatch) maintain(ctx context.Context) error {
 								// A replacement raced the metadata lookup. Rewalk
 								// without registering an inode under a stale name.
 								n.coverage = true
-								e = syscall.ENOENT
+								e = errLinuxEntryVanished
 							} else {
 								fileWD, e = n.register(child, held, fd)
 							}
 						}
-						e = errors.Join(e, file.Close())
-						n.descriptors--
-						if errors.Is(e, syscall.ENOENT) {
+						e = n.closeEntry(file, e)
+						if e == errLinuxEntryVanished {
 							continue
 						}
 						if e != nil {
