@@ -316,13 +316,6 @@ func TestTreeGraphLiteralRootsAndMissing(t *testing.T) {
 		id, err := ParseTreePageID(treeHex(t, row.Root))
 		if err != nil { t.Fatal(err) }
 		used, err := CheckTreePageGraph(context.Background(), id, frames, graphTestBudget())
-		// This valid extreme graph needs 81,867,529 cumulative context-copy
-		// bytes. Our bounded non-resumable attempt must report exhaustion,
-		// not misclassify it as corrupt or claim full graph acceptance.
-		if row.Name == "path-length-65535-components-1024" {
-			if err != metadata.ErrResourceExhausted || used.ContextBytes > graphTestBudget().ContextBytes { t.Fatalf("large valid graph: %+v %v", used, err) }
-			continue
-		}
 		if err != nil || used.Visits == 0 || used.PageBytes == 0 { t.Fatalf("positive graph: %+v %v", used, err) }
 	}
 	for _, row := range f.Negative {
@@ -490,11 +483,7 @@ func TestBuildSingleLeafMatchesLiteralRoots(t *testing.T) {
 			id, err := ParseTreePageID(treeHex(t, idHex))
 			if err != nil || !bytes.Equal(pages[id], literals[idHex]) { t.Fatalf("%s literal page mismatch", row.Name) }
 		}
-		// Do not claim graph-preflight success for the extreme fixture: that
-		// separate helper's cumulative context-copy cap remains unchanged.
-		if row.Name != "path-length-65535-components-1024" {
-			if _, err := CheckTreePageGraph(context.Background(), root, pages, graphTestBudget()); err != nil { t.Fatal(err) }
-		}
+		if _, err := CheckTreePageGraph(context.Background(), root, pages, graphTestBudget()); err != nil { t.Fatal(err) }
 		for _, limit := range []TreeBuildBudget{{budget.Pages, budget.Bytes-1}, {budget.Pages-1, budget.Bytes}} {
 			want := metadata.ErrResourceExhausted
 			if limit.Pages == 0 { want = metadata.ErrInvalidArgument }
@@ -969,10 +958,6 @@ func TestReadTreeEntriesLiteralMaps(t *testing.T) {
 	for _, c := range f.Positive {
 		root, err := ParseTreePageID(treeHex(t, c.Root)); if err != nil { t.Fatal(err) }
 		rows, _, err := ReadTreeEntries(context.Background(), root, frames, budget)
-		if c.Name == "path-length-65535-components-1024" {
-			if err != metadata.ErrResourceExhausted || rows != nil { t.Fatal("extreme valid graph did not exhaust privately") }
-			continue
-		}
 		if err != nil || len(rows) != len(c.Entries) { t.Fatalf("%s enumeration: %v", c.Name, err) }
 		for i, e := range c.Entries {
 			if !bytes.Equal(rows[i].Path().Bytes(), treeHex(t, e.Path)) { t.Fatalf("%s path/order mismatch", c.Name) }
@@ -1113,4 +1098,50 @@ func TestLookupTreeLeafPrivatePathOnlyAndFailures(t *testing.T) {
 	dirRoot, dirFrames, err := BuildSingleLeafTree(context.Background(), dirPath, 1, blob, TreeBuildBudget{2, 256}); if err != nil { t.Fatal(err) }
 	dir, _ := model.NewPath([]byte("dir"))
 	if got, _, err := LookupTreeLeaf(context.Background(), dirRoot, dirFrames, dir, TreeLookupBudget{2, 256}); err != ErrTreeLeafAbsent || got != (model.Operation{}) { t.Fatal("implicit directory exposed as file") }
+}
+
+func TestTreeGraphExtremeContextBufferBudget(t *testing.T) {
+	b, err := os.ReadFile("../../tests/fixtures/tree_pages_v1.json"); if err != nil { t.Fatal(err) }
+	var f struct {
+		Pages []treeLiteral `json:"pages"`
+		Positive []struct { Name string `json:"name"`; Root string `json:"root_id_hex"` } `json:"positive_vectors"`
+	}
+	if err := json.Unmarshal(b, &f); err != nil { t.Fatal(err) }
+	frames := make(map[TreePageID][]byte)
+	for _, p := range f.Pages {
+		id, err := ParseTreePageID(treeHex(t, p.IDHex)); if err != nil { t.Fatal(err) }
+		frames[id] = treeHex(t, p.FrameHex)
+	}
+	checked := 0
+	for _, c := range f.Positive {
+		if c.Name != "component-length-65535" && c.Name != "path-length-65535-components-1024" { continue }
+		checked++
+		root, err := ParseTreePageID(treeHex(t, c.Root)); if err != nil { t.Fatal(err) }
+		budget := graphTestBudget(); budget.ContextBytes = 194302
+		used, err := CheckTreePageGraph(context.Background(), root, frames, budget)
+		if err != nil || used.ContextBytes != budget.ContextBytes { t.Fatalf("exact growth-copy budget: %+v %v", used, err) }
+		budget.ContextBytes--
+		if rows, used, err := ReadTreeEntries(context.Background(), root, frames, TreeEntriesBudget{budget, 1, 2*model.MaxPathBytes}); err != metadata.ErrResourceExhausted || rows != nil || used.ContextBytes > budget.ContextBytes { t.Fatal("context growth exceeded budget or leaked rows") }
+	}
+	if checked != 2 { t.Fatal("extreme fixture coverage changed") }
+}
+
+func TestTreeGraphRestoresSiblingPathsAfterBufferGrowth(t *testing.T) {
+	tid, _ := model.NewTypedID(model.BlobKind, [32]byte{1}); blob, _ := model.NewBlobID(tid)
+	empty, root, _ := EncodeTreePageAt(UnlinkedTreePage{}, nil, nil)
+	frames := map[TreePageID][]byte{root: empty}
+	prefix := strings.Repeat("a", 260)
+	want := []string{prefix+".x", prefix+"/child/"+strings.Repeat("b", 300), prefix+"0z"}
+	for _, name := range want {
+		path, _ := model.NewPath([]byte(name))
+		next, added, err := SetTreeLeaf(context.Background(), root, frames, path, 1, blob, TreeRewriteBudget{4096, 4096*MaxTreePageBytes, 4096*MaxTreePageBytes})
+		if err != nil { t.Fatal(err) }
+		for id, frame := range added { frames[id] = frame }; root = next
+	}
+	before := make(map[TreePageID][]byte)
+	for id, frame := range frames { before[id] = append([]byte(nil), frame...) }
+	rows, _, err := ReadTreeEntries(context.Background(), root, frames, TreeEntriesBudget{graphTestBudget(), 3, 4096})
+	if err != nil || len(rows) != len(want) { t.Fatalf("restored sibling enumeration: %v", err) }
+	for i, name := range want { if string(rows[i].Path().Bytes()) != name { t.Fatal("shared path buffer overwrote a sibling or emitted row") } }
+	for id, frame := range before { if !bytes.Equal(frames[id], frame) { t.Fatal("walker mutated input bytes") } }
 }
