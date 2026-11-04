@@ -348,3 +348,63 @@ func PrepareFileOperations(ctx context.Context, entries []ResolvedFileEntry, bud
 	if err := ctx.Err(); err != nil { return nil, err }
 	return out, nil
 }
+
+// FileMergeEntry contains one exact path's already established base/left/right
+// states. Source identity, base selection, completeness and permission are caller
+// prerequisites; this descriptor is not a verified tree or authorization proof.
+type FileMergeEntry struct { Path model.Path; Base, Left, Right FileVersion }
+
+// PathFileConflict owns immutable exact sides plus their canonical path.
+// Every path/side remains private until independently authorized for disclosure.
+type PathFileConflict struct { Path model.Path; Sides FileConflict }
+
+// FileMergeBudget admits shared entries, raw path bytes and combined content
+// bytes across ALL three states of ALL entries. Limits are 4096 entries and
+// 64 MiB per byte counter. Entries/PathBytes must be positive; Payload may be zero.
+type FileMergeBudget struct { Entries, PathBytes, Payload uint64 }
+
+// MergeFileEntries applies opaque whole-file equality to strictly raw-byte-
+// sorted unique file triples. It preflights the entire input under one budget.
+// If any path conflicts, it returns ALL path-qualified conflicts and no resolved
+// candidates; callers cannot mistake a resolved prefix for a complete result.
+// With no conflicts it returns one resolved entry per input, including unchanged
+// or absent states. Any error returns neither candidates nor conflicts.
+//
+// This is independent-path merging, not whole-tree merging: file/descendant
+// interactions, renames, multiple-base selection, text alignment, source/blob
+// verification, authorization and publication are separate mandatory concerns.
+// Conflicts do not authorize winner selection. Input states are immutable, but
+// the input slice must not change concurrently. Results own their slices. Bounds
+// count logical bytes, not allocated memory; no resume state is provided.
+func MergeFileEntries(ctx context.Context, entries []FileMergeEntry, budget FileMergeBudget) ([]ResolvedFileEntry, []PathFileConflict, error) {
+	if ctx == nil { return nil, nil, ErrFileState }
+	if err := ctx.Err(); err != nil { return nil, nil, err }
+	if budget.Entries == 0 || budget.Entries > 4096 || budget.PathBytes == 0 || budget.PathBytes > 64<<20 || budget.Payload > 64<<20 { return nil, nil, ErrFileBudget }
+	if uint64(len(entries)) > budget.Entries { return nil, nil, ErrFileBudget }
+	var paths, payload uint64
+	for i, entry := range entries {
+		if err := ctx.Err(); err != nil { return nil, nil, err }
+		if entry.Path.Validate() != nil || (i > 0 && entries[i-1].Path.Compare(entry.Path) >= 0) { return nil, nil, ErrFileState }
+		n := uint64(len(entry.Path.Bytes()))
+		if n > budget.PathBytes-paths { return nil, nil, ErrFileBudget }; paths += n
+		for _, version := range [3]FileVersion{entry.Base, entry.Left, entry.Right} {
+			if version.Validate() != nil { return nil, nil, ErrFileState }
+			n := uint64(len(version.content))
+			if n > budget.Payload-payload { return nil, nil, ErrFileBudget }; payload += n
+		}
+	}
+	var resolved []ResolvedFileEntry
+	var conflicts []PathFileConflict
+	for _, entry := range entries {
+		version, conflict, err := MergeFileVersions(ctx, entry.Base, entry.Left, entry.Right, budget.Payload)
+		if err != nil { return nil, nil, err }
+		if conflict != nil {
+			conflicts = append(conflicts, PathFileConflict{entry.Path, *conflict})
+		} else {
+			resolved = append(resolved, ResolvedFileEntry{entry.Path, version})
+		}
+	}
+	if err := ctx.Err(); err != nil { return nil, nil, err }
+	if len(conflicts) != 0 { return nil, conflicts, nil }
+	return resolved, nil, nil
+}
