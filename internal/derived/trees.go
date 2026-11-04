@@ -1016,3 +1016,70 @@ func ReadTreeEntries(ctx context.Context, root TreePageID, frames map[TreePageID
 	if err := ctx.Err(); err != nil { return nil, used, err }
 	return rows, used, nil
 }
+
+// TreeLookupBudget bounds page-context reads in one exact-path lookup. The
+// canonical input path owns at most 65,535 bytes; its temporary copy and decoder
+// temporaries are not counted as page I/O or measured process memory.
+type TreeLookupBudget struct { Pages, ReadBytes uint64 }
+type TreeLookupUsage struct { Pages, ReadBytes uint64 }
+
+// LookupTreeLeaf follows only the exact raw-byte path from a caller-validated
+// retained graph and returns its immutable SET row. Directory-only paths and
+// absent file leaves return ErrTreeLeafAbsent; missing/corrupt traversed pages
+// are errors, never absence. Symlink bytes are not fetched or followed.
+//
+// The base validity/retention prerequisite is NOT established here. Unrelated
+// subtrees and blob content are not checked. Result, absence, error distinctions
+// and counters are PRIVATE and must not be exposed as unauthorized existence
+// signals. This is not a storage provider, projection or authorization check.
+// Inputs must not change concurrently. Every failure returns a zero row.
+func LookupTreeLeaf(ctx context.Context, root TreePageID, frames map[TreePageID][]byte, path model.Path, budget TreeLookupBudget) (model.Operation, TreeLookupUsage, error) {
+	var used TreeLookupUsage
+	bad := func(err error) (model.Operation, TreeLookupUsage, error) {
+		if ctx != nil { if canceled := ctx.Err(); canceled != nil { err = canceled } }
+		return model.Operation{}, used, err
+	}
+	if ctx == nil || root.Validate() != nil || path.Validate() != nil || budget.Pages == 0 || budget.Pages > 4096 || budget.ReadBytes == 0 || budget.ReadBytes > 4096*MaxTreePageBytes { return bad(metadata.ErrInvalidArgument) }
+	if err := ctx.Err(); err != nil { return bad(err) }
+	raw := path.Bytes()
+	current := root
+	start, pos, end := 0, 0, bytes.IndexByte(raw, '/')
+	if end < 0 { end = len(raw) }
+	for {
+		if err := ctx.Err(); err != nil { return bad(err) }
+		if used.Pages == budget.Pages { return bad(metadata.ErrResourceExhausted) }
+		used.Pages++
+		frame, ok := frames[current]
+		if !ok { return bad(ErrTreePageMissing) }
+		if len(frame) > MaxTreePageBytes { return bad(ErrTreePage) }
+		if uint64(len(frame)) > budget.ReadBytes-used.ReadBytes { return bad(metadata.ErrResourceExhausted) }
+		used.ReadBytes += uint64(len(frame))
+		var directory []byte
+		if start != 0 { directory = raw[:start-1] }
+		page, err := DecodeTreePageAt(frame, current, directory, raw[start:pos])
+		if err != nil { return bad(err) }
+		if !bytes.HasPrefix(raw[pos:end], page.Label) { return bad(ErrTreeLeafAbsent) }
+		pos += len(page.Label)
+		if pos == end {
+			if end == len(raw) {
+				if page.Tag < 1 || page.Tag > 3 { return bad(ErrTreeLeafAbsent) }
+				row, err := model.NewOperation(path, model.OperationTag(page.Tag), &page.Blob)
+				if err != nil { return bad(ErrTreePage) }
+				if err := ctx.Err(); err != nil { return bad(err) }
+				return row, used, nil
+			}
+			if page.Tag != 4 { return bad(ErrTreeLeafAbsent) }
+			current = page.Directory
+			start, pos = end+1, end+1
+			n := bytes.IndexByte(raw[start:], '/')
+			end = len(raw)
+			if n >= 0 { end = start+n }
+			continue
+		}
+		edge := raw[pos]
+		i := sort.Search(len(page.Children), func(i int) bool { return page.Children[i].Edge >= edge })
+		if i == len(page.Children) || page.Children[i].Edge != edge { return bad(ErrTreeLeafAbsent) }
+		current = page.Children[i].ID
+		pos++
+	}
+}
