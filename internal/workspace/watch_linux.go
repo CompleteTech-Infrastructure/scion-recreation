@@ -76,6 +76,11 @@ func OpenNativeWatch(root, metadata string, limits WatchLimits) (*Watch, error) 
 	}
 	n.observe = w.Observe // only after the common owner has successfully opened
 	go n.run()
+	ctx, cancel := context.WithTimeout(context.Background(), limits.Duration)
+	defer cancel()
+	if err = n.Barrier(ctx); err != nil {
+		return nil, errors.Join(err, w.Close())
+	}
 	return w, nil
 }
 

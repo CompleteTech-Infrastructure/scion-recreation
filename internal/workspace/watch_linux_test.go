@@ -23,7 +23,6 @@ func linuxFixture(t *testing.T) (*Watch, *linuxWatch, string, string) {
 	watchOK(t, err)
 	t.Cleanup(func() { _ = w.Close() })
 	n := w.backend.(*linuxWatch)
-	watchOK(t, n.Barrier(context.Background()))
 	// Only this fixture's known, synced baseline supplies the trusted assertion.
 	s := watchScan(t, w)
 	watchOK(t, w.Finish(context.Background(), s, watchProof(w, s)))
@@ -286,11 +285,14 @@ func TestLinuxNativeHardLinkCoverage(t *testing.T) {
 			if kind == "existing-link" {
 				watchOK(t, w.Close())
 				watchOK(t, os.Link(filepath.Join(root, "sub/file"), alias))
-				other, err := OpenNativeWatch(root, meta, n.limits)
+				beforeFDs, err := os.ReadDir("/proc/self/fd")
 				watchOK(t, err)
-				defer other.Close()
-				watchIs(t, other.backend.Barrier(context.Background()), ErrWatchStale)
-				watchUnknown(t, other, meta)
+				other, err := OpenNativeWatch(root, meta, n.limits)
+				watchIs(t, err, ErrWatchStale)
+				watchCheck(t, other == nil, "unarmed owner returned after initialization failure")
+				afterFDs, err := os.ReadDir("/proc/self/fd")
+				watchOK(t, err)
+				watchCheck(t, len(afterFDs) == len(beforeFDs), "initial arming failure leaked FDs")
 				return
 			}
 			_, before, _ := w.Snapshot()
@@ -334,4 +336,34 @@ func TestLinuxNativeHardLinkAdmissionRace(t *testing.T) {
 	watchIs(t, err, ErrWatchStale)
 	watchUnknown(t, w, meta)
 	watchIs(t, n.Barrier(context.Background()), ErrWatchStale)
+}
+
+// Public OpenNativeWatch must establish coverage without a private Barrier or
+// reconciliation call. Snapshot alone must observe subsequent native events.
+func TestLinuxNativeOpenArmsObservation(t *testing.T) {
+	root, meta := t.TempDir(), privateMetadataDir(t)
+	watchFile(t, filepath.Join(root, "file"), "baseline")
+	m := Manifest{Base: testChangeset(t, "Linux open"), SparseVersion: 1, SparseAll: true, State: Clean}
+	watchOK(t, Save(meta, m))
+	limits := WatchLimits{Candidates: 128, CandidateBytes: 4096, Queue: 128, Entries: 256, Bytes: 64 << 10, Depth: 8, Descriptors: 2, Attempts: 32, Duration: 2 * time.Second}
+	w, err := OpenNativeWatch(root, meta, limits)
+	watchOK(t, err)
+	defer w.Close()
+	_, before, _ := w.Snapshot()
+	watchFile(t, filepath.Join(root, "file"), "changed")
+	deadline := time.After(2 * time.Second)
+	tick := time.NewTicker(5 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		m, after, _ := w.Snapshot()
+		if after > before {
+			requirePathBytes(t, m.DirtyPaths, []byte("file"))
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("native observation was not armed at successful open")
+		case <-tick.C:
+		}
+	}
 }
