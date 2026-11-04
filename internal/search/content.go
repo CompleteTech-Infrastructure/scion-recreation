@@ -26,6 +26,7 @@ type ContentSnapshot struct {
 	repository [16]byte
 	source model.ChangesetID
 	entries []ContentEntry
+	fileBytes uint64
 }
 type ContentBudget struct { Files, FrameBytes, FileBytes, TextBytes uint64 }
 type ContentUsage struct { Files, FrameBytes, TextBytes uint64 }
@@ -50,17 +51,68 @@ func (s *contentStage) Write(p []byte) (int, error) {
 // No durable index, freshness/outbox state, publication or authorization is
 // established. Content and classifications must not bypass permission checks.
 func BuildContentSnapshot(ctx context.Context, paths *PathSnapshot, blobs map[model.BlobID][]byte, budget ContentBudget) (*ContentSnapshot, ContentUsage, error) {
-	var used ContentUsage
-	bad := func(err error) (*ContentSnapshot, ContentUsage, error) { return nil, used, err }
+	snapshot, used, err := buildContentSnapshot(ctx, paths, nil, blobs, budget)
+	return snapshot, used.Admission, err
+}
+
+type ContentReuseUsage struct { Admission ContentUsage; Reused uint64 }
+type contentReuseKey struct { blob model.BlobID; symlink bool }
+
+// BuildContentSnapshotReusing avoids decoding already verified immutable blob
+// content from a previous private snapshot in the SAME repository and with the
+// SAME FileBytes policy. Exact blob ID and symlink-vs-file mode select reuse;
+// path, revision and regular/executable mode come from the new canonical paths.
+// Deleted paths are absent because only the new snapshot's rows are visited.
+// Previous revision need not be an ancestor: immutable content identity, not
+// event order, justifies reuse. This does not update either input snapshot.
+//
+// On failed builds, Files counts attempted rows admitted before blob lookup,
+// including a missing-frame row (fresh builds now share this accounting).
+// FrameBytes charges newly decoded references only; Files and TextBytes charge
+// all new rows, including reused data. Reused counts rows, not unique objects.
+// New references are not added to the reuse map during this build. The previous
+// <=4096 rows bound map setup; all text still fits the new aggregate text cap.
+// Missing raw bytes are allowed ONLY for a verified reuse hit. Supplied bytes
+// for a hit are not consulted. The new PathSnapshot must already have passed
+// full canonical replay, so this saves content decoding, not tree verification
+// or network fetches. Nil previous is equivalent to a fresh content build.
+// This remains private computation, not an authorization or retention receipt.
+func BuildContentSnapshotReusing(ctx context.Context, paths *PathSnapshot, previous *ContentSnapshot, blobs map[model.BlobID][]byte, budget ContentBudget) (*ContentSnapshot, ContentReuseUsage, error) {
+	return buildContentSnapshot(ctx, paths, previous, blobs, budget)
+}
+
+func buildContentSnapshot(ctx context.Context, paths *PathSnapshot, previous *ContentSnapshot, blobs map[model.BlobID][]byte, budget ContentBudget) (*ContentSnapshot, ContentReuseUsage, error) {
+	var usage ContentReuseUsage
+	used := &usage.Admission
+	bad := func(err error) (*ContentSnapshot, ContentReuseUsage, error) { return nil, usage, err }
 	if ctx == nil || paths == nil || paths.source.Validate() != nil || budget.Files == 0 || budget.Files > 4096 || budget.FrameBytes == 0 || budget.FrameBytes > 1<<20 || budget.FileBytes > 1<<20 || budget.TextBytes > 1<<20 { return bad(metadata.ErrInvalidArgument) }
+	if previous != nil && (previous.source.Validate() != nil || previous.repository != paths.repository || previous.fileBytes != budget.FileBytes) { return bad(metadata.ErrInvalidArgument) }
 	if err := ctx.Err(); err != nil { return bad(err) }
+	var reusable map[contentReuseKey]ContentEntry
+	if previous != nil {
+		reusable = make(map[contentReuseKey]ContentEntry,len(previous.entries))
+		for _, entry := range previous.entries {
+			if err := ctx.Err(); err != nil { return bad(err) }
+			id, ok := entry.Operation.Target(); if !ok { return bad(metadata.ErrInvalidArgument) }
+			reusable[contentReuseKey{id,entry.Operation.Tag()==model.SetSymlink}] = entry
+		}
+	}
 	var entries []ContentEntry
 	for _, row := range paths.rows {
 		if err := ctx.Err(); err != nil { return bad(err) }
 		id, ok := row.Target(); if !ok { return bad(metadata.ErrInvalidArgument) }
+		if used.Files == budget.Files { return bad(metadata.ErrResourceExhausted) }
+		used.Files++
+		if entry, ok := reusable[contentReuseKey{id,row.Tag()==model.SetSymlink}]; ok {
+			n := uint64(len(entry.Text))
+			if n > budget.TextBytes-used.TextBytes { return bad(metadata.ErrResourceExhausted) }
+			used.TextBytes += n; usage.Reused++
+			entry.Operation = row; entries = append(entries,entry)
+			continue
+		}
 		frame, ok := blobs[id]; if !ok { return bad(metadata.ErrFailedPrecondition) }
-		if used.Files == budget.Files || uint64(len(frame)) > budget.FrameBytes-used.FrameBytes { return bad(metadata.ErrResourceExhausted) }
-		used.Files++; used.FrameBytes += uint64(len(frame))
+		if uint64(len(frame)) > budget.FrameBytes-used.FrameBytes { return bad(metadata.ErrResourceExhausted) }
+		used.FrameBytes += uint64(len(frame))
 		stage := &contentStage{limit: budget.FileBytes}
 		n, err := model.DecodeBlob(ctx, bytes.NewReader(frame), id, stage, budget.FrameBytes)
 		if err != nil { return bad(err) }
@@ -77,7 +129,7 @@ func BuildContentSnapshot(ctx context.Context, paths *PathSnapshot, blobs map[mo
 		entries = append(entries, entry)
 	}
 	if err := ctx.Err(); err != nil { return bad(err) }
-	return &ContentSnapshot{repository: paths.repository, source: paths.source, entries: entries}, used, nil
+	return &ContentSnapshot{repository: paths.repository, source: paths.source, entries: entries, fileBytes: budget.FileBytes}, usage, nil
 }
 
 // Entries returns a private owned slice; immutable strings/operations preserve
