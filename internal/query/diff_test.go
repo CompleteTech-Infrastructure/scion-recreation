@@ -1,6 +1,7 @@
 package query
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"reflect"
@@ -170,6 +171,57 @@ func TestFileEntryDiffRejectsAndBudgets(t *testing.T) {
 		if got != nil || !errors.Is(err, context.Canceled) { t.Fatal(at, got, err) }
 		if got, err := DiffFileEntries(ctx, nil, nil, FileDiffBudget{1, 1, 1}); got != nil || !errors.Is(err, context.Canceled) { t.Fatal(got, err) }
 	}
+}
+
+func canonicalDiffBlob(t *testing.T, payload []byte) (model.BlobID, []byte) {
+	t.Helper()
+	id, err := model.HashBlob(context.Background(), uint64(len(payload)), bytes.NewReader(payload))
+	if err != nil { t.Fatal(err) }
+	var frame bytes.Buffer
+	if err := model.EncodeBlob(context.Background(), &frame, uint64(len(payload)), bytes.NewReader(payload)); err != nil { t.Fatal(err) }
+	return id, frame.Bytes()
+}
+
+func TestCanonicalTextDiffMatchesVerifiedPayloads(t *testing.T) {
+	for _, pair := range [][2]string{{"", ""}, {"a\n", "A\n"}, {"a", "a\n"}, {"\xff\r\na", "\xff\r\nA"}, {"same", "same"}} {
+		oldID, oldFrame := canonicalDiffBlob(t, []byte(pair[0]))
+		nextID, nextFrame := canonicalDiffBlob(t, []byte(pair[1]))
+		budget := TextDiffBudget{InputBytes: 1024, OutputBytes: 1024, Lines: 100, Context: 1}
+		want, err := DiffText(context.Background(), []byte(pair[0]), []byte(pair[1]), budget)
+		if err != nil { t.Fatal(err) }
+		got, err := DiffCanonicalText(context.Background(), oldID, nextID, oldFrame, nextFrame, budget)
+		if err != nil || !bytes.Equal(got.Hunk, want.Hunk) || got.OldFinalNewline != want.OldFinalNewline || got.NewFinalNewline != want.NewFinalNewline { t.Fatal(pair, got, want, err) }
+	}
+}
+
+func TestCanonicalTextDiffFailsBeforeResult(t *testing.T) {
+	oldID, oldFrame := canonicalDiffBlob(t, []byte("a\n"))
+	nextID, nextFrame := canonicalDiffBlob(t, []byte("A\n"))
+	badOld := append([]byte(nil), oldFrame...); badOld[len(badOld)-1] ^= 1
+	badNext := append([]byte(nil), nextFrame...); badNext[len(badNext)-1] ^= 1
+	for _, tc := range []struct { oldID, nextID model.BlobID; old, next []byte }{
+		{oldID, nextID, badOld, nextFrame}, {oldID, nextID, oldFrame, badNext},
+		{oldID, nextID, oldFrame[:len(oldFrame)-1], nextFrame}, {oldID, nextID, oldFrame, nextFrame[:len(nextFrame)-1]},
+		{oldID, nextID, append(append([]byte(nil), oldFrame...), 0), nextFrame},
+		{oldID, nextID, oldFrame, append(append([]byte(nil), nextFrame...), 0)},
+		{oldID, oldID, oldFrame, badOld}, // Equal IDs must not skip verification.
+		{nextID, nextID, oldFrame, nextFrame}, {oldID, model.BlobID{}, oldFrame, nextFrame},
+	} {
+		got, err := DiffCanonicalText(context.Background(), tc.oldID, tc.nextID, tc.old, tc.next, TextDiffBudget{100, 100, 100, 1})
+		if err == nil || got.Hunk != nil || got.OldFinalNewline || got.NewFinalNewline { t.Fatal(got, err) }
+	}
+	for _, budget := range []TextDiffBudget{{}, {3, 100, 10, 0}, {4, 1, 10, 0}, {4, 100, 1, 0}, {4, 100, 1, 2}} {
+		got, err := DiffCanonicalText(context.Background(), oldID, nextID, oldFrame, nextFrame, budget)
+		if !errors.Is(err, ErrDiffLimit) || got.Hunk != nil || got.OldFinalNewline || got.NewFinalNewline { t.Fatal(budget, got, err) }
+	}
+	if _, err := DiffCanonicalText(context.Background(), oldID, nextID, oldFrame, nextFrame, TextDiffBudget{4, 100, 2, 0}); err != nil { t.Fatal("exact combined payload budget", err) }
+	emptyID, emptyFrame := canonicalDiffBlob(t, nil)
+	if got, err := DiffCanonicalText(context.Background(), oldID, emptyID, oldFrame, emptyFrame, TextDiffBudget{2, 100, 1, 0}); err != nil || got.Hunk == nil || !got.OldFinalNewline || got.NewFinalNewline { t.Fatal("zero remaining payload budget", got, err) }
+	binaryID, binaryFrame := canonicalDiffBlob(t, []byte{0})
+	if got, err := DiffCanonicalText(context.Background(), oldID, binaryID, oldFrame, binaryFrame, TextDiffBudget{100, 100, 100, 0}); !errors.Is(err, ErrDiffBinary) || got.Hunk != nil || got.OldFinalNewline || got.NewFinalNewline { t.Fatal(got, err) }
+	ctx, cancel := context.WithCancel(context.Background()); cancel()
+	if got, err := DiffCanonicalText(ctx, oldID, nextID, oldFrame, nextFrame, TextDiffBudget{100, 100, 100, 0}); !errors.Is(err, context.Canceled) || got.Hunk != nil { t.Fatal(got, err) }
+	if got, err := DiffCanonicalText(nil, oldID, nextID, oldFrame, nextFrame, TextDiffBudget{100, 100, 100, 0}); !errors.Is(err, ErrDiffInput) || got.Hunk != nil { t.Fatal(got, err) }
 }
 
 func TestFileEntryDiffBudgetAdmission(t *testing.T) {
