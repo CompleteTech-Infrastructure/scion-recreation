@@ -151,3 +151,91 @@ func TestTreePageBoundsOwnershipAndTruncation(t *testing.T) {
 	if len(max) != MaxTreePageBytes { t.Fatal("maximum fixture arithmetic") }
 	if _, err := DecodeUnlinkedTreePage(max, expected); err != nil { t.Fatal(err) }
 }
+
+func TestTreePageContextLiteralGraphs(t *testing.T) {
+	b, err := os.ReadFile("../../tests/fixtures/tree_pages_v1.json")
+	if err != nil { t.Fatal(err) }
+	var f struct {
+		Pages []treeLiteral `json:"pages"`
+		Positive []struct { Root string `json:"root_id_hex"` } `json:"positive_vectors"`
+		Negative []struct {
+			treeLiteral
+			Context *struct {
+				Directory string `json:"directory_prefix_hex"`
+				Component string `json:"component_prefix_hex"`
+			} `json:"context"`
+		} `json:"negative_vectors"`
+	}
+	if err := json.Unmarshal(b, &f); err != nil { t.Fatal(err) }
+	pages := make(map[TreePageID][]byte)
+	for _, row := range f.Pages {
+		id, err := ParseTreePageID(treeHex(t, row.IDHex))
+		if err != nil { t.Fatal(err) }
+		pages[id] = treeHex(t, row.FrameHex)
+	}
+	type visit struct { id TreePageID; directory, component []byte }
+	visits := 0
+	for _, row := range f.Positive {
+		root, err := ParseTreePageID(treeHex(t, row.Root))
+		if err != nil { t.Fatal(err) }
+		queue := []visit{{id: root}}
+		for len(queue) != 0 {
+			v := queue[len(queue)-1]
+			queue = queue[:len(queue)-1]
+			visits++
+			if visits > 100000 { t.Fatal("fixture traversal exceeded test bound") }
+			p, err := DecodeTreePageAt(pages[v.id], v.id, v.directory, v.component)
+			if err != nil { t.Fatalf("positive context dir=%d component=%d: %v", len(v.directory), len(v.component), err) }
+			component := append(append([]byte(nil), v.component...), p.Label...)
+			for _, child := range p.Children {
+				prefix := append(append([]byte(nil), component...), child.Edge)
+				queue = append(queue, visit{child.ID, v.directory, prefix})
+			}
+			if p.Tag == 4 {
+				dir := append([]byte(nil), v.directory...)
+				if len(dir) != 0 { dir = append(dir, '/') }
+				dir = append(dir, component...)
+				queue = append(queue, visit{id: p.Directory, directory: dir})
+			}
+		}
+	}
+	checked := 0
+	for _, row := range f.Negative {
+		if row.Context == nil && row.Reject != "graph:empty_directory_target" { continue }
+		var dir, component []byte
+		if row.Context != nil {
+			dir = treeHex(t, row.Context.Directory)
+			component = treeHex(t, row.Context.Component)
+		}
+		id, err := ParseTreePageID(treeHex(t, row.Claimed))
+		if err != nil { t.Fatal(err) }
+		if _, err := DecodeTreePageAt(treeHex(t, row.FrameHex), id, dir, component); err != ErrTreePage { t.Fatalf("accepted context %s", row.Name) }
+		checked++
+	}
+	if checked != 9 { t.Fatalf("context negatives: %d", checked) }
+}
+
+func TestTreePageContextRejectsMalformedPrefixes(t *testing.T) {
+	pages, _, _ := treeFixture(t)
+	var frame []byte
+	var id TreePageID
+	for _, row := range pages {
+		candidate := treeHex(t, row.FrameHex)
+		if binary.BigEndian.Uint16(candidate[19:21]) == 255 {
+			frame = candidate
+			var err error
+			id, err = ParseTreePageID(treeHex(t, row.IDHex))
+			if err != nil { t.Fatal(err) }
+			break
+		}
+	}
+	if frame == nil { t.Fatal("missing 255-byte label fixture") }
+	for _, tc := range []struct { directory, component []byte }{
+		{nil, []byte("a")}, // cap(1)=254, so this label crosses its anchor.
+		{nil, []byte("a/b")}, {nil, []byte{0}},
+		{[]byte("a/"), nil}, {[]byte("."), nil}, {[]byte("a/../b"), nil},
+		{bytes.Repeat([]byte{'a'}, 65536), nil}, {nil, bytes.Repeat([]byte{'a'}, 65536)},
+	} {
+		if _, err := DecodeTreePageAt(frame, id, tc.directory, tc.component); err != ErrTreePage { t.Fatal("accepted invalid context") }
+	}
+}

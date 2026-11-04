@@ -139,3 +139,64 @@ func DecodeUnlinkedTreePage(frame []byte, expected TreePageID) (UnlinkedTreePage
 	p.Label = append([]byte(nil), label...)
 	return p, nil
 }
+
+// DecodeTreePageAt additionally checks this page in its supplied byte-path
+// context. directoryPrefix is empty for the repository root, otherwise a
+// canonical directory path WITHOUT a trailing slash. componentPrefix contains
+// the bytes already consumed within its current component; its length is the
+// absolute radix offset, so callers cannot supply a contradictory offset/depth.
+// Context is caller-supplied, not authenticated. The result remains unlinked:
+// every referent must still be fetched/validated in its own context; missing
+// pages, cycles, publication, retention and authorization are not checked here.
+// Inputs must not be modified concurrently. Work is bounded by canonical path
+// limits plus one page. No graph traversal or filesystem operation is performed.
+func DecodeTreePageAt(frame []byte, expected TreePageID, directoryPrefix, componentPrefix []byte) (UnlinkedTreePage, error) {
+	bad := func() (UnlinkedTreePage, error) { return UnlinkedTreePage{}, ErrTreePage }
+	if uint64(len(directoryPrefix)) > model.MaxPathBytes || uint64(len(componentPrefix)) > model.MaxPathBytes {
+		return bad()
+	}
+	dirBytes, depth := 0, 0
+	if len(directoryPrefix) != 0 {
+		if _, err := model.NewPath(directoryPrefix); err != nil { return bad() }
+		dirBytes = len(directoryPrefix) + 1
+		depth = 1 + bytes.Count(directoryPrefix, []byte{'/'})
+	}
+	for _, c := range componentPrefix {
+		if c == 0 || c == '/' { return bad() }
+	}
+	p, err := DecodeUnlinkedTreePage(frame, expected)
+	if err != nil { return bad() }
+	d := len(componentPrefix)
+	cap := 255 - d%256
+	if len(p.Label) > cap { return bad() }
+	componentBytes := d + len(p.Label)
+	if p.Tag == 0 && len(p.Children) == 0 {
+		// The empty map is legal only as the entire repository result, not an
+		// explicit empty directory or an empty continuation.
+		if d != 0 || len(p.Label) != 0 || len(directoryPrefix) != 0 { return bad() }
+		return p, nil
+	}
+	if uint64(componentBytes) > model.MaxPathBytes || uint64(dirBytes+componentBytes) > model.MaxPathBytes || depth >= model.MaxPathComponents {
+		return bad()
+	}
+	if p.Tag == 0 && len(p.Children) == 1 && len(p.Label) != cap { return bad() }
+	if p.Tag != 0 {
+		if componentBytes == 0 { return bad() }
+		if componentBytes <= 2 {
+			component := append(append([]byte(nil), componentPrefix...), p.Label...)
+			if bytes.Equal(component, []byte(".")) || bytes.Equal(component, []byte("..")) { return bad() }
+		}
+	}
+	// Reject path/offset overruns BEFORE following the next edge. Directory
+	// targets necessarily need a slash and at least one more component byte.
+	if len(p.Children) != 0 && (uint64(componentBytes+1) > model.MaxPathBytes || uint64(dirBytes+componentBytes+1) > model.MaxPathBytes) { return bad() }
+	if p.Tag == 4 && (depth+1 >= model.MaxPathComponents || uint64(dirBytes+componentBytes+2) > model.MaxPathBytes) { return bad() }
+	// The empty root's identity is fixed by the contract. Referents with that
+	// identity are forbidden without needing to fetch their bytes.
+	emptyDigest := sha256.Sum256([]byte("CANOPY\x00TREE\x00\x00\x01\x01\x00\x00\x00\x05\x00\x00\x00\x00\x00"))
+	if p.Tag == 4 && bytes.Equal(p.Directory.raw[7:], emptyDigest[:]) { return bad() }
+	for _, child := range p.Children {
+		if bytes.Equal(child.ID.raw[7:], emptyDigest[:]) { return bad() }
+	}
+	return p, nil
+}
