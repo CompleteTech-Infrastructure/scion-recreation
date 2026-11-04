@@ -408,3 +408,56 @@ func MergeFileEntries(ctx context.Context, entries []FileMergeEntry, budget File
 	if len(conflicts) != 0 { return nil, conflicts, nil }
 	return resolved, nil, nil
 }
+
+// CanonicalFileMergeEntry supplies untrusted base/left/right blob descriptors at
+// one exact path. Mode/presence and source/base binding remain caller assertions.
+type CanonicalFileMergeEntry struct { Path model.Path; Sides [3]CanonicalFileSide }
+
+// MergeCanonicalFileEntries verifies ALL present blobs before exposing any
+// resolved state or conflict, then applies MergeFileEntries' opaque equality
+// rules. Matching IDs do not skip verification. Entries must have strictly
+// sorted unique paths; FileMergeBudget is shared across the entire batch,
+// including every repeated payload. Canonical frames additionally admit 22
+// header bytes per present side (at most 3*4096 headers). Empty/absent states
+// remain distinct, and zero payload budget permits them both.
+//
+// No result escapes on malformed data, exhaustion or cancellation, even if an
+// earlier entry would conflict or resolve. This is private independent-path
+// processing, not complete tree/source verification, text merging, rename or
+// multi-base policy, authorization, durable upload or publication. Input frames
+// and slices must not mutate during the call. Limits are logical admission,
+// not an allocator/RSS guarantee; bounded staging copies remain necessary.
+func MergeCanonicalFileEntries(ctx context.Context, entries []CanonicalFileMergeEntry, budget FileMergeBudget) ([]ResolvedFileEntry, []PathFileConflict, error) {
+	if ctx == nil { return nil, nil, ErrFileState }
+	if err := ctx.Err(); err != nil { return nil, nil, err }
+	if budget.Entries == 0 || budget.Entries > 4096 || budget.PathBytes == 0 || budget.PathBytes > 64<<20 || budget.Payload > 64<<20 { return nil, nil, ErrFileBudget }
+	if uint64(len(entries)) > budget.Entries { return nil, nil, ErrFileBudget }
+	var paths, frames, headers uint64
+	for i, entry := range entries {
+		if err := ctx.Err(); err != nil { return nil, nil, err }
+		if entry.Path.Validate() != nil || (i > 0 && entries[i-1].Path.Compare(entry.Path) >= 0) { return nil, nil, ErrFileState }
+		n := uint64(len(entry.Path.Bytes()))
+		if n > budget.PathBytes-paths { return nil, nil, ErrFileBudget }; paths += n
+		for _, side := range entry.Sides {
+			if !side.Present {
+				if side.Mode != model.Delete || side.ID != (model.BlobID{}) || side.Frame != nil { return nil, nil, ErrFileState }
+				continue
+			}
+			if side.Mode < model.SetRegular || side.Mode > model.SetSymlink || side.ID.Validate() != nil { return nil, nil, ErrFileState }
+			headers += 22
+			// The hard maximum prevents overflow before the tighter shared check.
+			n := uint64(len(side.Frame))
+			if n > (64<<20)+3*4096*22-frames { return nil, nil, ErrFileBudget }; frames += n
+		}
+	}
+	if frames > budget.Payload+headers { return nil, nil, ErrFileBudget }
+	remaining := budget.Payload
+	var verified []FileMergeEntry
+	for _, entry := range entries {
+		versions, err := verifyCanonicalFileSides(ctx, entry.Sides, remaining)
+		if err != nil { return nil, nil, err }
+		for _, v := range versions { remaining -= uint64(len(v.content)) }
+		verified = append(verified, FileMergeEntry{entry.Path, versions[0], versions[1], versions[2]})
+	}
+	return MergeFileEntries(ctx, verified, budget)
+}
