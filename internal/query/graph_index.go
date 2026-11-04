@@ -1,6 +1,7 @@
 package query
 
 import (
+	"bytes"
 	"context"
 	"errors"
 
@@ -145,4 +146,64 @@ func (b *GraphBuilder) Usage() (nodes, references uint64) {
 		return 0, 0
 	}
 	return uint64(len(b.state.nodes)), b.state.references
+}
+
+// CanonicalGraph owns a repository-bound graph whose nodes can only be admitted
+// through canonical changeset-frame verification. The private graph cannot be
+// populated via raw GraphBuilder.Add. It is still an in-process, single-owner
+// index, not proof of durable publication, final-tree validity or authorization.
+// The zero value is invalid. Copies share the same graph and accounting.
+type CanonicalGraph struct {
+	repository [16]byte
+	payloadBytes uint64
+	graph *GraphBuilder
+}
+
+// NewCanonicalGraph sets explicit retained graph and per-frame payload limits.
+// PayloadBytes caps canonical payload, excluding the 22-byte frame header. It
+// is not a peak-memory limit: decoding and Snapshot make bounded owned copies.
+func NewCanonicalGraph(repository [16]byte, budget GraphBudget, payloadBytes uint64) (*CanonicalGraph, error) {
+	if payloadBytes == 0 || payloadBytes > model.MaxChangesetPayload { return nil, ErrGraphBudget }
+	graph, err := NewGraphBuilder(budget)
+	if err != nil { return nil, err }
+	return &CanonicalGraph{repository: repository, payloadBytes: payloadBytes, graph: graph}, nil
+}
+
+// AddFrame verifies complete framing, digest, canonical syntax and repository
+// binding before atomically adding ordered-parent metadata. All parents must
+// already have passed the same admission path. Even replays verify the supplied
+// frame; knowing an existing digest does not allow skipping byte verification.
+// Inputs must not be mutated during this call. No reader/network fallback exists.
+func (g *CanonicalGraph) AddFrame(ctx context.Context, expected model.ChangesetID, frame []byte) (GraphNode, error) {
+	if ctx == nil || g == nil || g.graph == nil { return GraphNode{}, ErrGraphInput }
+	if err := ctx.Err(); err != nil { return GraphNode{}, err }
+	if uint64(len(frame)) > g.payloadBytes+22 { return GraphNode{}, ErrGraphBudget }
+	value, err := model.DecodeChangeset(ctx, bytes.NewReader(frame), expected, g.payloadBytes)
+	if err != nil { return GraphNode{}, err }
+	snapshot := value.Snapshot()
+	if snapshot.RepoID != g.repository { return GraphNode{}, ErrGraphInput }
+	return g.graph.Add(ctx, expected, snapshot.Parents)
+}
+
+// Lookup returns immutable verified-frame metadata, not a grant to disclose it.
+func (g *CanonicalGraph) Lookup(id model.ChangesetID) (GraphNode, bool) {
+	if g == nil || g.graph == nil { return GraphNode{}, false }
+	return g.graph.Lookup(id)
+}
+func (g *CanonicalGraph) Usage() (nodes, references uint64) {
+	if g == nil || g.graph == nil { return 0, 0 }
+	return g.graph.Usage()
+}
+
+// IsAncestor forwards the bounded query only over this repository-bound graph.
+// Callers must independently authorize both endpoints and the graph scope.
+func (g *CanonicalGraph) IsAncestor(ctx context.Context, ancestor, descendant model.ChangesetID, budget AncestryBudget) (bool, AncestryWork, error) {
+	if g == nil || g.graph == nil { return false, AncestryWork{}, ErrGraphInput }
+	return g.graph.IsAncestor(ctx, ancestor, descendant, budget)
+}
+
+// MergeBases forwards the all-best query with the same authorization obligation.
+func (g *CanonicalGraph) MergeBases(ctx context.Context, left, right model.ChangesetID, budget MergeBaseBudget) ([]model.ChangesetID, MergeBaseWork, error) {
+	if g == nil || g.graph == nil { return nil, MergeBaseWork{}, ErrGraphInput }
+	return g.graph.MergeBases(ctx, left, right, budget)
 }
