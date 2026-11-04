@@ -217,6 +217,13 @@ func Validate(ctx context.Context, scope metadata.Scope, input model.ChangesetIn
 	if err := contextFailure(ctx); err != nil {
 		return zero, err
 	}
+	// Reject cheap cardinality excess before the canonical validator walks
+	// caller-supplied parents and operations. Canonical maxima do not replace
+	// this request's potentially much smaller work budget.
+	if uint64(len(input.Parents)) > budget.MaxParents ||
+		uint64(len(input.Operations)) > budget.MaxOperations || uint64(len(base.Alias)) > budget.MaxAliasBytes {
+		return zero, failure(metadata.ErrResourceExhausted)
+	}
 	size, err := model.ValidateChangeset(input)
 	if ctxErr := contextFailure(ctx); ctxErr != nil {
 		return zero, ctxErr
@@ -227,8 +234,7 @@ func Validate(ctx context.Context, scope metadata.Scope, input model.ChangesetIn
 	if input.RepoID != scope.Repository {
 		return zero, failure(metadata.ErrInvalidArgument)
 	}
-	if size > budget.MaxPayloadBytes || uint64(len(input.Parents)) > budget.MaxParents ||
-		uint64(len(input.Operations)) > budget.MaxOperations || uint64(len(base.Alias)) > budget.MaxAliasBytes {
+	if size > budget.MaxPayloadBytes {
 		return zero, failure(metadata.ErrResourceExhausted)
 	}
 	if err := checkSets(ctx, input.Operations); err != nil {
