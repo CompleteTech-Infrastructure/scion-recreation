@@ -65,9 +65,16 @@ func TestLinuxNativeKernelEvents(t *testing.T) {
 				mask = syscall.IN_DELETE
 			case "root-replacement":
 				old := root + "-old"
-				watchOK(t, os.Rename(root, old))
 				t.Cleanup(func() { _ = os.RemoveAll(old) })
-				watchOK(t, os.Mkdir(root, 0700))
+				// Keep the observer from checking identity while replacement
+				// is in progress. This case asserts native MOVE_SELF;
+				// the independent identity-guard interleaving is tested below.
+				watchOK(t, n.call(context.Background(), func() error {
+					if err := os.Rename(root, old); err != nil {
+						return err
+					}
+					return os.Mkdir(root, 0700)
+				}))
 				want, mask = nil, syscall.IN_MOVE_SELF
 			}
 			err := n.Barrier(context.Background())
@@ -93,6 +100,73 @@ func TestLinuxNativeKernelEvents(t *testing.T) {
 			watchUnknown(t, w, meta)
 		})
 	}
+}
+
+// The delivery callback runs after drain reaches EAGAIN. Use it only as a
+// scheduling seam to replace the real root before step checks its identity;
+// no inotify events or identity results are injected. Measure loss delivery
+// from after the trigger's observation, independently of its invalidation.
+func TestLinuxNativeRootIdentityGuardAfterDrain(t *testing.T) {
+	w, n, root, meta := linuxFixture(t)
+	old := root + "-old"
+	t.Cleanup(func() { _ = os.RemoveAll(old) })
+	replaced := false
+	lossDelivered := false
+	var beforeMismatch uint64
+	err := n.call(context.Background(), func() error {
+		prior := n.observe
+		defer func() { n.observe = prior }()
+		n.masks = 0
+		n.observe = func(events []WatchEvent) error {
+			if replaced {
+				for _, event := range events {
+					if event.Kind == WatchLoss {
+						lossDelivered = true
+					}
+				}
+			}
+			if err := prior(events); err != nil {
+				return err
+			}
+			if replaced {
+				return nil
+			}
+			_, generation, err := w.Snapshot()
+			if err != nil {
+				return err
+			}
+			beforeMismatch = generation
+			if err := os.Rename(root, old); err != nil {
+				return err
+			}
+			if err := os.Mkdir(root, 0700); err != nil {
+				return err
+			}
+			replaced = true
+			return nil
+		}
+		if err := os.WriteFile(filepath.Join(root, "sub/file"), []byte("delivery trigger"), 0600); err != nil {
+			return err
+		}
+		return n.step(context.Background(), true)
+	})
+	watchIs(t, err, ErrWatchStale)
+	watchCheck(t, replaced, "root replacement scheduling seam was not reached")
+	var masks uint32
+	var released bool
+	watchOK(t, n.call(context.Background(), func() error {
+		masks = n.masks
+		released = n.failed != nil && n.fd == -1 && n.descriptors == 0
+		return nil
+	}))
+	watchCheck(t, masks&syscall.IN_MODIFY != 0, "trigger did not deliver a real kernel event")
+	watchCheck(t, masks&syscall.IN_MOVE_SELF == 0, "root move was drained before identity check")
+	watchCheck(t, released, "identity mismatch did not fail closed and release resources")
+	_, after, err := w.Snapshot()
+	watchOK(t, err)
+	watchCheck(t, after > beforeMismatch, "identity mismatch did not invalidate generation")
+	watchCheck(t, lossDelivered, "identity mismatch did not deliver WatchLoss")
+	watchUnknown(t, w, meta)
 }
 
 func TestLinuxNativeAssertionAndConfinement(t *testing.T) {
