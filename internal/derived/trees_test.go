@@ -1405,3 +1405,91 @@ func TestPrepareCanonicalTreeWriteAdmitsExactSource(t *testing.T) {
 	if err == nil || write.Result != (metadata.DerivedResult{}) || out != nil || usage.Parent.Graph.Visits != 1 || usage.Candidate.BlobVisits != 1 { t.Fatal("canonical source skipped candidate validation") }
 	if len(frames) != 1 || !bytes.Equal(frames[root], empty) || !bytes.Equal(source, sourceBefore) { t.Fatal("canonical preparation mutated input") }
 }
+
+func treeReplaySource(t *testing.T, change model.ChangesetInput) TreeSourceFrame {
+	t.Helper()
+	v, err := model.NewChangeset(change); if err != nil { t.Fatal(err) }
+	id, err := model.HashChangeset(context.Background(), v); if err != nil { t.Fatal(err) }
+	var frame bytes.Buffer
+	if err := model.EncodeChangeset(context.Background(), &frame, v); err != nil { t.Fatal(err) }
+	return TreeSourceFrame{id, frame.Bytes()}
+}
+
+func TestReplayCanonicalTreeChainOwnsParentMappings(t *testing.T) {
+	ctx := context.Background(); repo := [16]byte{1}
+	blob, blobFrame := treeCanonicalBlob(t, []byte("opaque"))
+	blobs := map[model.BlobID][]byte{blob: blobFrame}
+	blobBefore := append([]byte(nil), blobFrame...)
+	path, _ := model.NewPath([]byte("a"))
+	regular, _ := model.NewOperation(path, model.SetRegular, &blob)
+	executable, _ := model.NewOperation(path, model.SetExecutable, &blob)
+	remove, _ := model.NewOperation(path, model.Delete, nil)
+	symlink, _ := model.NewOperation(path, model.SetSymlink, &blob)
+	var sources []TreeSourceFrame
+	var changes []model.ChangesetInput
+	var sourceBytes uint64
+	for _, ops := range [][]model.Operation{{regular}, {executable}, {remove}, {symlink}, nil} {
+		change := model.ChangesetInput{RepoID: repo, Operations: ops}
+		if len(sources) != 0 { change.Parents = []model.ChangesetID{sources[len(sources)-1].ID} }
+		source := treeReplaySource(t, change); sources = append(sources, source); changes = append(changes, change); sourceBytes += uint64(len(source.Frame))
+	}
+	graph := TreeObjectGraphBudget{graphTestBudget(), 1<<20}
+	step := TreeCheckedWriteBudget{graph, graph, TreeChangesetBudget{TreeRewriteBudget{4096, 4096*MaxTreePageBytes, 4096*MaxTreePageBytes}, 4096, model.MaxChangesetPayload}}
+	budget := TreeReplayBudget{5, sourceBytes, 4, 204, step}
+	writes, pages, used, err := ReplayCanonicalTreeChain(ctx, repo, sources, blobs, budget)
+	if err != nil || len(writes) != 5 || len(pages) != 4 || used != (TreeReplayUsage{5, sourceBytes, 4, 204}) { t.Fatalf("exact replay: %+v %v", used, err) }
+	_, emptyRoot, _ := EncodeTreePageAt(UnlinkedTreePage{}, nil, nil)
+	for i, tag := range []byte{1, 2, 0, 3, 3} {
+		want := emptyRoot
+		if tag != 0 { want, _, err = BuildSingleLeafTree(ctx, path, tag, blob, TreeBuildBudget{1, 60}); if err != nil { t.Fatal(err) } }
+		if writes[i].Result.Identity != (metadata.DerivedIdentity{Repository: repo, Changeset: sources[i].ID, Kind: "TREE", Version: 1}) || !bytes.Equal(writes[i].Result.Value.Bytes(), want.raw[:]) { t.Fatal("replay changed canonical source/root association") }
+		if i == 0 { if len(writes[i].Parents) != 0 { t.Fatal("root acquired parent") } } else if len(writes[i].Parents) != 1 || writes[i].Parents[0] != writes[i-1].Result { t.Fatal("replay did not derive its own parent-zero mapping") }
+	}
+	for _, which := range []string{"sources", "source bytes", "pages", "page bytes"} {
+		short := budget
+		switch which { case "sources": short.Sources--; case "source bytes": short.SourceBytes--; case "pages": short.Pages--; case "page bytes": short.PageBytes-- }
+		out, frames, _, err := ReplayCanonicalTreeChain(ctx, repo, sources, blobs, short)
+		if err != metadata.ErrResourceExhausted || out != nil || frames != nil { t.Fatalf("%s exhaustion leaked candidates: %v", which, err) }
+	}
+	for _, invalid := range []TreeReplayBudget{{}, {65, sourceBytes, 4, 204, step}, {5, sourceBytes, 0, 204, step}} {
+		if out, frames, _, err := ReplayCanonicalTreeChain(ctx, repo, sources, blobs, invalid); err != metadata.ErrInvalidArgument || out != nil || frames != nil { t.Fatal("invalid replay budget accepted") }
+	}
+	if out, frames, _, err := ReplayCanonicalTreeChain(nil, repo, sources, blobs, budget); err != metadata.ErrInvalidArgument || out != nil || frames != nil { t.Fatal("nil replay context accepted") }
+	for _, which := range []string{"input", "parent visits", "candidate blobs", "rewrite pages"} {
+		invalid := budget
+		switch which { case "input": invalid.Step.Rewrite.InputBytes = 0; case "parent visits": invalid.Step.Parent.Graph.Visits = 0; case "candidate blobs": invalid.Step.Candidate.BlobBytes = 0; case "rewrite pages": invalid.Step.Rewrite.Rewrite.Pages = 0 }
+		if out, frames, _, err := ReplayCanonicalTreeChain(ctx, repo, sources, blobs, invalid); err != metadata.ErrInvalidArgument || out != nil || frames != nil { t.Fatalf("invalid step %s admitted output: %v", which, err) }
+	}
+	// The first rewrite reads the 24-byte empty root and succeeds; the
+	// second must read its 60-byte parent leaf and exhaust the per-step cap.
+	// A completed private first mapping must not escape the later failure.
+	laterShort := budget; laterShort.Step.Rewrite.Rewrite.ReadBytes = 24
+	if out, frames, usage, err := ReplayCanonicalTreeChain(ctx, repo, sources, blobs, laterShort); err != metadata.ErrResourceExhausted || out != nil || frames != nil || usage.Sources != 2 || usage.Pages != 2 || usage.PageBytes != 84 { t.Fatalf("later step exhaustion leaked prior candidate: %+v %v", usage, err) }
+	badSources := append([]TreeSourceFrame(nil), sources...)
+	badSources[4].Frame = append([]byte(nil), badSources[4].Frame...); badSources[4].Frame[len(badSources[4].Frame)-1] ^= 1
+	out, frames, partial, err := ReplayCanonicalTreeChain(ctx, repo, badSources, blobs, budget)
+	if err == nil || out != nil || frames != nil || partial.Sources != 5 { t.Fatal("late corrupt source exposed earlier private results") }
+	for _, batch := range [][]TreeSourceFrame{nil, sources[1:], {sources[0], sources[2]}, {sources[0], sources[0]}} {
+		if out, frames, _, err := ReplayCanonicalTreeChain(ctx, repo, batch, blobs, budget); err == nil || out != nil || frames != nil { t.Fatal("empty/non-root/disconnected/repeated-root chain accepted") }
+	}
+	if out, frames, _, err := ReplayCanonicalTreeChain(ctx, [16]byte{2}, sources, blobs, budget); err != metadata.ErrInvalidArgument || out != nil || frames != nil { t.Fatal("foreign repository replay accepted") }
+	if out, frames, _, err := ReplayCanonicalTreeChain(ctx, repo, sources, nil, budget); err == nil || out != nil || frames != nil { t.Fatal("missing referenced blob accepted") }
+	// Additional canonical parents are ancestry, never tree-union inputs.
+	merge := changes[1]; merge.Parents = append(append([]model.ChangesetID(nil), merge.Parents...), sources[3].ID)
+	mergeSource := treeReplaySource(t, merge)
+	mergeBudget := budget; mergeBudget.SourceBytes = uint64(len(sources[0].Frame)+len(mergeSource.Frame))
+	merged, _, _, err := ReplayCanonicalTreeChain(ctx, repo, []TreeSourceFrame{sources[0], mergeSource}, blobs, mergeBudget)
+	if err != nil || len(merged) != 2 || merged[1].Result.Value != writes[1].Result.Value || len(merged[1].Parents) != 1 { t.Fatal("additional ancestry changed parent-zero derivation") }
+	// Calibrate a complete one-source prefix. The longer batch adds four
+	// source-admission checkpoints; its next-step checkpoint replaces the
+	// one-source final checkpoint. Cancel with one private result collected.
+	probe := &treePhaseCancelContext{Context: ctx}
+	if _, _, _, err := ReplayCanonicalTreeChain(probe, repo, sources[:1], blobs, budget); err != nil { t.Fatal(err) }
+	cancel := &treePhaseCancelContext{Context: ctx, cancelAt: probe.calls+len(sources)-1}
+	out, frames, partial, err = ReplayCanonicalTreeChain(cancel, repo, sources, blobs, budget)
+	if err != context.Canceled || out != nil || frames != nil || partial.Sources != 1 { t.Fatalf("between-source cancellation leaked results: %+v %v", partial, err) }
+	// Returned page storage is owned, not aliased to canonical source/blob input.
+	for _, frame := range pages { if len(frame) != 0 { frame[0] ^= 1; break } }
+	if !bytes.Equal(blobBefore, blobs[blob]) { t.Fatal("result mutation changed blob input") }
+	for i, source := range sources { if _, err := model.DecodeChangeset(ctx, bytes.NewReader(source.Frame), source.ID, step.Rewrite.InputBytes); err != nil { t.Fatalf("source %d mutated: %v", i, err) } }
+}
