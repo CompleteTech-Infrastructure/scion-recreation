@@ -20,6 +20,7 @@ type ExactCopyBudget struct { Entries, PathBytes uint64 }
 type ExactCopyIndex struct {
 	source model.ChangesetID
 	paths map[model.BlobID][]model.Path
+	targets map[model.Path]model.BlobID
 }
 
 // NewExactCopyIndex requires strictly raw-byte-sorted canonical SET rows from
@@ -42,11 +43,12 @@ func NewExactCopyIndex(ctx context.Context, source model.ChangesetID, rows []mod
 		if n > budget.PathBytes-pathBytes { return nil, metadata.ErrResourceExhausted }
 		pathBytes += n
 	}
-	index := &ExactCopyIndex{source: source, paths: make(map[model.BlobID][]model.Path)}
+	index := &ExactCopyIndex{source: source, paths: make(map[model.BlobID][]model.Path), targets: make(map[model.Path]model.BlobID)}
 	for _, row := range rows {
 		if err := ctx.Err(); err != nil { return nil, err }
 		id, _ := row.Target()
 		index.paths[id] = append(index.paths[id], row.Path())
+		index.targets[row.Path()] = id
 	}
 	if err := ctx.Err(); err != nil { return nil, err }
 	return index, nil
@@ -106,4 +108,37 @@ func NewTreeExactCopyIndex(ctx context.Context, identity metadata.DerivedIdentit
 	if err != nil { return nil, usage, err }
 	index, err := NewExactCopyIndex(ctx, identity.Changeset, rows, ExactCopyBudget{Entries: budget.Entries, PathBytes: budget.PathBytes})
 	return index, usage, err
+}
+
+// CopiesOfPath selects the source blob identity from this same private snapshot
+// and returns every other indexed path with that exact identity in raw-byte
+// order. The source itself is excluded BEFORE result-budget admission; no list
+// is truncated. Modes may differ. These are identity matches, not proof of
+// copying/renaming, similarity ranking or historical relationships.
+//
+// maxResults must be 1..4096. A missing source row returns ErrNotFound rather
+// than an empty match set; this distinction and all candidate paths/counts/timing
+// are PRIVATE and require current source/candidate authorization before use.
+// A successful empty set only means this index has no alternative path. Source
+// provenance/completeness and authorization remain external prerequisites.
+// Constructor retains a bounded second map of <=4096 immutable path/ID pairs;
+// these maps share immutable values and permit concurrent read-only lookups.
+func (index *ExactCopyIndex) CopiesOfPath(ctx context.Context, sourcePath model.Path, maxResults uint64) (ExactCopyMatches, error) {
+	var zero ExactCopyMatches
+	if ctx == nil { return zero, metadata.ErrInvalidArgument }
+	if err := ctx.Err(); err != nil { return zero, err }
+	if index == nil || index.paths == nil || index.targets == nil || index.source.Validate() != nil || sourcePath.Validate() != nil || maxResults == 0 || maxResults > 4096 { return zero, metadata.ErrInvalidArgument }
+	blob, present := index.targets[sourcePath]
+	if !present { return zero, metadata.ErrNotFound }
+	paths := index.paths[blob]
+	// Constructor guarantees one occurrence of sourcePath in this bucket.
+	if uint64(len(paths)-1) > maxResults { return zero, metadata.ErrResourceExhausted }
+	out := ExactCopyMatches{Source: index.source}
+	for _, path := range paths {
+		if err := ctx.Err(); err != nil { return zero, err }
+		if path == sourcePath { continue }
+		out.Paths = append(out.Paths, path)
+	}
+	if err := ctx.Err(); err != nil { return zero, err }
+	return out, nil
 }

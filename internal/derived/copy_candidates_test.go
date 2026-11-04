@@ -113,3 +113,39 @@ func TestTreeExactCopyIndexBindingAndEnumeration(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background()); cancel()
 	if index, _, err := NewTreeExactCopyIndex(ctx, identity, record, frames, budget); err != context.Canceled || index != nil { t.Fatal(index, err) }
 }
+
+func TestExactCopiesOfPathExcludesSourceBeforeBudget(t *testing.T) {
+	source, rows, _ := copyFixture(t)
+	index, err := NewExactCopyIndex(context.Background(), source, rows, ExactCopyBudget{4,4}); if err != nil { t.Fatal(err) }
+	for _, tc := range []struct { row int; want []string }{{0, []string{"a", "\xff"}}, {1, []string{"A", "\xff"}}, {2, nil}, {3, []string{"A", "a"}}} {
+		got, err := index.CopiesOfPath(context.Background(), rows[tc.row].Path(), 2)
+		if err != nil || got.Source != source || len(got.Paths) != len(tc.want) { t.Fatal(got, err) }
+		for i, want := range tc.want { if string(got.Paths[i].Bytes()) != want { t.Fatal(got, tc.want) } }
+	}
+	if got, err := index.CopiesOfPath(context.Background(), rows[0].Path(), 1); err != metadata.ErrResourceExhausted || got.Source != (model.ChangesetID{}) || got.Paths != nil { t.Fatal(got, err) }
+	path := rows[0].Path(); rows[0] = model.Operation{}
+	got, err := index.CopiesOfPath(context.Background(), path, 2); if err != nil { t.Fatal(err) }
+	got.Paths[0] = model.Path{}
+	if again, err := index.CopiesOfPath(context.Background(), path, 2); err != nil || string(again.Paths[0].Bytes()) != "a" { t.Fatal(again, err) }
+	missing, _ := model.NewPath([]byte("missing"))
+	if got, err := index.CopiesOfPath(context.Background(), missing, 2); err != metadata.ErrNotFound || got.Source != (model.ChangesetID{}) || got.Paths != nil { t.Fatal(got, err) }
+	if got, err := index.CopiesOfPath(context.Background(), model.Path{}, 2); err != metadata.ErrInvalidArgument || got.Paths != nil { t.Fatal(got, err) }
+	for _, limit := range []uint64{0,4097} { if got, err := index.CopiesOfPath(context.Background(), path, limit); err != metadata.ErrInvalidArgument || got.Paths != nil { t.Fatal(got, err) } }
+	for _, invalid := range []*ExactCopyIndex{nil, {}} { if got, err := invalid.CopiesOfPath(context.Background(), path, 2); err != metadata.ErrInvalidArgument || got.Paths != nil { t.Fatal(got, err) } }
+	if got, err := index.CopiesOfPath(nil, path, 2); err != metadata.ErrInvalidArgument || got.Paths != nil { t.Fatal(got, err) }
+}
+
+type copyCancelContext struct { context.Context; calls, cancelAt int }
+func (c *copyCancelContext) Err() error { c.calls++; if c.calls >= c.cancelAt { return context.Canceled }; return nil }
+
+func TestExactCopiesOfPathCancellationDiscardsMatches(t *testing.T) {
+	source, rows, _ := copyFixture(t)
+	index, err := NewExactCopyIndex(context.Background(), source, rows, ExactCopyBudget{4,4}); if err != nil { t.Fatal(err) }
+	// Entry check, three bucket paths (including excluded source), final check.
+	// At four and five, at least one match was already appended privately.
+	for _, at := range []int{1,3,4,5} {
+		ctx := &copyCancelContext{Context: context.Background(), cancelAt: at}
+		got, err := index.CopiesOfPath(ctx, rows[0].Path(), 2)
+		if err != context.Canceled || got.Source != (model.ChangesetID{}) || got.Paths != nil { t.Fatal(at, got, err) }
+	}
+}
