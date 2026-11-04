@@ -228,3 +228,53 @@ func TestCanonicalFileMergeRejectsUnverifiedStates(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background()); cancel()
 	if got, conflict, err := MergeCanonicalFileVersions(ctx, sides, 100); err != context.Canceled || got != (FileVersion{}) || conflict != nil { t.Fatal(got, conflict, err) }
 }
+
+func TestCanonicalTextFileMergeParity(t *testing.T) {
+	reg := func(s string) FileVersion { return fileFixture(t, model.SetRegular, s) }
+	exec := func(s string) FileVersion { return fileFixture(t, model.SetExecutable, s) }
+	link := func(s string) FileVersion { return fileFixture(t, model.SetSymlink, s) }
+	for _, v := range [][3]FileVersion{
+		{reg("a\nb\nc\n"), exec("A\nb\nc\n"), reg("a\nb\nC\n")},
+		{reg("a"), reg("b"), reg("c")}, {reg("a"), AbsentFile(), reg("b")},
+		{AbsentFile(), reg("a"), reg("b")}, {reg("a"), link("a"), reg("b")},
+		{link("a"), link("b"), link("c")}, {AbsentFile(), reg(""), AbsentFile()},
+		{reg("a\x00"), reg("a\x00"), exec("b\x00")},
+		{reg("a\x00"), reg("b\x00"), reg("c\x00")},
+		{reg("\xff\r\na"), reg("\xff\r\nA"), exec("\xff\r\na")},
+	} {
+		var sides [3]CanonicalFileSide
+		for i, version := range v {
+			if version.IsAbsent() { continue }
+			content, _ := version.Content(); mode, _ := version.Mode()
+			ids, frames := canonicalMergeInputs(t, [3]string{string(content), "", ""})
+			sides[i] = CanonicalFileSide{true, mode, ids[0], frames[0]}
+		}
+		budget := ThreeWayTextBudget{1024, 100, 1000, 100}
+		want, conflict, wantErr := MergeTextFileVersions(context.Background(), v[0], v[1], v[2], budget)
+		got, gotConflict, err := MergeCanonicalTextFileVersions(context.Background(), sides, budget)
+		if !errors.Is(err, wantErr) || got != want || (gotConflict == nil) != (conflict == nil) { t.Fatal(v, got, gotConflict, err, wantErr) }
+		if conflict != nil && *conflict != *gotConflict { t.Fatal(conflict, gotConflict) }
+	}
+}
+
+func TestCanonicalTextFileMergeVerificationAndAdmission(t *testing.T) {
+	ids, frames := canonicalMergeInputs(t, [3]string{"a", "a", "a"})
+	var sides [3]CanonicalFileSide
+	for i := range sides { sides[i] = CanonicalFileSide{true, model.SetRegular, ids[i], frames[i]} }
+	for i := range sides {
+		bad := sides; bad[i].Frame = append([]byte(nil), frames[i]...); bad[i].Frame[len(bad[i].Frame)-1] ^= 1
+		got, conflict, err := MergeCanonicalTextFileVersions(context.Background(), bad, ThreeWayTextBudget{3, 1, 1, 1})
+		if err == nil || got != (FileVersion{}) || conflict != nil { t.Fatal(i, got, conflict, err) }
+	}
+	for _, budget := range []ThreeWayTextBudget{{}, {3, 0, 1, 1}, {3, 1, 4000001, 1}, {65<<20, 1, 1, 1}} {
+		got, conflict, err := MergeCanonicalTextFileVersions(context.Background(), sides, budget)
+		if err != ErrTextLimit || got != (FileVersion{}) || conflict != nil { t.Fatal(got, conflict, err) }
+	}
+	if got, conflict, err := MergeCanonicalTextFileVersions(context.Background(), sides, ThreeWayTextBudget{2, 1, 1, 1}); err != ErrFileBudget || got != (FileVersion{}) || conflict != nil { t.Fatal(got, conflict, err) }
+	// Three input lines exceed Lines=1, but verified whole-file equality needs
+	// no text analysis; work admission is intentionally not consumed here.
+	if got, conflict, err := MergeCanonicalTextFileVersions(context.Background(), sides, ThreeWayTextBudget{3, 1, 1, 1}); err != nil || conflict != nil || got != fileFixture(t, model.SetRegular, "a") { t.Fatal(got, conflict, err) }
+	if got, conflict, err := MergeCanonicalTextFileVersions(nil, sides, ThreeWayTextBudget{3, 1, 1, 1}); err != ErrFileState || got != (FileVersion{}) || conflict != nil { t.Fatal(got, conflict, err) }
+	ctx, cancel := context.WithCancel(context.Background()); cancel()
+	if got, conflict, err := MergeCanonicalTextFileVersions(ctx, sides, ThreeWayTextBudget{3, 1, 1, 1}); err != context.Canceled || got != (FileVersion{}) || conflict != nil { t.Fatal(got, conflict, err) }
+}
