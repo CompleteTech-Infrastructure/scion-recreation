@@ -188,7 +188,14 @@ func (n *linuxWatch) step(ctx context.Context, barrier bool) error {
 	if barrier {
 		n.coverage = true
 	}
-	for pass := 0; pass < 4; pass++ {
+	for pass := 0; ; pass++ {
+		// Background work yields after a bounded number of walks. Arrivals
+		// during a walk are ordinary churn, not a terminal loss of coverage.
+		// Barriers instead keep draining through their existing deadline.
+		if !barrier && pass == 4 {
+			n.coverage = true
+			return nil
+		}
 		if err := ctx.Err(); err != nil {
 			return n.fail(err)
 		}
@@ -218,7 +225,6 @@ func (n *linuxWatch) step(ctx context.Context, barrier bool) error {
 		}
 		return nil
 	}
-	return n.fail(ErrWatchLimit)
 }
 
 func (n *linuxWatch) openDir(path string) (*os.File, error) {
@@ -257,15 +263,23 @@ func (n *linuxWatch) openDir(path string) (*os.File, error) {
 func (n *linuxWatch) register(path string, info os.FileInfo, fd int) (int, error) {
 	if info.Mode().IsRegular() {
 		stat, ok := info.Sys().(*syscall.Stat_t)
+		if ok && stat.Nlink == 0 {
+			return -1, syscall.ENOENT
+		}
 		if !ok || stat.Nlink != 1 {
 			return -1, ErrWatchStale
 		}
 	}
 	if wd, exists := n.paths[path]; exists {
-		if !os.SameFile(info, n.watches[wd].info) {
+		previous := n.watches[wd].info
+		if os.SameFile(info, previous) {
+			return wd, nil
+		}
+		if info.IsDir() || previous.IsDir() {
 			return -1, ErrWatchStale
 		}
-		return wd, nil
+		// Regular-file replacement is normal. Keep the old watch until the
+		// sweep and its queued IN_IGNORED, while registering the new inode.
 	}
 	if len(n.watches) >= n.registrationCap {
 		return -1, ErrWatchLimit
@@ -286,6 +300,9 @@ func (n *linuxWatch) register(path string, info os.FileInfo, fd int) (int, error
 		if err = syscall.Fstat(fd, &current); err != nil {
 			return -1, err
 		}
+		if current.Nlink == 0 {
+			return -1, syscall.ENOENT
+		}
 		if current.Mode&syscall.S_IFMT != syscall.S_IFREG || current.Nlink != 1 {
 			return -1, ErrWatchStale
 		}
@@ -299,6 +316,9 @@ func (n *linuxWatch) register(path string, info os.FileInfo, fd int) (int, error
 func (n *linuxWatch) entryInfo(dir *os.File, name string) (os.FileInfo, error) {
 	const oPath = 0x200000
 	fd, err := syscall.Openat(int(dir.Fd()), name, oPath|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	if errors.Is(err, syscall.ENOENT) {
+		return nil, nil // the armed parent reports this removal
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -308,6 +328,11 @@ func (n *linuxWatch) entryInfo(dir *os.File, name string) (os.FileInfo, error) {
 	info, err := file.Stat()
 	err = errors.Join(err, file.Close())
 	n.descriptors--
+	if err == nil && info.Mode().IsRegular() {
+		if stat, ok := info.Sys().(*syscall.Stat_t); ok && stat.Nlink == 0 {
+			return nil, nil
+		}
+	}
 	return info, err
 }
 
@@ -364,6 +389,9 @@ func (n *linuxWatch) maintain(ctx context.Context) error {
 					if err != nil {
 						return err
 					}
+					if de == nil {
+						continue
+					}
 					// Symlinks are parent-directory hints only; never follow targets.
 					if de.IsDir() {
 						if strings.Count(child, "/")+1 > n.limits.Depth || len(queue) >= min(n.limits.Queue, n.registrationCap) {
@@ -375,6 +403,9 @@ func (n *linuxWatch) maintain(ctx context.Context) error {
 						// for I/O. O_NOFOLLOW refuses a final symlink replacement.
 						const oPath = 0x200000 // Linux O_PATH (not exported by syscall).
 						fd, e := syscall.Openat(int(f.Fd()), name, oPath|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+						if errors.Is(e, syscall.ENOENT) {
+							continue
+						}
 						if e != nil {
 							return e
 						}
@@ -385,18 +416,26 @@ func (n *linuxWatch) maintain(ctx context.Context) error {
 						fileWD := -1
 						if e == nil {
 							if !held.Mode().IsRegular() || !os.SameFile(held, de) {
-								e = ErrWatchStale
+								// A replacement raced the metadata lookup. Rewalk
+								// without registering an inode under a stale name.
+								n.coverage = true
+								e = syscall.ENOENT
 							} else {
 								fileWD, e = n.register(child, held, fd)
 							}
 						}
 						e = errors.Join(e, file.Close())
 						n.descriptors--
+						if errors.Is(e, syscall.ENOENT) {
+							continue
+						}
 						if e != nil {
 							return e
 						}
 						if prior, ok := seen[fileWD]; ok && prior.path != child {
-							return ErrWatchStale
+							// The singly linked inode moved during this walk.
+							// Parent events retain both names as dirty hints.
+							delete(paths, prior.path)
 						}
 						seen[fileWD], paths[child] = linuxRegistration{child, held}, fileWD
 					}
@@ -411,11 +450,14 @@ func (n *linuxWatch) maintain(ctx context.Context) error {
 			return err
 		}
 	}
-	for wd := range n.watches {
+	for wd, reg := range n.watches {
 		if _, ok := seen[wd]; !ok {
-			if _, err := syscall.InotifyRmWatch(n.fd, uint32(wd)); err != nil {
+			if _, err := syscall.InotifyRmWatch(n.fd, uint32(wd)); err != nil && !errors.Is(err, syscall.EINVAL) {
 				return err
 			}
+			// Events preceding IN_IGNORED still name this watch. Retain its
+			// decoder record, but not its obsolete path-to-watch mapping.
+			seen[wd] = reg
 		}
 	}
 	n.watches, n.paths = seen, paths
@@ -451,7 +493,9 @@ func (n *linuxWatch) decode(data []byte, events *[]WatchEvent, used *int) error 
 		if mask&syscall.IN_IGNORED != 0 {
 			if ok {
 				delete(n.watches, wd)
-				delete(n.paths, reg.path)
+				if n.paths[reg.path] == wd {
+					delete(n.paths, reg.path)
+				}
 			}
 			n.coverage = true
 			*events = append(*events, WatchEvent{Kind: WatchLoss})

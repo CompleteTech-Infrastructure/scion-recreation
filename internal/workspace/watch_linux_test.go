@@ -464,3 +464,166 @@ func TestLinuxNativeRegularArrivalCoverage(t *testing.T) {
 		})
 	}
 }
+
+func TestLinuxNativeCoverageChurn(t *testing.T) {
+	for _, barrier := range []bool{false, true} {
+		t.Run(map[bool]string{false: "background", true: "barrier"}[barrier], func(t *testing.T) {
+			_, n, root, _ := linuxFixture(t)
+			watchOK(t, n.call(context.Background(), func() error {
+				prior := n.observe
+				defer func() { n.observe = prior }()
+				remaining := 6
+				n.observe = func(events []WatchEvent) error {
+					if err := prior(events); err != nil {
+						return err
+					}
+					if remaining > 0 {
+						remaining--
+						return os.WriteFile(filepath.Join(root, "arrival"+string(rune('a'+remaining))), []byte("new"), 0600)
+					}
+					return nil
+				}
+				if err := os.WriteFile(filepath.Join(root, "trigger"), nil, 0600); err != nil {
+					return err
+				}
+				if err := n.step(context.Background(), barrier); err != nil {
+					return err
+				}
+				if n.failed != nil {
+					return n.failed
+				}
+				if !barrier && !n.coverage {
+					return ErrWatchStale
+				}
+				if err := n.step(context.Background(), true); err != nil {
+					return err
+				}
+				for i := 0; i < 6; i++ {
+					if _, ok := n.paths["arrival"+string(rune('a'+i))]; !ok {
+						return ErrWatchStale
+					}
+				}
+				return nil
+			}))
+		})
+	}
+}
+
+func TestLinuxNativeRegularReplacement(t *testing.T) {
+	for _, rotation := range []bool{false, true} {
+		t.Run(map[bool]string{false: "pinned-replacement", true: "rotation"}[rotation], func(t *testing.T) {
+			w, n, root, _ := linuxFixture(t)
+			old, err := os.Open(filepath.Join(root, "sub/file"))
+			watchOK(t, err)
+			defer old.Close()
+			watchFile(t, filepath.Join(root, "sub/other"), "replacement")
+			watchOK(t, n.Barrier(context.Background()))
+			watchOK(t, n.call(context.Background(), func() error {
+				if rotation {
+					if err := os.Rename(filepath.Join(root, "sub/file"), filepath.Join(root, "sub/rotated")); err != nil {
+						return err
+					}
+				}
+				if err := os.Rename(filepath.Join(root, "sub/other"), filepath.Join(root, "sub/file")); err != nil {
+					return err
+				}
+				if err := n.step(context.Background(), true); err != nil {
+					return err
+				}
+				info, err := os.Stat(filepath.Join(root, "sub/file"))
+				if err != nil {
+					return err
+				}
+				wd, ok := n.paths["sub/file"]
+				if !ok || !os.SameFile(info, n.watches[wd].info) {
+					return ErrWatchStale
+				}
+				return nil
+			}))
+			m, _, err := w.Snapshot()
+			watchOK(t, err)
+			want := []string{"sub/file", "sub/other"}
+			if rotation {
+				want = append(want, "sub/rotated")
+			}
+			found := make(map[string]bool)
+			for _, path := range m.DirtyPaths {
+				found[string(path.Bytes())] = true
+			}
+			for _, path := range want {
+				watchCheck(t, found[path], "missing dirty path %s", path)
+			}
+		})
+	}
+}
+
+func TestLinuxNativeVanishedEntry(t *testing.T) {
+	w, n, root, _ := linuxFixture(t)
+	watchOK(t, n.call(context.Background(), func() error {
+		f, err := n.openDir("sub")
+		if err != nil {
+			return err
+		}
+		defer func() { _ = f.Close(); n.descriptors-- }()
+		// Model a name already returned by readdir, then removed before lookup.
+		if err := os.WriteFile(filepath.Join(root, "sub/vanished"), nil, 0600); err != nil {
+			return err
+		}
+		if err := os.Remove(filepath.Join(root, "sub/vanished")); err != nil {
+			return err
+		}
+		info, err := n.entryInfo(f, "vanished")
+		if err != nil {
+			return err
+		}
+		if info != nil {
+			return ErrWatchStale
+		}
+		return nil
+	}))
+	watchOK(t, n.Barrier(context.Background()))
+	m, _, err := w.Snapshot()
+	watchOK(t, err)
+	requirePathBytes(t, m.DirtyPaths, []byte("sub/vanished"))
+}
+
+func TestLinuxNativeUnlinkedPinnedEntry(t *testing.T) {
+	_, n, root, _ := linuxFixture(t)
+	watchOK(t, n.call(context.Background(), func() error {
+		file, err := os.Create(filepath.Join(root, "sub/unlinked"))
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+		before, err := file.Stat()
+		if err != nil {
+			return err
+		}
+		if err := os.Remove(filepath.Join(root, "sub/unlinked")); err != nil {
+			return err
+		}
+		_, err = n.register("sub/unlinked", before, int(file.Fd()))
+		if !os.IsNotExist(err) {
+			return ErrWatchStale
+		}
+		return nil
+	}))
+	watchOK(t, n.Barrier(context.Background()))
+}
+
+func TestLinuxNativeSweepAlreadyRemoved(t *testing.T) {
+	w, n, root, _ := linuxFixture(t)
+	watchOK(t, n.call(context.Background(), func() error {
+		if err := os.Remove(filepath.Join(root, "sub/file")); err != nil {
+			return err
+		}
+		// Deliberately sweep before draining the kernel's queued IN_IGNORED.
+		if err := n.maintain(context.Background()); err != nil {
+			return err
+		}
+		return n.step(context.Background(), true)
+	}))
+	m, _, err := w.Snapshot()
+	watchOK(t, err)
+	requirePathBytes(t, m.DirtyPaths, []byte("sub/file"))
+}
