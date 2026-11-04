@@ -244,6 +244,156 @@ func TestTreePageContextRejectsMalformedPrefixes(t *testing.T) {
 	}
 }
 
+type treeContextTestFrame struct {
+	frame []byte
+	id    TreePageID
+}
+
+// Encode only the documented frame format. Contextual validity is deliberately
+// left to each case; syntax validity and the complete-frame digest are checked
+// here so a malformed frame cannot mask the contextual condition under test.
+func makeTreeContextTestFrame(t *testing.T, label []byte, tag byte, target []byte, children ...TreePageChild) treeContextTestFrame {
+	t.Helper()
+	payload := binary.BigEndian.AppendUint16(nil, uint16(len(label)))
+	payload = append(payload, label...)
+	payload = append(payload, tag)
+	payload = append(payload, target...)
+	payload = binary.BigEndian.AppendUint16(payload, uint16(len(children)))
+	for _, child := range children {
+		payload = append(payload, child.Edge)
+		encoded, err := child.ID.MarshalBinary()
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload = append(payload, encoded...)
+	}
+	frame := append([]byte("CANOPY\x00TREE\x00\x00\x01\x01"), binary.BigEndian.AppendUint32(nil, uint32(len(payload)))...)
+	frame = append(frame, payload...)
+	digest := sha256.Sum256(frame)
+	rawID := append([]byte("CTP\x00\x00\x01\x01"), digest[:]...)
+	id, err := ParseTreePageID(rawID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeUnlinkedTreePage(frame, id); err != nil {
+		t.Fatalf("context fixture must pass syntax and digest validation: %v", err)
+	}
+	return treeContextTestFrame{frame, id}
+}
+
+func TestTreePageContextIsolatedBoundaries(t *testing.T) {
+	// Reuse an actual corpus Blob TID. The child frame is nonempty and valid at
+	// a directory root; these tests do not claim to perform graph traversal.
+	pages, _, _ := treeFixture(t)
+	var blob []byte
+	for _, row := range pages {
+		id, err := ParseTreePageID(treeHex(t, row.IDHex))
+		if err != nil {
+			t.Fatal(err)
+		}
+		p, err := DecodeUnlinkedTreePage(treeHex(t, row.FrameHex), id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.Tag == 1 {
+			blob, err = p.Blob.TypedID().MarshalBinary()
+			if err != nil {
+				t.Fatal(err)
+			}
+			break
+		}
+	}
+	if blob == nil {
+		t.Fatal("missing regular-file corpus target")
+	}
+	nonempty := makeTreeContextTestFrame(t, []byte("z"), 1, blob)
+	if _, err := DecodeTreePageAt(nonempty.frame, nonempty.id, nil, nil); err != nil {
+		t.Fatalf("nonempty reference control: %v", err)
+	}
+	empty := makeTreeContextTestFrame(t, nil, 0, nil)
+	child := TreePageChild{Edge: 'b', ID: nonempty.id}
+	fullLabel := bytes.Repeat([]byte{'x'}, 255)
+	maximalUnary := makeTreeContextTestFrame(t, fullLabel, 0, nil, child)
+	shortUnary := makeTreeContextTestFrame(t, nil, 0, nil, child)
+	oneByteUnary := makeTreeContextTestFrame(t, []byte("x"), 0, nil, child)
+	emptyContinuation := makeTreeContextTestFrame(t, fullLabel, 0, nil, TreePageChild{Edge: 'b', ID: empty.id})
+	emptyTerminal := makeTreeContextTestFrame(t, nil, 1, blob)
+	dotTerminal := makeTreeContextTestFrame(t, []byte("."), 1, blob)
+	aTerminal := makeTreeContextTestFrame(t, []byte("a"), 1, blob)
+	branch := makeTreeContextTestFrame(t, nil, 0, nil, child, TreePageChild{Edge: 'c', ID: nonempty.id})
+	directoryID, err := nonempty.id.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := makeTreeContextTestFrame(t, nil, 4, directoryID)
+	dotDirectory := makeTreeContextTestFrame(t, []byte("."), 4, directoryID)
+	namedDirectory := makeTreeContextTestFrame(t, []byte("x"), 4, directoryID)
+	cleanPrefix := bytes.Repeat([]byte{'a'}, 256)
+	slashPrefix := append([]byte(nil), cleanPrefix...)
+	slashPrefix[128] = '/'
+	nulPrefix := append([]byte(nil), cleanPrefix...)
+	nulPrefix[128] = 0
+
+	for _, tc := range []struct {
+		name                 string
+		page                 treeContextTestFrame
+		directory, component []byte
+		reject               bool
+	}{
+		// At offset 254, only one label byte remains before the next anchor.
+		{"short-unary-nonempty-child", shortUnary, nil, bytes.Repeat([]byte{'a'}, 254), true},
+		{"maximal-unary-at-offset-254", oneByteUnary, nil, bytes.Repeat([]byte{'a'}, 254), false},
+		{"empty-continuation-after-maximal-label", emptyContinuation, nil, nil, true},
+		{"nonempty-continuation-after-maximal-label", maximalUnary, nil, nil, false},
+		// All three prefixes have identical length/anchor allowance. Only the
+		// forbidden component byte differs; the label cannot mask rejection.
+		{"clean-prefix-at-offset-256", maximalUnary, nil, cleanPrefix, false},
+		{"slash-prefix-at-offset-256", maximalUnary, nil, slashPrefix, true},
+		{"nul-prefix-at-offset-256", maximalUnary, nil, nulPrefix, true},
+		{"empty-component-terminal", emptyTerminal, nil, nil, true},
+		{"nonempty-component-empty-label-terminal", emptyTerminal, nil, []byte("a"), false},
+		// A radix edge can consume the dots before this terminal page. Check
+		// the reconstructed component for both files and directory targets.
+		{"dot-prefix-file-terminal", emptyTerminal, nil, []byte("."), true},
+		{"dotdot-prefix-file-terminal", emptyTerminal, nil, []byte(".."), true},
+		{"split-dotdot-file-terminal", dotTerminal, nil, []byte("."), true},
+		{"three-dot-prefix-file-terminal", emptyTerminal, nil, []byte("..."), false},
+		{"dot-a-prefix-file-terminal", emptyTerminal, nil, []byte(".a"), false},
+		{"split-dot-a-file-terminal", aTerminal, nil, []byte("."), false},
+		{"dot-prefix-directory-terminal", directory, nil, []byte("."), true},
+		{"dotdot-prefix-directory-terminal", directory, nil, []byte(".."), true},
+		{"split-dotdot-directory-terminal", dotDirectory, nil, []byte("."), true},
+		{"dot-a-prefix-directory-terminal", directory, nil, []byte(".a"), false},
+		{"empty-repository-root", empty, nil, nil, false},
+		{"empty-nonroot-directory", empty, []byte("a"), nil, true},
+		// A continuation edge itself consumes a byte. The two-child frame
+		// avoids unary compression, so the edge-space guard is decisive.
+		{"component-edge-fits-last-byte", branch, nil, bytes.Repeat([]byte{'a'}, 65534), false},
+		{"component-edge-overflows", branch, nil, bytes.Repeat([]byte{'a'}, 65535), true},
+		{"path-edge-fits-last-byte", branch, []byte("a"), bytes.Repeat([]byte{'a'}, 65532), false},
+		{"path-edge-overflows", branch, []byte("a"), bytes.Repeat([]byte{'a'}, 65533), true},
+		// 1,022 parents leave room for the directory component and one child;
+		// 1,023 parents cannot represent any descendant of that directory.
+		{"directory-depth-leaves-one-child", namedDirectory, []byte(strings.Repeat("a/", 1021) + "a"), nil, false},
+		{"directory-depth-no-child-room", namedDirectory, []byte(strings.Repeat("a/", 1022) + "a"), nil, true},
+		// The parent contributes "a/". A directory also needs "/" and at
+		// least one child byte: total 65,535 fits, total 65,536 does not.
+		{"directory-path-fits-slash-and-child", directory, []byte("a"), bytes.Repeat([]byte{'a'}, 65531), false},
+		{"directory-path-no-child-room", directory, []byte("a"), bytes.Repeat([]byte{'a'}, 65532), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := DecodeTreePageAt(tc.page.frame, tc.page.id, tc.directory, tc.component)
+			if tc.reject {
+				if err != ErrTreePage {
+					t.Fatalf("wanted contextual rejection, got %v", err)
+				}
+			} else if err != nil {
+				t.Fatalf("boundary control rejected: %v", err)
+			}
+		})
+	}
+}
+
 func TestTreePageEncoderRejectsInactiveTargetsAndInvalidShapes(t *testing.T) {
 	pages, _, _ := treeFixture(t)
 	var page UnlinkedTreePage
@@ -1043,4 +1193,399 @@ func TestReadTreeEntriesDiscardsLeafBeforeMissingReferent(t *testing.T) {
 	// Visits/terminal usage confirms the failure is after a collected leaf.
 	rows, used, err := ReadTreeEntries(context.Background(), root, map[TreePageID][]byte{root: frame, leafID: leaf}, TreeEntriesBudget{graphTestBudget(), 2, 8})
 	if err != ErrTreePageMissing || rows != nil || used.Visits != 3 || used.Terminals != 1 { t.Fatalf("late missing referent leaked rows: %+v %v", used, err) }
+}
+
+func TestLookupTreeLeafLiteralPaths(t *testing.T) {
+	b, err := os.ReadFile("../../tests/fixtures/tree_pages_v1.json"); if err != nil { t.Fatal(err) }
+	var f struct {
+		Pages []treeLiteral `json:"pages"`
+		Positive []struct {
+			Name string `json:"name"`; Root string `json:"root_id_hex"`
+			Entries []struct { Path string `json:"path_hex"`; Mode string `json:"mode"`; Payload string `json:"blob_payload_hex"` } `json:"entries"`
+		} `json:"positive_vectors"`
+	}
+	if err := json.Unmarshal(b, &f); err != nil { t.Fatal(err) }
+	if len(f.Positive) != 15 { t.Fatal("lookup fixture coverage changed") }
+	frames := make(map[TreePageID][]byte)
+	for _, p := range f.Pages {
+		id, err := ParseTreePageID(treeHex(t, p.IDHex)); if err != nil { t.Fatal(err) }
+		frames[id] = treeHex(t, p.FrameHex)
+	}
+	budget := TreeLookupBudget{4096, 4096*MaxTreePageBytes}
+	for _, c := range f.Positive {
+		root, err := ParseTreePageID(treeHex(t, c.Root)); if err != nil { t.Fatal(err) }
+		if len(c.Entries) == 0 {
+			path, _ := model.NewPath([]byte("absent"))
+			if row, used, err := LookupTreeLeaf(context.Background(), root, frames, path, budget); err != ErrTreeLeafAbsent || row != (model.Operation{}) || used.Pages != 1 || used.ReadBytes != 24 { t.Fatal("empty-root lookup") }
+		}
+		for _, e := range c.Entries {
+			path, err := model.NewPath(treeHex(t, e.Path)); if err != nil { t.Fatal(err) }
+			row, used, err := LookupTreeLeaf(context.Background(), root, frames, path, budget)
+			if err != nil || row.Path().Compare(path) != 0 || used.Pages == 0 { t.Fatalf("%s lookup: %v", c.Name, err) }
+			payload := treeHex(t, e.Payload)
+			blob, err := model.HashBlob(context.Background(), uint64(len(payload)), bytes.NewReader(payload)); if err != nil { t.Fatal(err) }
+			var tag model.OperationTag
+			switch e.Mode { case "regular": tag = model.SetRegular; case "executable": tag = model.SetExecutable; case "symlink": tag = model.SetSymlink; default: t.Fatal("unknown mode") }
+			got, ok := row.Target()
+			if !ok || got != blob || row.Tag() != tag { t.Fatal("lookup mode/target mismatch") }
+			if again, exact, err := LookupTreeLeaf(context.Background(), root, frames, path, TreeLookupBudget{used.Pages, used.ReadBytes}); err != nil || again != row || exact != used { t.Fatal("exact lookup budget rejected") }
+			if got, _, err := LookupTreeLeaf(context.Background(), root, frames, path, TreeLookupBudget{used.Pages, used.ReadBytes-1}); err != metadata.ErrResourceExhausted || got != (model.Operation{}) { t.Fatal("lookup byte budget exceeded") }
+		}
+	}
+}
+
+func TestLookupTreeLeafPrivatePathOnlyAndFailures(t *testing.T) {
+	tid, _ := model.NewTypedID(model.BlobKind, [32]byte{1}); blob, _ := model.NewBlobID(tid)
+	leaf, leafID, err := EncodeTreePageAt(UnlinkedTreePage{Label: []byte("x"), Tag: 3, Blob: blob}, nil, []byte("b"))
+	if err != nil { t.Fatal(err) }
+	_, missingID, err := EncodeTreePageAt(UnlinkedTreePage{Label: []byte("y"), Tag: 1, Blob: blob}, nil, []byte("a"))
+	if err != nil { t.Fatal(err) }
+	frame, root, err := EncodeTreePageAt(UnlinkedTreePage{Children: []TreePageChild{{Edge: 'a', ID: missingID}, {Edge: 'b', ID: leafID}}}, nil, nil)
+	if err != nil { t.Fatal(err) }
+	frames := map[TreePageID][]byte{root: frame, leafID: leaf}
+	path, _ := model.NewPath([]byte("bx"))
+	budget := TreeLookupBudget{2, uint64(len(frame)+len(leaf))}
+	row, used, err := LookupTreeLeaf(context.Background(), root, frames, path, budget)
+	// The trusted-base precondition is external: unrelated missing pages are
+	// not fetched, so this success is NOT evidence of complete graph validity.
+	if err != nil || row.Tag() != model.SetSymlink || used.Pages != 2 || used.ReadBytes != budget.ReadBytes { t.Fatal("point lookup traversed unrelated subtree") }
+	if got, _, err := LookupTreeLeaf(context.Background(), root, frames, path, TreeLookupBudget{1, budget.ReadBytes}); err != metadata.ErrResourceExhausted || got != (model.Operation{}) { t.Fatal("lookup page budget exceeded") }
+	missing, _ := model.NewPath([]byte("ay"))
+	if got, _, err := LookupTreeLeaf(context.Background(), root, frames, missing, budget); err != ErrTreePageMissing || got != (model.Operation{}) { t.Fatal("missing page became absent leaf") }
+	for _, name := range []string{"b", "bz", "c", "bx/child"} {
+		p, _ := model.NewPath([]byte(name))
+		if got, _, err := LookupTreeLeaf(context.Background(), root, frames, p, budget); err != ErrTreeLeafAbsent || got != (model.Operation{}) { t.Fatalf("unexpected presence for %s: %v", name, err) }
+	}
+	corrupt := append([]byte(nil), leaf...); corrupt[len(corrupt)-1] ^= 1
+	if got, _, err := LookupTreeLeaf(context.Background(), root, map[TreePageID][]byte{root: frame, leafID: corrupt}, path, budget); err != ErrTreePage || got != (model.Operation{}) { t.Fatal("corrupt lookup admitted") }
+	if got, _, err := LookupTreeLeaf(&treeCancelContext{Context: context.Background()}, root, frames, path, budget); err != context.Canceled || got != (model.Operation{}) { t.Fatal("mid-lookup cancellation lost") }
+	dirPath, _ := model.NewPath([]byte("dir/file"))
+	dirRoot, dirFrames, err := BuildSingleLeafTree(context.Background(), dirPath, 1, blob, TreeBuildBudget{2, 256}); if err != nil { t.Fatal(err) }
+	dir, _ := model.NewPath([]byte("dir"))
+	if got, _, err := LookupTreeLeaf(context.Background(), dirRoot, dirFrames, dir, TreeLookupBudget{2, 256}); err != ErrTreeLeafAbsent || got != (model.Operation{}) { t.Fatal("implicit directory exposed as file") }
+}
+
+type setTestEntry struct {
+	path string
+	tag  byte
+	blob model.BlobID
+}
+
+func setTestBudget() TreeRewriteBudget {
+	return TreeRewriteBudget{4096, 4096 * MaxTreePageBytes, 4096 * MaxTreePageBytes}
+}
+
+func setTestPut(t *testing.T, root TreePageID, frames map[TreePageID][]byte, entry setTestEntry) (TreePageID, map[TreePageID][]byte) {
+	t.Helper()
+	path, err := model.NewPath([]byte(entry.path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, added, err := SetTreeLeaf(context.Background(), root, frames, path, entry.tag, entry.blob, setTestBudget())
+	if err != nil {
+		t.Fatalf("SET %s: %v", entry.path, err)
+	}
+	combined := make(map[TreePageID][]byte)
+	for id, frame := range frames {
+		combined[id] = frame
+	}
+	for id, frame := range added {
+		combined[id] = frame
+	}
+	if _, err := CheckTreePageGraph(context.Background(), next, combined, graphTestBudget()); err != nil {
+		t.Fatalf("SET %s candidate graph: %v", entry.path, err)
+	}
+	return next, combined
+}
+
+func setTestMap(t *testing.T, entries ...setTestEntry) (TreePageID, map[TreePageID][]byte) {
+	t.Helper()
+	empty, root, err := EncodeTreePageAt(UnlinkedTreePage{}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frames := map[TreePageID][]byte{root: empty}
+	for _, entry := range entries {
+		root, frames = setTestPut(t, root, frames, entry)
+	}
+	return root, frames
+}
+
+// Enumerate this small test graph to find a terminal. This is a read-only
+// assertion helper; it does not duplicate SET's search/split/rewrite logic.
+func setTestLeaf(t *testing.T, root TreePageID, frames map[TreePageID][]byte, name string) (TreePageID, UnlinkedTreePage) {
+	t.Helper()
+	type visit struct {
+		id                   TreePageID
+		directory, component []byte
+	}
+	stack := []visit{{id: root}}
+	for count := 0; len(stack) != 0 && count < 100; count++ {
+		v := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		p, err := DecodeTreePageAt(frames[v.id], v.id, v.directory, v.component)
+		if err != nil {
+			t.Fatal(err)
+		}
+		component := append(append([]byte(nil), v.component...), p.Label...)
+		full := append([]byte(nil), v.directory...)
+		if len(full) != 0 {
+			full = append(full, '/')
+		}
+		full = append(full, component...)
+		if p.Tag == 4 {
+			stack = append(stack, visit{id: p.Directory, directory: full})
+		} else if p.Tag != 0 && string(full) == name {
+			return v.id, p
+		}
+		for _, child := range p.Children {
+			prefix := append(append([]byte(nil), component...), child.Edge)
+			stack = append(stack, visit{child.ID, v.directory, prefix})
+		}
+	}
+	t.Fatalf("terminal %q absent from bounded test graph", name)
+	return TreePageID{}, UnlinkedTreePage{}
+}
+
+func TestSetTreeLeafExistingDirectoryUpdates(t *testing.T) {
+	tid, _ := model.NewTypedID(model.BlobKind, [32]byte{1})
+	blob, _ := model.NewBlobID(tid)
+	for _, directory := range []string{"dir/", "dir/sub/"} {
+		t.Run(directory, func(t *testing.T) {
+			a := setTestEntry{directory + "a", 1, blob}
+			b := setTestEntry{directory + "b", 1, blob}
+			c := setTestEntry{directory + "c", 1, blob}
+			base, frames := setTestMap(t, a)
+			next, frames := setTestPut(t, base, frames, b)
+			opposite, _ := setTestMap(t, b, a)
+			if next == base || next != opposite {
+				t.Fatal("changing SET below a directory lost an entry or changed canonical shape")
+			}
+			aID, oldA := setTestLeaf(t, next, frames, a.path)
+			if oldA.Tag != 1 || oldA.Blob != blob {
+				t.Fatal("existing directory sibling changed")
+			}
+			// With a branch established, inserting c can retain a's exact page.
+			last, combined := setTestPut(t, next, frames, c)
+			retained, _ := setTestLeaf(t, last, combined, a.path)
+			reverse, _ := setTestMap(t, c, b, a)
+			if last == next || last != reverse || retained != aID {
+				t.Fatal("directory rewrite lost canonical identity or rewrote an unrelated sibling")
+			}
+		})
+	}
+}
+
+func TestSetTreeLeafChangesExistingValueAndRestoresRoot(t *testing.T) {
+	oldTID, _ := model.NewTypedID(model.BlobKind, [32]byte{1})
+	oldBlob, _ := model.NewBlobID(oldTID)
+	newTID, _ := model.NewTypedID(model.BlobKind, [32]byte{2})
+	newBlob, _ := model.NewBlobID(newTID)
+	for _, prefix := range []string{"", "dir/sub/"} {
+		for _, change := range []struct {
+			name string
+			tag  byte
+			blob model.BlobID
+		}{{"tag", 2, oldBlob}, {"blob", 1, newBlob}} {
+			t.Run(prefix+change.name, func(t *testing.T) {
+				original := setTestEntry{prefix + "x", 1, oldBlob}
+				sibling := setTestEntry{prefix + "z", 1, oldBlob}
+				base, frames := setTestMap(t, original, sibling)
+				siblingID, _ := setTestLeaf(t, base, frames, sibling.path)
+				next, combined := setTestPut(t, base, frames, setTestEntry{original.path, change.tag, change.blob})
+				_, actual := setTestLeaf(t, next, combined, original.path)
+				retained, _ := setTestLeaf(t, next, combined, sibling.path)
+				if next == base || actual.Tag != change.tag || actual.Blob != change.blob || retained != siblingID {
+					t.Fatal("existing-file SET dropped the new value or changed a sibling")
+				}
+				restored, _ := setTestPut(t, next, combined, original)
+				if restored != base {
+					t.Fatal("restoring the original map did not restore its canonical root")
+				}
+			})
+		}
+	}
+}
+
+func TestSetTreeLeafComponentBoundarySplit(t *testing.T) {
+	tid, _ := model.NewTypedID(model.BlobKind, [32]byte{1})
+	blob, _ := model.NewBlobID(tid)
+	base, frames := setTestMap(t, setTestEntry{"abc", 1, blob})
+	next, combined := setTestPut(t, base, frames, setTestEntry{"a/x", 1, blob})
+	opposite, _ := setTestMap(t, setTestEntry{"a/x", 1, blob}, setTestEntry{"abc", 1, blob})
+	// The canonical map is a root labelled a with both directory terminal x
+	// and continuation edge b -> c. Encode that concrete expected shape.
+	_, xID, err := EncodeTreePageAt(UnlinkedTreePage{Label: []byte("x"), Tag: 1, Blob: blob}, []byte("a"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, cID, err := EncodeTreePageAt(UnlinkedTreePage{Label: []byte("c"), Tag: 1, Blob: blob}, nil, []byte("ab"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, expected, err := EncodeTreePageAt(UnlinkedTreePage{Label: []byte("a"), Tag: 4, Directory: xID, Children: []TreePageChild{{'b', cID}}}, nil, nil)
+	if err != nil || next != expected || next != opposite {
+		t.Fatalf("component-boundary split differs from exact canonical map: %v", err)
+	}
+	setTestLeaf(t, next, combined, "abc")
+	setTestLeaf(t, next, combined, "a/x")
+}
+
+func TestSetTreeLeafCorruptionMissingAndTraversalAdmission(t *testing.T) {
+	oldTID, _ := model.NewTypedID(model.BlobKind, [32]byte{1})
+	oldBlob, _ := model.NewBlobID(oldTID)
+	newTID, _ := model.NewTypedID(model.BlobKind, [32]byte{2})
+	newBlob, _ := model.NewBlobID(newTID)
+	entry := setTestEntry{"dir/file", 1, oldBlob}
+	base, frames := setTestMap(t, entry)
+	path, _ := model.NewPath([]byte(entry.path))
+	next, candidates, err := SetTreeLeaf(context.Background(), base, frames, path, 2, newBlob, setTestBudget())
+	if err != nil || next == base || len(candidates[next]) == 0 {
+		t.Fatalf("candidate precondition: %v", err)
+	}
+	for _, sameLength := range []bool{true, false} {
+		t.Run(map[bool]string{true: "same-length-occupied", false: "different-length-occupied"}[sameLength], func(t *testing.T) {
+			occupied := make(map[TreePageID][]byte)
+			for id, frame := range frames {
+				occupied[id] = frame
+			}
+			corrupt := append([]byte(nil), candidates[next]...)
+			if sameLength {
+				corrupt[len(corrupt)-1] ^= 1
+			} else {
+				corrupt = append(corrupt, 0)
+			}
+			occupied[next] = corrupt
+			snapshot := append([]byte(nil), corrupt...)
+			id, output, err := SetTreeLeaf(context.Background(), base, occupied, path, 2, newBlob, setTestBudget())
+			if err != ErrTreePage || id != (TreePageID{}) || output != nil || !bytes.Equal(occupied[next], snapshot) {
+				t.Fatalf("corrupt occupied ID accepted or changed: %v", err)
+			}
+		})
+	}
+	leafID, _ := setTestLeaf(t, base, frames, entry.path)
+	missing := make(map[TreePageID][]byte)
+	for id, frame := range frames {
+		if id != leafID {
+			missing[id] = frame
+		}
+	}
+	if id, output, err := SetTreeLeaf(context.Background(), base, missing, path, 2, newBlob, setTestBudget()); err != ErrTreePageMissing || id != (TreePageID{}) || output != nil {
+		t.Fatalf("missing path page: %v", err)
+	}
+	// An identical SET performs no writes. This limit can therefore fail only
+	// while traversing the two existing pages, not at the production cap.
+	limit := setTestBudget()
+	limit.Pages = 1
+	if id, output, err := SetTreeLeaf(context.Background(), base, frames, path, 1, oldBlob, limit); err != metadata.ErrResourceExhausted || id != (TreePageID{}) || output != nil {
+		t.Fatalf("traversal page cap: %v", err)
+	}
+}
+
+func TestReplaceExistingTreeLeafSecondChildAndOccupiedBytes(t *testing.T) {
+	oldTID, err := model.NewTypedID(model.BlobKind, [32]byte{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldBlob, err := model.NewBlobID(oldTID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newTID, err := model.NewTypedID(model.BlobKind, [32]byte{2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	newBlob, err := model.NewBlobID(newTID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, leafID, err := EncodeTreePageAt(UnlinkedTreePage{Tag: 1, Blob: oldBlob}, nil, []byte("z"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootFrame, root, err := EncodeTreePageAt(UnlinkedTreePage{
+		Children: []TreePageChild{{'a', leafID}, {'z', leafID}},
+	}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frames := map[TreePageID][]byte{root: rootFrame, leafID: leaf}
+	if _, err := CheckTreePageGraph(context.Background(), root, frames, graphTestBudget()); err != nil {
+		t.Fatalf("base graph: %v", err)
+	}
+	path, err := model.NewPath([]byte("z"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pathBytes := uint64(len(rootFrame) + len(leaf))
+	budget := TreeRewriteBudget{Pages: 2, ReadBytes: pathBytes, WriteBytes: pathBytes}
+	next, added, err := ReplaceExistingTreeLeaf(context.Background(), root, frames, path, 2, newBlob, budget)
+	if err != nil || next == root || len(added) != 2 {
+		t.Fatalf("second-child replacement: root=%v frames=%d err=%v", next, len(added), err)
+	}
+	combined := make(map[TreePageID][]byte)
+	for id, frame := range frames {
+		combined[id] = frame
+	}
+	for id, frame := range added {
+		combined[id] = frame
+	}
+	page, err := DecodeTreePageAt(combined[next], next, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Children) != 2 || page.Children[0].Edge != 'a' || page.Children[0].ID != leafID ||
+		page.Children[1].Edge != 'z' || page.Children[1].ID == leafID {
+		t.Fatalf("wrong child rewritten or sibling lost: %+v", page.Children)
+	}
+	replaced, err := DecodeTreePageAt(combined[page.Children[1].ID], page.Children[1].ID, nil, []byte("z"))
+	if err != nil || replaced.Tag != 2 || replaced.Blob != newBlob {
+		t.Fatalf("second-child terminal: tag=%d blob=%v err=%v", replaced.Tag, replaced.Blob, err)
+	}
+	if _, err := CheckTreePageGraph(context.Background(), next, combined, graphTestBudget()); err != nil {
+		t.Fatalf("candidate graph: %v", err)
+	}
+
+	// Occupy only the new root ID, so the additional read is exactly its
+	// candidate frame. The new leaf is still produced by the rewrite.
+	comparisonBudget := budget
+	comparisonBudget.ReadBytes += uint64(len(added[next]))
+	for _, tc := range []struct {
+		name    string
+		corrupt bool
+		short   bool
+		want    error
+	}{
+		{"identical-at-exact-budget", false, false, nil},
+		{"equal-length-corruption-at-exact-budget", true, false, ErrTreePage},
+		{"admission-before-corrupt-byte-comparison", true, true, metadata.ErrResourceExhausted},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			occupied := make(map[TreePageID][]byte)
+			for id, frame := range frames {
+				occupied[id] = frame
+			}
+			candidate := append([]byte(nil), added[next]...)
+			if tc.corrupt {
+				candidate[len(candidate)-1] ^= 1
+			}
+			occupied[next] = candidate
+			expectedOccupied := append([]byte(nil), candidate...)
+			limit := comparisonBudget
+			if tc.short {
+				limit.ReadBytes--
+			}
+			got, output, err := ReplaceExistingTreeLeaf(context.Background(), root, occupied, path, 2, newBlob, limit)
+			if tc.want != nil {
+				if err != tc.want || got != (TreePageID{}) || output != nil {
+					t.Fatalf("wanted %v and no output, got root=%v frames=%d err=%v", tc.want, got, len(output), err)
+				}
+			} else if err != nil || got != next || len(output) != 1 {
+				t.Fatalf("exact occupied comparison: root=%v frames=%d err=%v", got, len(output), err)
+			}
+			if !bytes.Equal(occupied[next], expectedOccupied) {
+				t.Fatal("occupied bytes were overwritten")
+			}
+		})
+	}
 }

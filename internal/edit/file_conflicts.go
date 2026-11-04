@@ -1,0 +1,463 @@
+package edit
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"strings"
+
+	"canopy.local/canopy/internal/model"
+)
+
+var (
+	ErrFileState  = errors.New("invalid file conflict state")
+	ErrFileBudget = errors.New("file conflict byte budget exhausted")
+)
+
+// FileVersion is an immutable, explicitly absent or present file. Its zero
+// value is invalid, not deletion. It models control-v1 ConflictSide locally;
+// it is not a wire decoder, a verified blob or an authorization assertion.
+// Binary bytes and symlink target bytes are opaque; no normalization occurs.
+type FileVersion struct {
+	state   uint8
+	mode    model.OperationTag
+	content string
+}
+
+func AbsentFile() FileVersion { return FileVersion{state: 1} }
+
+// PresentFile owns a copy of content. A nonnil empty slice explicitly represents
+// an empty file; nil is missing required content. The caller admits memory
+// before constructing values; this helper additionally caps each file at 64 MiB.
+func PresentFile(mode model.OperationTag, content []byte) (FileVersion, error) {
+	if mode < model.SetRegular || mode > model.SetSymlink || content == nil {
+		return FileVersion{}, ErrFileState
+	}
+	if uint64(len(content)) > 64<<20 {
+		return FileVersion{}, ErrFileBudget
+	}
+	return FileVersion{state: 2, mode: mode, content: string(content)}, nil
+}
+
+func (v FileVersion) Validate() error {
+	if v.state == 1 && v.mode == model.Delete && v.content == "" {
+		return nil
+	}
+	if v.state == 2 && v.mode >= model.SetRegular && v.mode <= model.SetSymlink && uint64(len(v.content)) <= 64<<20 {
+		return nil
+	}
+	return ErrFileState
+}
+
+// Content returns a caller-owned copy for present files, including present-empty.
+// Invalid and absent values return false; callers must Validate to distinguish.
+func (v FileVersion) Content() ([]byte, bool) {
+	if v.Validate() != nil || v.state != 2 {
+		return nil, false
+	}
+	return append([]byte{}, v.content...), true
+}
+func (v FileVersion) Mode() (model.OperationTag, bool) {
+	return v.mode, v.Validate() == nil && v.state == 2
+}
+func (v FileVersion) IsAbsent() bool { return v.Validate() == nil && v.state == 1 }
+
+// FileConflict preserves all exact input states. It contains no path, diagnostic
+// payload or authority claim. Service code must authorize every side and linked
+// identity before serializing it; this local value must never bypass filtering.
+type FileConflict struct {
+	Base, Left, Right FileVersion
+}
+
+// MergeFileVersions resolves only provably identical/unchanged whole-file cases.
+// Different concurrent byte/type/mode edits return an explicit conflict and the
+// invalid zero result. This includes delete/modify, distinct additions, binary
+// and symlink changes. Mode and bytes are considered together: a mode change on
+// one side plus content change on the other is conservatively a conflict here.
+// It does NOT run text merge, choose a base, resolve a conflict, authorize output,
+// emit a canonical operation, or publish. Partial EDT-02 only; #97/service wiring
+// remains separate. maxBytes admits the sum of all three content lengths, capped
+// at 64 MiB; zero admits only empty/absent states. Returned values are immutable.
+func MergeFileVersions(ctx context.Context, base, left, right FileVersion, maxBytes uint64) (FileVersion, *FileConflict, error) {
+	if ctx == nil {
+		return FileVersion{}, nil, ErrFileState
+	}
+	if err := ctx.Err(); err != nil {
+		return FileVersion{}, nil, err
+	}
+	if maxBytes > 64<<20 {
+		return FileVersion{}, nil, ErrFileBudget
+	}
+	var used uint64
+	for _, v := range []FileVersion{base, left, right} {
+		if err := v.Validate(); err != nil {
+			return FileVersion{}, nil, err
+		}
+		if uint64(len(v.content)) > maxBytes-used {
+			return FileVersion{}, nil, ErrFileBudget
+		}
+		used += uint64(len(v.content))
+	}
+	var result FileVersion
+	switch {
+	case left == right:
+		result = left
+	case left == base:
+		result = right
+	case right == base:
+		result = left
+	}
+	if err := ctx.Err(); err != nil {
+		return FileVersion{}, nil, err
+	}
+	if result.Validate() != nil {
+		return FileVersion{}, &FileConflict{base, left, right}, nil
+	}
+	return result, nil, nil
+}
+
+// MergeTextFileVersions composes file-state handling with bounded text merging.
+// Callers explicitly select this operation for text: NUL rejection is only a
+// guard, not a comprehensive classifier. Use MergeFileVersions for opaque binary
+// and symlink data. This is not authorization, base selection or publication.
+//
+// Identical/unchanged whole-file cases resolve first without parsing content.
+// Competing edits merge as text only when ALL three states are present regular
+// or executable files. Delete/modify, distinct additions and symlink/type cases
+// retain exact structured conflicts. Modes use ordinary three-way equality:
+// equal side modes win; otherwise the side different from base wins. An
+// unresolved mode or text overlap keeps all three exact FileConflict states.
+// Byte admission always applies; line/cell/hunk work limits are consumed only
+// when text analysis runs. Bytes is not a peak-memory ceiling. Byte admission
+// failures return ErrFileBudget; invalid text limits or exhausted text work
+// return ErrTextLimit. No result escapes on error.
+func MergeTextFileVersions(ctx context.Context, base, left, right FileVersion, budget ThreeWayTextBudget) (FileVersion, *FileConflict, error) {
+	if ctx == nil { return FileVersion{}, nil, ErrFileState }
+	if err := ctx.Err(); err != nil { return FileVersion{}, nil, err }
+	if budget.Bytes == 0 || budget.Bytes > 64<<20 || budget.Lines == 0 || budget.Lines > 1000000 || budget.Cells == 0 || budget.Cells > 4000000 || budget.Hunks == 0 || budget.Hunks > 1000000 {
+		return FileVersion{}, nil, ErrTextLimit
+	}
+	resolved, conflict, err := MergeFileVersions(ctx, base, left, right, budget.Bytes)
+	if err != nil || conflict == nil { return resolved, conflict, err }
+	for _, v := range []FileVersion{base, left, right} {
+		if v.state != 2 || (v.mode != model.SetRegular && v.mode != model.SetExecutable) {
+			return FileVersion{}, conflict, nil
+		}
+	}
+	var mode model.OperationTag
+	switch {
+	case left.mode == right.mode:
+		mode = left.mode
+	case left.mode == base.mode:
+		mode = right.mode
+	case right.mode == base.mode:
+		mode = left.mode
+	default:
+		return FileVersion{}, conflict, nil
+	}
+	// Combined byte admission already succeeded above. Conversions own local
+	// bounded copies; returned content is independently owned by PresentFile.
+	content, overlap, err := MergeText(ctx, []byte(base.content), []byte(left.content), []byte(right.content), budget)
+	if err != nil { return FileVersion{}, nil, err }
+	if overlap != nil { return FileVersion{}, conflict, nil }
+	resolved, err = PresentFile(mode, content)
+	if err != nil { return FileVersion{}, nil, err }
+	if err := ctx.Err(); err != nil { return FileVersion{}, nil, err }
+	return resolved, nil, nil
+}
+
+// CanonicalFileSide is a private input descriptor, not a trusted file state.
+// Present=false requires zero Mode/ID and nil Frame. Present=true requires a
+// regular/executable/symlink mode, typed blob ID and complete canonical frame.
+// Present-empty has a verified empty blob frame, never an absent descriptor.
+// Mode and presence are NOT authenticated by a blob digest: callers must bind
+// these descriptors to the correct authorized tree/source independently.
+type CanonicalFileSide struct {
+	Present bool
+	Mode model.OperationTag
+	ID model.BlobID
+	Frame []byte
+}
+
+// MergeCanonicalFileVersions verifies every present side before applying the
+// opaque whole-file equality rules of MergeFileVersions. Sides are ordered base,
+// left, right. Matching IDs never skip validation. Binary and symlink payloads
+// remain opaque; concurrent changes yield exact FileConflict states, not text
+// merging or arbitrary winners. This does not authorize, choose a base, fetch
+// blobs, decode envelopes, establish retention or publish anything.
+//
+// maxBytes admits combined decoded payloads, capped at 64 MiB; zero allows only
+// absent/empty content. Canonical headers are excluded. Owned staging and file
+// copies are bounded but this is not a peak-memory ceiling. Frames must not
+// mutate during the call. Any verification error yields zero result/no conflict.
+func MergeCanonicalFileVersions(ctx context.Context, sides [3]CanonicalFileSide, maxBytes uint64) (FileVersion, *FileConflict, error) {
+	versions, err := verifyCanonicalFileSides(ctx, sides, maxBytes)
+	if err != nil { return FileVersion{}, nil, err }
+	return MergeFileVersions(ctx, versions[0], versions[1], versions[2], maxBytes)
+}
+
+// MergeCanonicalTextFileVersions verifies every present canonical blob before
+// applying MergeTextFileVersions, including its whole-file equality fast paths.
+// Callers explicitly choose text processing: only concurrent present regular/
+// executable edits enter text analysis; delete/modify, additions and symlink/
+// type cases keep existing exact conflicts. NUL rejection is not a classifier;
+// opaque equality fast paths intentionally preserve binary and symlink bytes.
+//
+// Descriptor presence/mode, source/tree binding, correct base and authorization
+// remain caller prerequisites, as for CanonicalFileSide. No output is published.
+// Bytes admits combined decoded payloads, excluding headers, and bounds text
+// output separately. Copying/staging is bounded but not a peak-memory guarantee.
+// All budgets must be valid before decoding; work limits are charged only when
+// text analysis runs. Errors return zero result/no conflict, never unverified
+// content. Inputs must not mutate during the call.
+func MergeCanonicalTextFileVersions(ctx context.Context, sides [3]CanonicalFileSide, budget ThreeWayTextBudget) (FileVersion, *FileConflict, error) {
+	if ctx == nil { return FileVersion{}, nil, ErrFileState }
+	if err := ctx.Err(); err != nil { return FileVersion{}, nil, err }
+	if budget.Bytes == 0 || budget.Bytes > 64<<20 || budget.Lines == 0 || budget.Lines > 1000000 || budget.Cells == 0 || budget.Cells > 4000000 || budget.Hunks == 0 || budget.Hunks > 1000000 {
+		return FileVersion{}, nil, ErrTextLimit
+	}
+	versions, err := verifyCanonicalFileSides(ctx, sides, budget.Bytes)
+	if err != nil { return FileVersion{}, nil, err }
+	return MergeTextFileVersions(ctx, versions[0], versions[1], versions[2], budget)
+}
+
+// Shared verification must finish before either merge path can expose states.
+func verifyCanonicalFileSides(ctx context.Context, sides [3]CanonicalFileSide, maxBytes uint64) ([3]FileVersion, error) {
+	if ctx == nil { return [3]FileVersion{}, ErrFileState }
+	if err := ctx.Err(); err != nil { return [3]FileVersion{}, err }
+	if maxBytes > 64<<20 { return [3]FileVersion{}, ErrFileBudget }
+	frameAllowance := maxBytes
+	for _, side := range sides {
+		if !side.Present {
+			if side.Mode != model.Delete || side.ID != (model.BlobID{}) || side.Frame != nil { return [3]FileVersion{}, ErrFileState }
+			continue
+		}
+		if side.Mode < model.SetRegular || side.Mode > model.SetSymlink || side.ID.Validate() != nil { return [3]FileVersion{}, ErrFileState }
+		frameAllowance += 22
+	}
+	for _, side := range sides {
+		if uint64(len(side.Frame)) > frameAllowance { return [3]FileVersion{}, ErrFileBudget }
+		frameAllowance -= uint64(len(side.Frame))
+	}
+	versions := [3]FileVersion{AbsentFile(), AbsentFile(), AbsentFile()}
+	remaining := maxBytes
+	for i, side := range sides {
+		if !side.Present { continue }
+		var content bytes.Buffer
+		n, err := model.DecodeBlob(ctx, bytes.NewReader(side.Frame), side.ID, &content, remaining)
+		if err != nil { return [3]FileVersion{}, err }
+		remaining -= n
+		payload := content.Bytes()
+		if payload == nil { payload = []byte{} }
+		versions[i], err = PresentFile(side.Mode, payload)
+		if err != nil { return [3]FileVersion{}, err }
+	}
+	return versions, nil
+}
+
+// PreparedFileOperation is PRIVATE candidate content, not a durable upload,
+// authorized operation, published changeset or conflict-resolution receipt.
+// DELETE has nil BlobFrame; SET has a complete canonical frame whose identity
+// equals Operation.Target, including present-empty. BlobFrame is caller-owned.
+type PreparedFileOperation struct {
+	Operation model.Operation
+	BlobFrame []byte
+}
+
+// PrepareFileOperation encodes one explicitly resolved file state at an exact
+// canonical path. Absence becomes DELETE; present mode and bytes become SET
+// plus a newly hashed canonical blob frame. It does not infer whether the path
+// changed, select/resolve conflicts or verify that this state came from a merge.
+// The caller must validate the whole changeset/tree, authorize every input and
+// output, durably upload bytes, obtain receipts and publish separately.
+//
+// maxPayload caps decoded content (0..64 MiB); zero admits absent/empty states.
+// A present frame adds 22 bytes of canonical header. Hashing and encoding make
+// two bounded streaming passes over immutable content. Output allocation is not
+// a reservation/RSS guarantee. Errors return no operation or frame.
+func PrepareFileOperation(ctx context.Context, path model.Path, version FileVersion, maxPayload uint64) (PreparedFileOperation, error) {
+	var zero PreparedFileOperation
+	if ctx == nil { return zero, ErrFileState }
+	if err := ctx.Err(); err != nil { return zero, err }
+	if path.Validate() != nil || version.Validate() != nil { return zero, ErrFileState }
+	if maxPayload > 64<<20 || uint64(len(version.content)) > maxPayload { return zero, ErrFileBudget }
+	if version.IsAbsent() {
+		op, err := model.NewOperation(path, model.Delete, nil)
+		if err != nil { return zero, err }
+		if err := ctx.Err(); err != nil { return zero, err }
+		return PreparedFileOperation{Operation: op}, nil
+	}
+	length := uint64(len(version.content))
+	id, err := model.HashBlob(ctx, length, strings.NewReader(version.content))
+	if err != nil { return zero, err }
+	var frame bytes.Buffer
+	if err := model.EncodeBlob(ctx, &frame, length, strings.NewReader(version.content)); err != nil { return zero, err }
+	op, err := model.NewOperation(path, version.mode, &id)
+	if err != nil { return zero, err }
+	if err := ctx.Err(); err != nil { return zero, err }
+	return PreparedFileOperation{Operation: op, BlobFrame: frame.Bytes()}, nil
+}
+
+// ResolvedFileEntry binds an explicit resolved state to one canonical path.
+// This is private input, not proof that a conflict was resolved or authorized.
+type ResolvedFileEntry struct { Path model.Path; Version FileVersion }
+
+// FilePreparationBudget bounds the entire batch, not each entry. Entries and
+// PathBytes must be positive and at most 4096 and 64 MiB respectively. Payload
+// may be zero and is capped at 64 MiB. Frames may be zero and is capped at
+// 64 MiB + 4096*22, including each present entry's canonical header. Repeated
+// content counts separately: no implicit deduplication bypasses admission.
+type FilePreparationBudget struct { Entries, PathBytes, Payload, Frames uint64 }
+
+// PrepareFileOperations requires strictly raw-byte-sorted unique paths and
+// preflights all descriptors and aggregate sizes before hashing/encoding any
+// blob. Each result corresponds to its input, preserving SET/DELETE and modes.
+// Empty input succeeds with nil results; any error returns nil results, never
+// a usable prefix. Output frame slices are owned independently of each other.
+//
+// This checks local candidate syntax/admission, NOT whole-tree validity (e.g.
+// file/descendant conflicts), complete changeset canonicality, authorization,
+// conflict resolution, upload/durability or publication. The caller must perform
+// those checks before using these PRIVATE candidates. Aggregate retained output
+// is bounded but temporary copies/allocator overhead are not a measured RSS cap.
+// Inputs must not mutate during the call. No partial resume state is returned.
+func PrepareFileOperations(ctx context.Context, entries []ResolvedFileEntry, budget FilePreparationBudget) ([]PreparedFileOperation, error) {
+	if ctx == nil { return nil, ErrFileState }
+	if err := ctx.Err(); err != nil { return nil, err }
+	if budget.Entries == 0 || budget.Entries > 4096 || budget.PathBytes == 0 || budget.PathBytes > 64<<20 || budget.Payload > 64<<20 || budget.Frames > (64<<20)+4096*22 { return nil, ErrFileBudget }
+	if uint64(len(entries)) > budget.Entries { return nil, ErrFileBudget }
+	var paths, payload, frames uint64
+	for i, entry := range entries {
+		if err := ctx.Err(); err != nil { return nil, err }
+		if entry.Path.Validate() != nil || entry.Version.Validate() != nil || (i > 0 && entries[i-1].Path.Compare(entry.Path) >= 0) { return nil, ErrFileState }
+		n := uint64(len(entry.Path.Bytes()))
+		if n > budget.PathBytes-paths { return nil, ErrFileBudget }; paths += n
+		n = uint64(len(entry.Version.content))
+		if n > budget.Payload-payload { return nil, ErrFileBudget }; payload += n
+		if !entry.Version.IsAbsent() {
+			n += 22
+			if n > budget.Frames-frames { return nil, ErrFileBudget }; frames += n
+		}
+	}
+	var out []PreparedFileOperation
+	for _, entry := range entries {
+		candidate, err := PrepareFileOperation(ctx, entry.Path, entry.Version, uint64(len(entry.Version.content)))
+		if err != nil { return nil, err }
+		out = append(out, candidate)
+	}
+	if err := ctx.Err(); err != nil { return nil, err }
+	return out, nil
+}
+
+// FileMergeEntry contains one exact path's already established base/left/right
+// states. Source identity, base selection, completeness and permission are caller
+// prerequisites; this descriptor is not a verified tree or authorization proof.
+type FileMergeEntry struct { Path model.Path; Base, Left, Right FileVersion }
+
+// PathFileConflict owns immutable exact sides plus their canonical path.
+// Every path/side remains private until independently authorized for disclosure.
+type PathFileConflict struct { Path model.Path; Sides FileConflict }
+
+// FileMergeBudget admits shared entries, raw path bytes and combined content
+// bytes across ALL three states of ALL entries. Limits are 4096 entries and
+// 64 MiB per byte counter. Entries/PathBytes must be positive; Payload may be zero.
+type FileMergeBudget struct { Entries, PathBytes, Payload uint64 }
+
+// MergeFileEntries applies opaque whole-file equality to strictly raw-byte-
+// sorted unique file triples. It preflights the entire input under one budget.
+// If any path conflicts, it returns ALL path-qualified conflicts and no resolved
+// candidates; callers cannot mistake a resolved prefix for a complete result.
+// With no conflicts it returns one resolved entry per input, including unchanged
+// or absent states. Any error returns neither candidates nor conflicts.
+//
+// This is independent-path merging, not whole-tree merging: file/descendant
+// interactions, renames, multiple-base selection, text alignment, source/blob
+// verification, authorization and publication are separate mandatory concerns.
+// Conflicts do not authorize winner selection. Input states are immutable, but
+// the input slice must not change concurrently. Results own their slices. Bounds
+// count logical bytes, not allocated memory; no resume state is provided.
+func MergeFileEntries(ctx context.Context, entries []FileMergeEntry, budget FileMergeBudget) ([]ResolvedFileEntry, []PathFileConflict, error) {
+	if ctx == nil { return nil, nil, ErrFileState }
+	if err := ctx.Err(); err != nil { return nil, nil, err }
+	if budget.Entries == 0 || budget.Entries > 4096 || budget.PathBytes == 0 || budget.PathBytes > 64<<20 || budget.Payload > 64<<20 { return nil, nil, ErrFileBudget }
+	if uint64(len(entries)) > budget.Entries { return nil, nil, ErrFileBudget }
+	var paths, payload uint64
+	for i, entry := range entries {
+		if err := ctx.Err(); err != nil { return nil, nil, err }
+		if entry.Path.Validate() != nil || (i > 0 && entries[i-1].Path.Compare(entry.Path) >= 0) { return nil, nil, ErrFileState }
+		n := uint64(len(entry.Path.Bytes()))
+		if n > budget.PathBytes-paths { return nil, nil, ErrFileBudget }; paths += n
+		for _, version := range [3]FileVersion{entry.Base, entry.Left, entry.Right} {
+			if version.Validate() != nil { return nil, nil, ErrFileState }
+			n := uint64(len(version.content))
+			if n > budget.Payload-payload { return nil, nil, ErrFileBudget }; payload += n
+		}
+	}
+	var resolved []ResolvedFileEntry
+	var conflicts []PathFileConflict
+	for _, entry := range entries {
+		version, conflict, err := MergeFileVersions(ctx, entry.Base, entry.Left, entry.Right, budget.Payload)
+		if err != nil { return nil, nil, err }
+		if conflict != nil {
+			conflicts = append(conflicts, PathFileConflict{entry.Path, *conflict})
+		} else {
+			resolved = append(resolved, ResolvedFileEntry{entry.Path, version})
+		}
+	}
+	if err := ctx.Err(); err != nil { return nil, nil, err }
+	if len(conflicts) != 0 { return nil, conflicts, nil }
+	return resolved, nil, nil
+}
+
+// CanonicalFileMergeEntry supplies untrusted base/left/right blob descriptors at
+// one exact path. Mode/presence and source/base binding remain caller assertions.
+type CanonicalFileMergeEntry struct { Path model.Path; Sides [3]CanonicalFileSide }
+
+// MergeCanonicalFileEntries verifies ALL present blobs before exposing any
+// resolved state or conflict, then applies MergeFileEntries' opaque equality
+// rules. Matching IDs do not skip verification. Entries must have strictly
+// sorted unique paths; FileMergeBudget is shared across the entire batch,
+// including every repeated payload. Canonical frames additionally admit 22
+// header bytes per present side (at most 3*4096 headers). Empty/absent states
+// remain distinct, and zero payload budget permits them both.
+//
+// No result escapes on malformed data, exhaustion or cancellation, even if an
+// earlier entry would conflict or resolve. This is private independent-path
+// processing, not complete tree/source verification, text merging, rename or
+// multi-base policy, authorization, durable upload or publication. Input frames
+// and slices must not mutate during the call. Limits are logical admission,
+// not an allocator/RSS guarantee; bounded staging copies remain necessary.
+func MergeCanonicalFileEntries(ctx context.Context, entries []CanonicalFileMergeEntry, budget FileMergeBudget) ([]ResolvedFileEntry, []PathFileConflict, error) {
+	if ctx == nil { return nil, nil, ErrFileState }
+	if err := ctx.Err(); err != nil { return nil, nil, err }
+	if budget.Entries == 0 || budget.Entries > 4096 || budget.PathBytes == 0 || budget.PathBytes > 64<<20 || budget.Payload > 64<<20 { return nil, nil, ErrFileBudget }
+	if uint64(len(entries)) > budget.Entries { return nil, nil, ErrFileBudget }
+	var paths, frames, headers uint64
+	for i, entry := range entries {
+		if err := ctx.Err(); err != nil { return nil, nil, err }
+		if entry.Path.Validate() != nil || (i > 0 && entries[i-1].Path.Compare(entry.Path) >= 0) { return nil, nil, ErrFileState }
+		n := uint64(len(entry.Path.Bytes()))
+		if n > budget.PathBytes-paths { return nil, nil, ErrFileBudget }; paths += n
+		for _, side := range entry.Sides {
+			if !side.Present {
+				if side.Mode != model.Delete || side.ID != (model.BlobID{}) || side.Frame != nil { return nil, nil, ErrFileState }
+				continue
+			}
+			if side.Mode < model.SetRegular || side.Mode > model.SetSymlink || side.ID.Validate() != nil { return nil, nil, ErrFileState }
+			headers += 22
+			// The hard maximum prevents overflow before the tighter shared check.
+			n := uint64(len(side.Frame))
+			if n > (64<<20)+3*4096*22-frames { return nil, nil, ErrFileBudget }; frames += n
+		}
+	}
+	if frames > budget.Payload+headers { return nil, nil, ErrFileBudget }
+	remaining := budget.Payload
+	var verified []FileMergeEntry
+	for _, entry := range entries {
+		versions, err := verifyCanonicalFileSides(ctx, entry.Sides, remaining)
+		if err != nil { return nil, nil, err }
+		for _, v := range versions { remaining -= uint64(len(v.content)) }
+		verified = append(verified, FileMergeEntry{entry.Path, versions[0], versions[1], versions[2]})
+	}
+	return MergeFileEntries(ctx, verified, budget)
+}
