@@ -459,3 +459,65 @@ func (encodeTestShortWriter) Write(p []byte) (int, error) {
 type encodeTestWriteFunc func([]byte) (int, error)
 
 func (f encodeTestWriteFunc) Write(p []byte) (int, error) { return f(p) }
+
+// A complete payload is not success when the same read, or the required final
+// EOF probe, reports a source failure. No reusable digest may escape either case.
+func TestBlobTerminalSourceFailures(t *testing.T) {
+	boom := errors.New("terminal source failure")
+	for _, tc := range []struct {
+		name   string
+		length uint64
+		reader func() io.Reader
+	}{
+		{"final-data-error", 1, func() io.Reader {
+			return &encodeTestReadOnce{data: []byte{'x'}, err: boom}
+		}},
+		{"final-probe-error", 1, func() io.Reader {
+			return io.MultiReader(bytes.NewReader([]byte{'x'}), &encodeTestReadOnce{err: boom})
+		}},
+		{"empty-probe-error", 0, func() io.Reader {
+			return &encodeTestReadOnce{err: boom}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var output bytes.Buffer
+			if err := EncodeBlob(context.Background(), &output, tc.length, tc.reader()); !errors.Is(err, boom) {
+				t.Fatalf("terminal encoder error lost: %v", err)
+			}
+			id, err := HashBlob(context.Background(), tc.length, tc.reader())
+			if !errors.Is(err, boom) || id != (BlobID{}) {
+				t.Fatalf("terminal failure returned id=%v err=%v", id, err)
+			}
+		})
+	}
+}
+
+// io.Writer may accept every supplied byte and still report failure. Checking
+// only the count would incorrectly declare a complete canonical frame successful.
+func TestCanonicalEncoderFullCountWriteFailure(t *testing.T) {
+	boom := errors.New("terminal output failure")
+	value := encodeTestChangesetForVector(t, "metadata_absent")
+	for _, changeset := range []bool{false, true} {
+		var written uint64
+		frameSize := uint64(23)
+		if changeset {
+			frameSize = 22 + value.PayloadSize()
+		}
+		writer := encodeTestWriteFunc(func(p []byte) (int, error) {
+			written += uint64(len(p))
+			if written == frameSize {
+				return len(p), boom
+			}
+			return len(p), nil
+		})
+		var err error
+		if changeset {
+			err = EncodeChangeset(context.Background(), writer, value)
+		} else {
+			err = EncodeBlob(context.Background(), writer, 1, bytes.NewReader([]byte{'x'}))
+		}
+		if !errors.Is(err, boom) || written != frameSize {
+			t.Fatalf("changeset=%v full-count failure: bytes=%d err=%v", changeset, written, err)
+		}
+	}
+}
