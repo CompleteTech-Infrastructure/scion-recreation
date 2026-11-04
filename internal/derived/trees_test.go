@@ -1098,6 +1098,103 @@ func TestPrepareTreeWriteExactParentZeroAndPrivateDelta(t *testing.T) {
 	if len(frames) != 1 || !bytes.Equal(frames[root], before) { t.Fatal("binding mutated caller graph") }
 }
 
+func TestReadTreeEntriesLiteralMaps(t *testing.T) {
+	b, err := os.ReadFile("../../tests/fixtures/tree_pages_v1.json")
+	if err != nil { t.Fatal(err) }
+	var f struct {
+		Pages []treeLiteral `json:"pages"`
+		Positive []struct {
+			Name string `json:"name"`; Root string `json:"root_id_hex"`
+			Entries []struct { Path string `json:"path_hex"`; Mode string `json:"mode"`; Payload string `json:"blob_payload_hex"` } `json:"entries"`
+		} `json:"positive_vectors"`
+	}
+	if err := json.Unmarshal(b, &f); err != nil { t.Fatal(err) }
+	if len(f.Positive) != 15 { t.Fatal("literal map coverage changed") }
+	frames := make(map[TreePageID][]byte)
+	for _, p := range f.Pages {
+		id, err := ParseTreePageID(treeHex(t, p.IDHex)); if err != nil { t.Fatal(err) }
+		frames[id] = treeHex(t, p.FrameHex)
+	}
+	budget := TreeEntriesBudget{graphTestBudget(), 4096, 64<<20}
+	for _, c := range f.Positive {
+		root, err := ParseTreePageID(treeHex(t, c.Root)); if err != nil { t.Fatal(err) }
+		rows, _, err := ReadTreeEntries(context.Background(), root, frames, budget)
+		if c.Name == "path-length-65535-components-1024" {
+			if err != metadata.ErrResourceExhausted || rows != nil { t.Fatal("extreme valid graph did not exhaust privately") }
+			continue
+		}
+		if err != nil || len(rows) != len(c.Entries) { t.Fatalf("%s enumeration: %v", c.Name, err) }
+		for i, e := range c.Entries {
+			if !bytes.Equal(rows[i].Path().Bytes(), treeHex(t, e.Path)) { t.Fatalf("%s path/order mismatch", c.Name) }
+			payload := treeHex(t, e.Payload)
+			blob, err := model.HashBlob(context.Background(), uint64(len(payload)), bytes.NewReader(payload)); if err != nil { t.Fatal(err) }
+			got, ok := rows[i].Target()
+			var tag model.OperationTag
+			switch e.Mode { case "regular": tag = model.SetRegular; case "executable": tag = model.SetExecutable; case "symlink": tag = model.SetSymlink; default: t.Fatal("unknown mode") }
+			if !ok || got != blob || rows[i].Tag() != tag { t.Fatal("mode/target mismatch") }
+		}
+	}
+}
+
+func TestReadTreeEntriesBudgetsSharedPagesAndNoPartial(t *testing.T) {
+	tid, _ := model.NewTypedID(model.BlobKind, [32]byte{1}); blob, _ := model.NewBlobID(tid)
+	leaf, leafID, err := EncodeTreePageAt(UnlinkedTreePage{Label: []byte("x"), Tag: 1, Blob: blob}, nil, []byte("a"))
+	if err != nil { t.Fatal(err) }
+	frame, root, err := EncodeTreePageAt(UnlinkedTreePage{Children: []TreePageChild{{Edge: 'a', ID: leafID}, {Edge: 'b', ID: leafID}}}, nil, nil)
+	if err != nil { t.Fatal(err) }
+	frames := map[TreePageID][]byte{root: frame, leafID: leaf}
+	// Every shared context counts: root plus two visits to the same leaf.
+	// Paths ax and bx each charge a two-byte assembly and owned copy.
+	budget := TreeEntriesBudget{graphTestBudget(), 2, 8}
+	budget.Graph.Visits = 3; budget.Graph.PageBytes = uint64(len(frame)+2*len(leaf))
+	rows, used, err := ReadTreeEntries(context.Background(), root, frames, budget)
+	if err != nil || len(rows) != 2 || used.Visits != 3 || string(rows[0].Path().Bytes()) != "ax" || string(rows[1].Path().Bytes()) != "bx" { t.Fatalf("shared contexts: %+v %v", used, err) }
+	for _, kind := range []string{"entries", "paths", "visits", "page-bytes"} {
+		b := budget
+		switch kind { case "entries": b.Entries--; case "paths": b.PathBytes--; case "visits": b.Graph.Visits--; case "page-bytes": b.Graph.PageBytes-- }
+		if rows, _, err := ReadTreeEntries(context.Background(), root, frames, b); err != metadata.ErrResourceExhausted || rows != nil { t.Fatalf("%s leaked partial output", kind) }
+	}
+	if rows, _, err := ReadTreeEntries(&treeCancelContext{Context: context.Background()}, root, frames, budget); err != context.Canceled || rows != nil { t.Fatal("enumeration cancellation lost") }
+	missing := map[TreePageID][]byte{root: frame}
+	if rows, _, err := ReadTreeEntries(context.Background(), root, missing, budget); err != ErrTreePageMissing || rows != nil { t.Fatal("missing referent treated as absence") }
+	corrupt := append([]byte(nil), leaf...); corrupt[len(corrupt)-1] ^= 1
+	if rows, _, err := ReadTreeEntries(context.Background(), root, map[TreePageID][]byte{root: frame, leafID: corrupt}, budget); err != ErrTreePage || rows != nil { t.Fatal("corrupt leaf admitted") }
+	owned := rows[0].Path().Bytes(); owned[0] = 'z'
+	if string(rows[0].Path().Bytes()) != "ax" { t.Fatal("returned path leaked ownership") }
+}
+
+func TestReadTreeEntriesDirectoryOrder(t *testing.T) {
+	tid, _ := model.NewTypedID(model.BlobKind, [32]byte{1}); blob, _ := model.NewBlobID(tid)
+	empty, root, _ := EncodeTreePageAt(UnlinkedTreePage{}, nil, nil)
+	frames := map[TreePageID][]byte{root: empty}
+	// '/' sorts between '.' and '0'; neither unconditional directory-first
+	// nor directory-last traversal is the required raw-byte order.
+	want := []string{"a.", "a/b", "a0"}
+	for _, name := range want {
+		path, _ := model.NewPath([]byte(name))
+		next, added, err := SetTreeLeaf(context.Background(), root, frames, path, 1, blob, TreeRewriteBudget{4096, 4096*MaxTreePageBytes, 4096*MaxTreePageBytes})
+		if err != nil { t.Fatal(err) }
+		for id, frame := range added { frames[id] = frame }; root = next
+	}
+	rows, _, err := ReadTreeEntries(context.Background(), root, frames, TreeEntriesBudget{graphTestBudget(), 3, 64})
+	if err != nil || len(rows) != len(want) { t.Fatalf("directory enumeration: %v", err) }
+	for i, name := range want { if string(rows[i].Path().Bytes()) != name { t.Fatal("directory/continuation ordering incorrect") } }
+}
+
+func TestReadTreeEntriesDiscardsLeafBeforeMissingReferent(t *testing.T) {
+	tid, _ := model.NewTypedID(model.BlobKind, [32]byte{1}); blob, _ := model.NewBlobID(tid)
+	leaf, leafID, err := EncodeTreePageAt(UnlinkedTreePage{Label: []byte("x"), Tag: 1, Blob: blob}, nil, []byte("b"))
+	if err != nil { t.Fatal(err) }
+	_, missingID, err := EncodeTreePageAt(UnlinkedTreePage{Label: []byte("y"), Tag: 1, Blob: blob}, nil, []byte("a"))
+	if err != nil { t.Fatal(err) }
+	frame, root, err := EncodeTreePageAt(UnlinkedTreePage{Children: []TreePageChild{{Edge: 'a', ID: missingID}, {Edge: 'b', ID: leafID}}}, nil, nil)
+	if err != nil { t.Fatal(err) }
+	// The LIFO walker collects bx first, then discovers the missing ay page.
+	// Visits/terminal usage confirms the failure is after a collected leaf.
+	rows, used, err := ReadTreeEntries(context.Background(), root, map[TreePageID][]byte{root: frame, leafID: leaf}, TreeEntriesBudget{graphTestBudget(), 2, 8})
+	if err != ErrTreePageMissing || rows != nil || used.Visits != 3 || used.Terminals != 1 { t.Fatalf("late missing referent leaked rows: %+v %v", used, err) }
+}
+
 type setTestEntry struct {
 	path string
 	tag  byte
