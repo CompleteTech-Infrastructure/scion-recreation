@@ -1225,3 +1225,82 @@ func PrepareCanonicalTreeWrite(ctx context.Context, identity metadata.DerivedIde
 	if err != nil { return bad(err) }
 	return PrepareCheckedTreeWrite(ctx, identity, source.Snapshot(), parent, frames, blobs, budget)
 }
+
+// TreeSourceFrame identifies one exact canonical source. Replay requires a root
+// first and then a contiguous parent-zero chain in oldest-to-newest order.
+type TreeSourceFrame struct { ID model.ChangesetID; Frame []byte }
+
+// TreeReplayBudget admits at most Sources independent checked-write attempts.
+// Total admitted phase work is Sources times Step's phase ceilings, not one
+// graph quantum. SourceBytes charges complete frames including headers once;
+// Pages/PageBytes bound retained distinct pages, including empty/intermediate
+// pages. Decoder/rewrite temporaries are separately bounded by Step, not RSS.
+type TreeReplayBudget struct {
+	Sources, SourceBytes, Pages, PageBytes uint64
+	Step TreeCheckedWriteBudget
+}
+type TreeReplayUsage struct { Sources, SourceBytes, Pages, PageBytes uint64 }
+
+// ReplayCanonicalTreeChain computes private mappings from a canonical root to
+// the final source without caller-supplied tree mappings. Every parent-zero
+// mapping comes from the immediately preceding checked computation. Additional
+// canonical parents affect source identity, not the tree input; their repository
+// membership/publication remains an external prerequisite. Inputs must be stable.
+//
+// This is bounded, non-resumable private replay, not a durable evaluator or an
+// authorization boundary. It fetches nothing and publishes nothing. Outputs
+// include mappings for the whole chain and owned page bytes, including possibly
+// unreachable intermediate pages. Any failure returns nil mappings and pages;
+// private usage describes admitted work, not proof of successful validation.
+func ReplayCanonicalTreeChain(ctx context.Context, repository [16]byte, sources []TreeSourceFrame, blobs map[model.BlobID][]byte, budget TreeReplayBudget) ([]metadata.DerivedWrite, map[TreePageID][]byte, TreeReplayUsage, error) {
+	var used TreeReplayUsage
+	bad := func(err error) ([]metadata.DerivedWrite, map[TreePageID][]byte, TreeReplayUsage, error) { return nil, nil, used, err }
+	if ctx == nil || budget.Sources == 0 || budget.Sources > 64 || budget.SourceBytes == 0 || budget.SourceBytes > model.MaxChangesetPayload+64*22 || budget.Pages == 0 || budget.Pages > 4096 || budget.PageBytes == 0 || budget.PageBytes > 4096*MaxTreePageBytes || budget.Step.Rewrite.InputBytes == 0 || budget.Step.Rewrite.InputBytes > model.MaxChangesetPayload { return bad(metadata.ErrInvalidArgument) }
+	if err := ctx.Err(); err != nil { return bad(err) }
+	if len(sources) == 0 { return bad(metadata.ErrInvalidArgument) }
+	if uint64(len(sources)) > budget.Sources { return bad(metadata.ErrResourceExhausted) }
+	// Reserve the complete source batch before any decoding or tree work.
+	for _, source := range sources {
+		if err := ctx.Err(); err != nil { return bad(err) }
+		n := uint64(len(source.Frame))
+		if source.ID.Validate() != nil { return bad(metadata.ErrInvalidArgument) }
+		if n > budget.Step.Rewrite.InputBytes+22 || n > budget.SourceBytes-used.SourceBytes { return bad(metadata.ErrResourceExhausted) }
+		used.SourceBytes += n
+	}
+	empty, root, err := EncodeTreePageAt(UnlinkedTreePage{}, nil, nil)
+	if err != nil { return bad(err) }
+	if uint64(len(empty)) > budget.PageBytes { return bad(metadata.ErrResourceExhausted) }
+	pages := map[TreePageID][]byte{root: empty}
+	used.Pages, used.PageBytes = 1, uint64(len(empty))
+	writes := make([]metadata.DerivedWrite, 0, len(sources))
+	for i, source := range sources {
+		if err := ctx.Err(); err != nil { return bad(err) }
+		used.Sources++
+		value, err := model.DecodeChangeset(ctx, bytes.NewReader(source.Frame), source.ID, budget.Step.Rewrite.InputBytes)
+		if err != nil { return bad(err) }
+		change := value.Snapshot()
+		if change.RepoID != repository { return bad(metadata.ErrInvalidArgument) }
+		var parent *metadata.DerivedResult
+		if i == 0 {
+			if len(change.Parents) != 0 { return bad(metadata.ErrFailedPrecondition) }
+		} else {
+			if len(change.Parents) == 0 || change.Parents[0] != sources[i-1].ID { return bad(metadata.ErrFailedPrecondition) }
+			parent = &writes[i-1].Result
+		}
+		identity := metadata.DerivedIdentity{Repository: repository, Changeset: source.ID, Kind: "TREE", Version: 1}
+		write, added, _, err := PrepareCheckedTreeWrite(ctx, identity, change, parent, pages, blobs, budget.Step)
+		if err != nil { return bad(err) }
+		// Stage only privately owned new frames. Existing frames were checked
+		// against the occupied ID by the rewrite path before it returned.
+		for id, frame := range added {
+			if err := ctx.Err(); err != nil { return bad(err) }
+			if _, exists := pages[id]; exists { continue }
+			if used.Pages == budget.Pages || uint64(len(frame)) > budget.PageBytes-used.PageBytes { return bad(metadata.ErrResourceExhausted) }
+			used.Pages++; used.PageBytes += uint64(len(frame))
+			pages[id] = frame
+		}
+		writes = append(writes, write)
+	}
+	if err := ctx.Err(); err != nil { return bad(err) }
+	return writes, pages, used, nil
+}
