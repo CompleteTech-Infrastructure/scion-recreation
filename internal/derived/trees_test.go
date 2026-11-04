@@ -186,6 +186,8 @@ func TestTreePageContextLiteralGraphs(t *testing.T) {
 			if visits > 100000 { t.Fatal("fixture traversal exceeded test bound") }
 			p, err := DecodeTreePageAt(pages[v.id], v.id, v.directory, v.component)
 			if err != nil { t.Fatalf("positive context dir=%d component=%d: %v", len(v.directory), len(v.component), err) }
+			encoded, encodedID, err := EncodeTreePageAt(p, v.directory, v.component)
+			if err != nil || encodedID != v.id || !bytes.Equal(encoded, pages[v.id]) { t.Fatalf("literal context encoding: %v", err) }
 			component := append(append([]byte(nil), v.component...), p.Label...)
 			for _, child := range p.Children {
 				prefix := append(append([]byte(nil), component...), child.Edge)
@@ -388,4 +390,47 @@ func TestTreePageContextIsolatedBoundaries(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTreePageEncoderRejectsInactiveTargetsAndInvalidShapes(t *testing.T) {
+	pages, _, _ := treeFixture(t)
+	var page UnlinkedTreePage
+	for _, row := range pages {
+		id, err := ParseTreePageID(treeHex(t, row.IDHex))
+		if err != nil { t.Fatal(err) }
+		p, err := DecodeTreePageAt(treeHex(t, row.FrameHex), id, nil, nil)
+		if err == nil && p.Tag == 1 && len(p.Children) == 0 {
+			page = p
+			break
+		}
+	}
+	if page.Tag != 1 { t.Fatal("missing independent leaf fixture") }
+	frame, id, err := EncodeTreePageAt(page, nil, nil)
+	if err != nil { t.Fatal(err) }
+	for _, invalid := range []UnlinkedTreePage{
+		{Tag: 0, Blob: page.Blob}, {Tag: 0, Directory: id},
+		{Tag: 1, Label: []byte("a"), Blob: page.Blob, Directory: id},
+		{Tag: 4, Label: []byte("a"), Blob: page.Blob, Directory: id},
+		{Tag: 1, Label: []byte("a")}, {Tag: 4, Label: []byte("a")}, {Tag: 5},
+		{Label: bytes.Repeat([]byte{'a'}, 256)}, {Children: make([]TreePageChild, 255)},
+		{Tag: 1, Label: []byte("a/b"), Blob: page.Blob},
+		{Tag: 1, Label: []byte("."), Blob: page.Blob},
+		{Tag: 1, Label: []byte("a"), Blob: page.Blob, Children: []TreePageChild{{Edge: 'b'}}},
+		{Tag: 1, Label: []byte("a"), Blob: page.Blob, Children: []TreePageChild{{Edge: 'c', ID: id}, {Edge: 'b', ID: id}}},
+		{Tag: 1, Label: []byte("a"), Blob: page.Blob, Children: []TreePageChild{{Edge: 'b', ID: id}, {Edge: 'b', ID: id}}},
+	} {
+		got, gotID, err := EncodeTreePageAt(invalid, nil, nil)
+		if err != ErrTreePage || got != nil || gotID != (TreePageID{}) { t.Fatal("invalid page produced output") }
+	}
+	original := append([]byte(nil), frame...)
+	page.Label[0] ^= 1
+	if !bytes.Equal(frame, original) { t.Fatal("encoded frame aliases label") }
+	frame[0] ^= 1
+	if _, err := DecodeTreePageAt(frame, id, nil, nil); err != ErrTreePage { t.Fatal("changed frame preserved verification") }
+	// Empty repository has its unique canonical frame; no empty directory is
+	// introduced when the identical empty syntax is supplied below a path.
+	empty, emptyID, err := EncodeTreePageAt(UnlinkedTreePage{}, nil, nil)
+	if err != nil || hex.EncodeToString(empty) != "43414e4f5059005452454500000101000000050000000000" { t.Fatal("wrong empty encoding") }
+	if _, _, err := EncodeTreePageAt(UnlinkedTreePage{}, []byte("dir"), nil); err != ErrTreePage { t.Fatal("encoded empty nonroot") }
+	if _, _, err := EncodeTreePageAt(UnlinkedTreePage{Tag: 4, Label: []byte("dir"), Directory: emptyID}, nil, nil); err != ErrTreePage { t.Fatal("encoded empty directory referent") }
 }

@@ -200,3 +200,54 @@ func DecodeTreePageAt(frame []byte, expected TreePageID, directoryPrefix, compon
 	}
 	return p, nil
 }
+
+// EncodeTreePageAt serializes one page exactly as the derived v1 contract and
+// checks its local context with DecodeTreePageAt. It does not normalize/sort an
+// invalid shape, validate referent graphs, write storage, or authorize delivery.
+// Inactive union targets must be zero, not silently discarded. Output owns its
+// bytes. The page and context inputs must not be modified concurrently.
+func EncodeTreePageAt(page UnlinkedTreePage, directoryPrefix, componentPrefix []byte) ([]byte, TreePageID, error) {
+	bad := func() ([]byte, TreePageID, error) { return nil, TreePageID{}, ErrTreePage }
+	if len(page.Label) > 255 || len(page.Children) > 254 ||
+		uint64(len(directoryPrefix)) > model.MaxPathBytes || uint64(len(componentPrefix)) > model.MaxPathBytes {
+		return bad()
+	}
+	var target []byte
+	var err error
+	switch page.Tag {
+	case 0:
+		if page.Blob != (model.BlobID{}) || page.Directory != (TreePageID{}) { return bad() }
+	case 1, 2, 3:
+		if page.Directory != (TreePageID{}) { return bad() }
+		target, err = page.Blob.TypedID().MarshalBinary()
+	case 4:
+		if page.Blob != (model.BlobID{}) { return bad() }
+		target, err = page.Directory.MarshalBinary()
+	default:
+		return bad()
+	}
+	if err != nil { return bad() }
+	// Counts are bounded above before multiplication or allocation.
+	length := 2 + len(page.Label) + 1 + len(target) + 2 + len(page.Children)*(1+TreePageIDSize)
+	frame := make([]byte, 19, 19+length)
+	copy(frame, "CANOPY\x00TREE\x00")
+	binary.BigEndian.PutUint16(frame[12:14], 1)
+	frame[14] = 1
+	binary.BigEndian.PutUint32(frame[15:19], uint32(length))
+	frame = binary.BigEndian.AppendUint16(frame, uint16(len(page.Label)))
+	frame = append(frame, page.Label...)
+	frame = append(frame, page.Tag)
+	frame = append(frame, target...)
+	frame = binary.BigEndian.AppendUint16(frame, uint16(len(page.Children)))
+	for _, child := range page.Children {
+		if child.ID.Validate() != nil { return bad() }
+		frame = append(frame, child.Edge)
+		frame = append(frame, child.ID.raw[:]...)
+	}
+	digest := sha256.Sum256(frame)
+	var id TreePageID
+	copy(id.raw[:7], "CTP\x00\x00\x01\x01")
+	copy(id.raw[7:], digest[:])
+	if _, err := DecodeTreePageAt(frame, id, directoryPrefix, componentPrefix); err != nil { return bad() }
+	return frame, id, nil
+}
