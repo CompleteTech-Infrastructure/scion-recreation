@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+
+	"canopy.local/canopy/internal/model"
 )
 
 var (
@@ -165,4 +167,85 @@ func DiffText(ctx context.Context, old, next []byte, budget TextDiffBudget) (Tex
 	if err := ctx.Err(); err != nil { return zero, err }
 	result.Hunk = out
 	return result, nil
+}
+
+var (
+	ErrFileDiffInput = errors.New("invalid file-entry diff input")
+	ErrFileDiffLimit = errors.New("file-entry diff budget exhausted")
+)
+
+// FileDiffBudget bounds combined input entries, combined path bytes and emitted
+// deltas. Explicit positive limits are required: one million entries/deltas and
+// 64 MiB path bytes maximum. These are local query admission limits.
+type FileDiffBudget struct { Entries, PathBytes, Changes uint64 }
+
+// FileDelta owns immutable canonical values. Presence flags distinguish an
+// absent side from its invalid zero Operation: add is false/true, delete is
+// true/false, modification is true/true. ModeChanged and ContentChanged apply
+// only to modifications. A mode change includes executable and symlink changes;
+// content compares typed blob identities, never decoded text or target paths.
+type FileDelta struct {
+	Path model.Path
+	Before, After model.Operation
+	BeforePresent, AfterPresent bool
+	ModeChanged, ContentChanged bool
+}
+
+// DiffFileEntries compares two exact corresponding selections of file entries,
+// represented by canonical SET operations sorted strictly by raw byte path.
+// DELETE operations, duplicate/unsorted paths and invalid values reject. It
+// does not sort, normalize paths, resolve symlinks or infer renames/copies.
+//
+// This is a bounded selection comparator, NOT a tree/page traversal or tree
+// validity verifier. Callers must supply complete matching selected scopes;
+// a missing row then means absence within that selection. They must validate
+// tree structure and blob content and authorize both selections before calling.
+// It does not fetch bytes, classify binary content or produce text patches.
+// Inputs must not be mutated concurrently. Errors return no partial deltas.
+func DiffFileEntries(ctx context.Context, before, after []model.Operation, budget FileDiffBudget) ([]FileDelta, error) {
+	if ctx == nil { return nil, ErrFileDiffInput }
+	if err := ctx.Err(); err != nil { return nil, err }
+	if budget.Entries == 0 || budget.Entries > 1000000 || budget.PathBytes == 0 || budget.PathBytes > 64<<20 || budget.Changes == 0 || budget.Changes > budget.Entries {
+		return nil, ErrFileDiffLimit
+	}
+	if uint64(len(before)) > budget.Entries || uint64(len(after)) > budget.Entries-uint64(len(before)) { return nil, ErrFileDiffLimit }
+	var pathBytes uint64
+	for _, side := range [][]model.Operation{before, after} {
+		for i, op := range side {
+			if err := ctx.Err(); err != nil { return nil, err }
+			id, present := op.Target()
+			if op.Path().Validate() != nil || !present || id.Validate() != nil || (i > 0 && side[i-1].Path().Compare(op.Path()) >= 0) {
+				return nil, ErrFileDiffInput
+			}
+			// Each Path already owns at most 65,535 bytes. This temporary copy
+			// is bounded independently before charging aggregate path storage.
+			n := uint64(len(op.Path().Bytes()))
+			if n > budget.PathBytes-pathBytes { return nil, ErrFileDiffLimit }
+			pathBytes += n
+		}
+	}
+	var deltas []FileDelta
+	for i, j := 0, 0; i < len(before) || j < len(after); {
+		if err := ctx.Err(); err != nil { return nil, err }
+		var d FileDelta
+		switch {
+		case j == len(after) || (i < len(before) && before[i].Path().Compare(after[j].Path()) < 0):
+			d = FileDelta{Path: before[i].Path(), Before: before[i], BeforePresent: true}
+			i++
+		case i == len(before) || after[j].Path().Compare(before[i].Path()) < 0:
+			d = FileDelta{Path: after[j].Path(), After: after[j], AfterPresent: true}
+			j++
+		default:
+			old, next := before[i], after[j]
+			i++; j++
+			if old == next { continue }
+			oldID, _ := old.Target()
+			nextID, _ := next.Target()
+			d = FileDelta{Path: old.Path(), Before: old, After: next, BeforePresent: true, AfterPresent: true, ModeChanged: old.Tag() != next.Tag(), ContentChanged: oldID != nextID}
+		}
+		if uint64(len(deltas)) == budget.Changes { return nil, ErrFileDiffLimit }
+		deltas = append(deltas, d)
+	}
+	if err := ctx.Err(); err != nil { return nil, err }
+	return deltas, nil
 }
