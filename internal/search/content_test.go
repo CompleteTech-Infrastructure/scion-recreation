@@ -70,6 +70,65 @@ func TestCanonicalContentAdmissionAndLiteralSearch(t *testing.T) {
 	if out, _, err := snapshot.Contains(&pathCancelContext{Context:ctx,stop:4},repo,id,"go",query); err != context.Canceled || out != nil { t.Fatal("query cancellation") }
 	if out, _, err := snapshot.Contains(ctx,[16]byte{9},id,"go",query); err != metadata.ErrInvalidArgument || out != nil { t.Fatal("foreign query") }
 	if out, _, err := snapshot.Contains(ctx,repo,model.ChangesetID{},"go",query); err != metadata.ErrInvalidArgument || out != nil { t.Fatal("wrong revision query") }
+	// A new canonical revision drops b, retains c, changes g from symlink
+	// to regular and adds h sharing verified text plus i as a new symlink kind.
+	op := func(path string, tag model.OperationTag, blob model.BlobID) model.Operation {
+		p, err := model.NewPath([]byte(path)); if err != nil { t.Fatal(err) }
+		var target *model.BlobID; if tag != model.Delete { target=&blob }
+		v, err := model.NewOperation(p,tag,target); if err != nil { t.Fatal(err) }; return v
+	}
+	textID,_ := rows[1].Target()
+	g := op("g",model.SetRegular,textID); h := op("h",model.SetRegular,textID); i := op("i",model.SetSymlink,largeID)
+	child, err := model.NewChangeset(model.ChangesetInput{RepoID:repo,Parents:[]model.ChangesetID{id},Operations:[]model.Operation{op("b",model.Delete,model.BlobID{}),g,h,i}}); if err != nil { t.Fatal(err) }
+	childID, err := model.HashChangeset(ctx,child); if err != nil { t.Fatal(err) }
+	var childFrame bytes.Buffer; if err := model.EncodeChangeset(ctx,&childFrame,child); err != nil { t.Fatal(err) }
+	nextPaths, _, err := BuildCanonicalPathSnapshot(ctx,repo,childID,[]derived.TreeSourceFrame{{ID:id,Frame:source.Bytes()},{ID:childID,Frame:childFrame.Bytes()}},blobs,PathSnapshotBudget{Replay:derived.TreeReplayBudget{Sources:2,SourceBytes:uint64(source.Len()+childFrame.Len()),Pages:4096,PageBytes:4096*derived.MaxTreePageBytes,Step:step},Snapshot:derived.TreeEntriesBudget{Graph:graph,Entries:8,PathBytes:16}})
+	if err != nil { t.Fatal(err) }
+	reuseBudget := ContentBudget{Files:8,FrameBytes:uint64(len(blobs[largeID])),FileBytes:3,TextBytes:9}
+	needed := map[model.BlobID][]byte{largeID:blobs[largeID]}
+	next, reused, err := BuildContentSnapshotReusing(ctx,nextPaths,snapshot,needed,reuseBudget)
+	if err != nil || reused.Reused != 7 || reused.Admission != (ContentUsage{8,reuseBudget.FrameBytes,9}) { t.Fatalf("reuse: %+v %v",reused,err) }
+	got, _, err := next.Contains(ctx,repo,childID,"go",ContentQueryBudget{18,3})
+	if err != nil || !reflect.DeepEqual(got,[]model.Operation{rows[2],g,h}) { t.Fatal("reuse resurrected deletion or wrong mode/path") }
+	if next.Entries()[7].Class != ContentSymlink { t.Fatal("file classification reused as symlink") }
+	freshBudget := reuseBudget; freshBudget.FrameBytes=1<<20
+	fresh, _, err := BuildContentSnapshot(ctx,nextPaths,blobs,freshBudget)
+	if err != nil || !reflect.DeepEqual(next.Entries(),fresh.Entries()) { t.Fatal("incremental differs from fresh") }
+	if failed, _, err := BuildContentSnapshotReusing(ctx,nextPaths,snapshot,nil,reuseBudget); err != metadata.ErrFailedPrecondition || failed != nil { t.Fatal("missing mode-specific content accepted") }
+	for _, which := range []string{"files","frames","text"} {
+		short:=reuseBudget; switch which { case "files": short.Files--; case "frames": short.FrameBytes--; case "text": short.TextBytes-- }
+		if failed, _, err := BuildContentSnapshotReusing(ctx,nextPaths,snapshot,needed,short); err != metadata.ErrResourceExhausted || failed != nil { t.Fatalf("%s reuse partial",which) }
+	}
+	policy := reuseBudget; policy.FileBytes++
+	if failed, _, err := BuildContentSnapshotReusing(ctx,nextPaths,snapshot,blobs,policy); err != metadata.ErrInvalidArgument || failed != nil { t.Fatal("size policy mismatch reused classifications") }
+	foreign := *snapshot; foreign.repository=[16]byte{9}
+	if failed, _, err := BuildContentSnapshotReusing(ctx,nextPaths,&foreign,blobs,reuseBudget); err != metadata.ErrInvalidArgument || failed != nil { t.Fatal("cross-repository reuse") }
+	repeat, repeated, err := BuildContentSnapshotReusing(ctx,nextPaths,next,nil,ContentBudget{8,1,3,9})
+	if err != nil || repeated.Reused != 8 || repeated.Admission.FrameBytes != 0 || !reflect.DeepEqual(repeat.Entries(),next.Entries()) { t.Fatal("repeat rebuild not idempotent") }
+	// A changed blob at an unchanged path must not reuse the prior text.
+	newID, err := model.HashBlob(ctx,3,bytes.NewReader([]byte("new"))); if err != nil { t.Fatal(err) }
+	var newFrame bytes.Buffer; if err := model.EncodeBlob(ctx,&newFrame,3,bytes.NewReader([]byte("new"))); err != nil { t.Fatal(err) }
+	blobs[newID]=newFrame.Bytes(); replacement:=op("c",model.SetExecutable,newID)
+	third, err := model.NewChangeset(model.ChangesetInput{RepoID:repo,Parents:[]model.ChangesetID{childID},Operations:[]model.Operation{replacement}}); if err != nil { t.Fatal(err) }
+	thirdID, err := model.HashChangeset(ctx,third); if err != nil { t.Fatal(err) }
+	var thirdFrame bytes.Buffer; if err := model.EncodeChangeset(ctx,&thirdFrame,third); err != nil { t.Fatal(err) }
+	thirdPaths, _, err := BuildCanonicalPathSnapshot(ctx,repo,thirdID,[]derived.TreeSourceFrame{{ID:id,Frame:source.Bytes()},{ID:childID,Frame:childFrame.Bytes()},{ID:thirdID,Frame:thirdFrame.Bytes()}},blobs,PathSnapshotBudget{Replay:derived.TreeReplayBudget{Sources:3,SourceBytes:uint64(source.Len()+childFrame.Len()+thirdFrame.Len()),Pages:4096,PageBytes:4096*derived.MaxTreePageBytes,Step:step},Snapshot:derived.TreeEntriesBudget{Graph:graph,Entries:8,PathBytes:16}})
+	if err != nil { t.Fatal(err) }
+	thirdBudget:=ContentBudget{8,uint64(newFrame.Len()),3,9}
+	if v, _, err := BuildContentSnapshotReusing(ctx,thirdPaths,next,nil,thirdBudget); err != metadata.ErrFailedPrecondition || v != nil { t.Fatal("same-path changed blob reused stale text") }
+	updated, updateUsage, err := BuildContentSnapshotReusing(ctx,thirdPaths,next,map[model.BlobID][]byte{newID:newFrame.Bytes()},thirdBudget)
+	if err != nil || updateUsage.Reused != 7 || updateUsage.Admission.FrameBytes != uint64(newFrame.Len()) { t.Fatalf("changed blob admission: %+v %v",updateUsage,err) }
+	if got, _, err := updated.Contains(ctx,repo,thirdID,"new",ContentQueryBudget{27,1}); err != nil || !reflect.DeepEqual(got,[]model.Operation{replacement}) { t.Fatal("new text not indexed") }
+	owned:=updated.Entries(); owned[1].Text="broken"; owned[1].Operation=rows[0]
+	previousOwned:=next.Entries(); previousOwned[1].Text="broken"
+	for j:=range newFrame.Bytes() { newFrame.Bytes()[j]=0 }
+	if got, _, err := updated.Contains(ctx,repo,thirdID,"new",ContentQueryBudget{27,1}); err != nil || !reflect.DeepEqual(got,[]model.Operation{replacement}) { t.Fatal("new text aliases returned entries or frame bytes") }
+	if got, _, err := updated.Contains(ctx,repo,thirdID,"go",ContentQueryBudget{18,2}); err != nil || !reflect.DeepEqual(got,[]model.Operation{g,h}) { t.Fatal("reused snapshot ownership failed") }
+	if got, _, err := next.Contains(ctx,repo,childID,"go",ContentQueryBudget{18,3}); err != nil || !reflect.DeepEqual(got,[]model.Operation{rows[2],g,h}) { t.Fatal("prior snapshot mutated by reuse") }
+	probeReuse := &pathCancelContext{Context:ctx}
+	if v, _, err := BuildContentSnapshotReusing(probeReuse,nextPaths,snapshot,needed,reuseBudget); err != nil || v == nil { t.Fatal("reuse probe") }
+	if v, _, err := BuildContentSnapshotReusing(&pathCancelContext{Context:ctx,stop:probeReuse.calls},nextPaths,snapshot,needed,reuseBudget); err != context.Canceled || v != nil { t.Fatal("late reuse cancellation") }
+	if v, _, err := BuildContentSnapshotReusing(ctx,nextPaths,nil,blobs,freshBudget); err != nil || !reflect.DeepEqual(v.Entries(),fresh.Entries()) { t.Fatal("nil previous changed fresh semantics") }
 	entries[1].Text="mutated"; entries[1].Operation=rows[5]; out[0]=rows[5]
 	for _, frame := range blobs { for i := range frame { frame[i]=0 } }
 	again, _, err := snapshot.Contains(ctx,repo,id,"go",query)
