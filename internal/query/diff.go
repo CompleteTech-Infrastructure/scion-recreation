@@ -1,0 +1,398 @@
+// Package query contains bounded query primitives, not authorization or storage.
+package query
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+
+	"canopy.local/canopy/internal/derived"
+	"canopy.local/canopy/internal/model"
+)
+
+var (
+	ErrDiffInput = errors.New("invalid text diff input")
+	ErrDiffLimit = errors.New("text diff budget exhausted")
+	ErrDiffBinary = errors.New("NUL-bearing input is not admitted as text")
+)
+
+// TextDiffBudget admits total input bytes, combined lines, output bytes and
+// context lines. Byte ceilings are 64 MiB and the combined line ceiling is one
+// million. Context may be zero and may not exceed Lines. All other limits >0.
+type TextDiffBudget struct {
+	InputBytes, OutputBytes, Lines, Context uint64
+}
+
+// TextDiff contains at most one complete coarse unified-diff fragment, with no
+// file headers. Nil Hunk means equal bytes. Newline flags describe each original
+// input independently; empty input has no final newline. Hunk is caller-owned.
+type TextDiff struct {
+	Hunk []byte
+	OldFinalNewline, NewFinalNewline bool
+}
+
+// DiffText preserves exact bytes, including CRLF and invalid UTF-8. It emits one
+// deterministic replacement for everything between the longest common line
+// prefix/suffix, with bounded surrounding context. It is not a minimal edit
+// script. Missing newlines use explicit unified-diff markers, never silent LF
+// insertion. NUL input is rejected; this is NOT comprehensive binary detection.
+// Callers must classify/admit text and authorize both inputs before using this
+// helper. Tree traversal, binary diffs, renames/copies, paging and RPC assembly
+// are separate QRY-04 work. Inputs must not be mutated during this call.
+func DiffText(ctx context.Context, old, next []byte, budget TextDiffBudget) (TextDiff, error) {
+	var zero TextDiff
+	if ctx == nil {
+		return zero, ErrDiffInput
+	}
+	if err := ctx.Err(); err != nil {
+		return zero, err
+	}
+	if budget.InputBytes == 0 || budget.InputBytes > 64<<20 || budget.OutputBytes == 0 || budget.OutputBytes > 64<<20 || budget.Lines == 0 || budget.Lines > 1000000 || budget.Context > budget.Lines {
+		return zero, ErrDiffLimit
+	}
+	if uint64(len(old)) > budget.InputBytes || uint64(len(next)) > budget.InputBytes-uint64(len(old)) {
+		return zero, ErrDiffLimit
+	}
+	var usedLines uint64
+	split := func(data []byte) ([]int, error) {
+		var ends []int
+		for i, b := range data {
+			if i%(32<<10) == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
+			if b == 0 {
+				return nil, ErrDiffBinary
+			}
+			if b == '\n' || i == len(data)-1 {
+				if usedLines == budget.Lines {
+					return nil, ErrDiffLimit
+				}
+				usedLines++
+				ends = append(ends, i+1)
+			}
+		}
+		return ends, nil
+	}
+	a, err := split(old)
+	if err != nil {
+		return zero, err
+	}
+	b, err := split(next)
+	if err != nil {
+		return zero, err
+	}
+	line := func(data []byte, ends []int, i int) []byte {
+		start := 0
+		if i > 0 {
+			start = ends[i-1]
+		}
+		return data[start:ends[i]]
+	}
+	prefix := 0
+	for prefix < len(a) && prefix < len(b) {
+		if err := ctx.Err(); err != nil {
+			return zero, err
+		}
+		if !bytes.Equal(line(old, a, prefix), line(next, b, prefix)) {
+			break
+		}
+		prefix++
+	}
+	result := TextDiff{OldFinalNewline: len(old)>0 && old[len(old)-1]=='\n', NewFinalNewline: len(next)>0 && next[len(next)-1]=='\n'}
+	if prefix == len(a) && prefix == len(b) {
+		if err := ctx.Err(); err != nil {
+			return zero, err
+		}
+		return result, nil
+	}
+	suffix := 0
+	for suffix < len(a)-prefix && suffix < len(b)-prefix {
+		if err := ctx.Err(); err != nil {
+			return zero, err
+		}
+		if !bytes.Equal(line(old, a, len(a)-suffix-1), line(next, b, len(b)-suffix-1)) {
+			break
+		}
+		suffix++
+	}
+	start := max(0, prefix-int(budget.Context))
+	tail := min(suffix, int(budget.Context))
+	oldEnd, newEnd := len(a)-suffix, len(b)-suffix
+	oldCount, newCount := oldEnd-start+tail, newEnd-start+tail
+	position := func(count int) int {
+		if count == 0 {
+			return start
+		}
+		return start+1
+	}
+	var out []byte
+	appendPart := func(part []byte) error {
+		if uint64(len(part)) > budget.OutputBytes-uint64(len(out)) {
+			return ErrDiffLimit
+		}
+		for len(part)>0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			n := min(len(part), 32<<10)
+			out = append(out, part[:n]...)
+			part = part[n:]
+		}
+		return nil
+	}
+	emit := func(mark byte, data []byte) error {
+		if err := appendPart([]byte{mark}); err != nil { return err }
+		if err := appendPart(data); err != nil { return err }
+		if data[len(data)-1] != '\n' {
+			return appendPart([]byte("\n\\ No newline at end of file\n"))
+		}
+		return nil
+	}
+	header := fmt.Sprintf("@@ -%d,%d +%d,%d @@\n", position(oldCount), oldCount, position(newCount), newCount)
+	if err := appendPart([]byte(header)); err != nil { return zero, err }
+	for i := start; i < prefix; i++ {
+		if err := emit(' ', line(old,a,i)); err != nil { return zero, err }
+	}
+	for i := prefix; i < oldEnd; i++ {
+		if err := emit('-', line(old,a,i)); err != nil { return zero, err }
+	}
+	for i := prefix; i < newEnd; i++ {
+		if err := emit('+', line(next,b,i)); err != nil { return zero, err }
+	}
+	for i := oldEnd; i < oldEnd+tail; i++ {
+		if err := emit(' ', line(old,a,i)); err != nil { return zero, err }
+	}
+	if err := ctx.Err(); err != nil { return zero, err }
+	result.Hunk = out
+	return result, nil
+}
+
+var (
+	ErrFileDiffInput = errors.New("invalid file-entry diff input")
+	ErrFileDiffLimit = errors.New("file-entry diff budget exhausted")
+)
+
+// FileDiffBudget bounds combined input entries, combined path bytes and emitted
+// deltas. Explicit positive limits are required: one million entries/deltas and
+// 64 MiB path bytes maximum. These are local query admission limits.
+type FileDiffBudget struct { Entries, PathBytes, Changes uint64 }
+
+// FileDelta owns immutable canonical values. Presence flags distinguish an
+// absent side from its invalid zero Operation: add is false/true, delete is
+// true/false, modification is true/true. ModeChanged and ContentChanged apply
+// only to modifications. A mode change includes executable and symlink changes;
+// content compares typed blob identities, never decoded text or target paths.
+type FileDelta struct {
+	Path model.Path
+	Before, After model.Operation
+	BeforePresent, AfterPresent bool
+	ModeChanged, ContentChanged bool
+}
+
+// DiffFileEntries compares two exact corresponding selections of file entries,
+// represented by canonical SET operations sorted strictly by raw byte path.
+// DELETE operations, duplicate/unsorted paths and invalid values reject. It
+// does not sort, normalize paths, resolve symlinks or infer renames/copies.
+//
+// This is a bounded selection comparator, NOT a tree/page traversal or tree
+// validity verifier. Callers must supply complete matching selected scopes;
+// a missing row then means absence within that selection. They must validate
+// tree structure and blob content and authorize both selections before calling.
+// It does not fetch bytes, classify binary content or produce text patches.
+// Inputs must not be mutated concurrently. Errors return no partial deltas.
+func DiffFileEntries(ctx context.Context, before, after []model.Operation, budget FileDiffBudget) ([]FileDelta, error) {
+	if ctx == nil { return nil, ErrFileDiffInput }
+	if err := ctx.Err(); err != nil { return nil, err }
+	if budget.Entries == 0 || budget.Entries > 1000000 || budget.PathBytes == 0 || budget.PathBytes > 64<<20 || budget.Changes == 0 || budget.Changes > budget.Entries {
+		return nil, ErrFileDiffLimit
+	}
+	if uint64(len(before)) > budget.Entries || uint64(len(after)) > budget.Entries-uint64(len(before)) { return nil, ErrFileDiffLimit }
+	var pathBytes uint64
+	for _, side := range [][]model.Operation{before, after} {
+		for i, op := range side {
+			if err := ctx.Err(); err != nil { return nil, err }
+			id, present := op.Target()
+			if op.Path().Validate() != nil || !present || id.Validate() != nil || (i > 0 && side[i-1].Path().Compare(op.Path()) >= 0) {
+				return nil, ErrFileDiffInput
+			}
+			// Each Path already owns at most 65,535 bytes. This temporary copy
+			// is bounded independently before charging aggregate path storage.
+			n := uint64(len(op.Path().Bytes()))
+			if n > budget.PathBytes-pathBytes { return nil, ErrFileDiffLimit }
+			pathBytes += n
+		}
+	}
+	var deltas []FileDelta
+	for i, j := 0, 0; i < len(before) || j < len(after); {
+		if err := ctx.Err(); err != nil { return nil, err }
+		var d FileDelta
+		switch {
+		case j == len(after) || (i < len(before) && before[i].Path().Compare(after[j].Path()) < 0):
+			d = FileDelta{Path: before[i].Path(), Before: before[i], BeforePresent: true}
+			i++
+		case i == len(before) || after[j].Path().Compare(before[i].Path()) < 0:
+			d = FileDelta{Path: after[j].Path(), After: after[j], AfterPresent: true}
+			j++
+		default:
+			old, next := before[i], after[j]
+			i++; j++
+			if old == next { continue }
+			oldID, _ := old.Target()
+			nextID, _ := next.Target()
+			d = FileDelta{Path: old.Path(), Before: old, After: next, BeforePresent: true, AfterPresent: true, ModeChanged: old.Tag() != next.Tag(), ContentChanged: oldID != nextID}
+		}
+		if uint64(len(deltas)) == budget.Changes { return nil, ErrFileDiffLimit }
+		deltas = append(deltas, d)
+	}
+	if err := ctx.Err(); err != nil { return nil, err }
+	return deltas, nil
+}
+
+// DiffCanonicalText verifies two complete canonical blob frames, then runs the
+// bounded text diff over their verified payloads. It always verifies BOTH frames,
+// including equal expected IDs. A known digest is not an authorization grant.
+// Callers must authorize delivery and explicitly classify/admit text first;
+// the NUL guard in DiffText is not comprehensive binary classification.
+//
+// Both inputs are present blobs: this does not model absent files, tree changes,
+// mode changes, compression envelopes or remote fetches. InputBytes admits the
+// combined decoded payload bytes (excluding two 22-byte canonical headers).
+// Decoding uses private in-memory staging and exposes no partial content. Limits
+// are not peak-memory ceilings; buffers and output have bounded owned storage.
+// Input frames must not be modified during the call. Errors return zero TextDiff.
+func DiffCanonicalText(ctx context.Context, oldID, nextID model.BlobID, oldFrame, nextFrame []byte, budget TextDiffBudget) (TextDiff, error) {
+	var zero TextDiff
+	if ctx == nil { return zero, ErrDiffInput }
+	if err := ctx.Err(); err != nil { return zero, err }
+	if budget.InputBytes == 0 || budget.InputBytes > 64<<20 || budget.OutputBytes == 0 || budget.OutputBytes > 64<<20 || budget.Lines == 0 || budget.Lines > 1000000 || budget.Context > budget.Lines {
+		return zero, ErrDiffLimit
+	}
+	frameBytes := budget.InputBytes + 44
+	if uint64(len(oldFrame)) > frameBytes || uint64(len(nextFrame)) > frameBytes-uint64(len(oldFrame)) { return zero, ErrDiffLimit }
+	var old, next bytes.Buffer
+	used, err := model.DecodeBlob(ctx, bytes.NewReader(oldFrame), oldID, &old, budget.InputBytes)
+	if err != nil { return zero, err }
+	if _, err := model.DecodeBlob(ctx, bytes.NewReader(nextFrame), nextID, &next, budget.InputBytes-used); err != nil { return zero, err }
+	return DiffText(ctx, old.Bytes(), next.Bytes(), budget)
+}
+
+// PrivateTreeDiffBudget gives each side its OWN traversal/output allowance,
+// ordered before then after. Compare separately bounds combined selected rows,
+// combined path bytes and emitted deltas. No allowance is silently reset across
+// sides: total admitted traversal work is bounded by the sum of both Side caps.
+// These are admission limits, not peak-memory or interruptible CPU guarantees.
+type PrivateTreeDiffBudget struct {
+	Side [2]derived.TreeEntriesBudget
+	Compare FileDiffBudget
+}
+
+// DiffPrivateTrees verifies and enumerates two entire supplied private page
+// graphs, then compares their canonical file entries. Both graphs are checked
+// even when root IDs match. Missing/invalid pages and exhaustion are errors,
+// never absence. No partial deltas escape. Usage counters on errors describe
+// attempted private traversal, not public progress or an authorization receipt.
+//
+// This does not validate file blob bytes, establish repository/source binding,
+// publication/retention, authorize output, fetch pages or classify text. Callers
+// must establish provenance and authorize BOTH graphs before any disclosure,
+// including paths, counts and timing. Unreachable map frames are ignored. Maps
+// and frames must not mutate during the call. No resumable cursor is provided.
+func DiffPrivateTrees(ctx context.Context, roots [2]derived.TreePageID, frames [2]map[derived.TreePageID][]byte, budget PrivateTreeDiffBudget) ([]FileDelta, [2]derived.TreeGraphUsage, error) {
+	var usage [2]derived.TreeGraphUsage
+	// Reject invalid comparator/context admission before traversing any graph.
+	if _, err := DiffFileEntries(ctx, nil, nil, budget.Compare); err != nil { return nil, usage, err }
+	var rows [2][]model.Operation
+	for i := range roots {
+		var err error
+		rows[i], usage[i], err = derived.ReadTreeEntries(ctx, roots[i], frames[i], budget.Side[i])
+		if err != nil { return nil, usage, err }
+	}
+	deltas, err := DiffFileEntries(ctx, rows[0], rows[1], budget.Compare)
+	return deltas, usage, err
+}
+
+// DiffPrivateTreePath compares one exact raw-byte file path in two already
+// validated retained graphs. Each side has its own explicit lookup allowance;
+// total traversal is bounded by their sum. It does NOT establish whole-graph
+// validity, retention, source/repository binding or authorization. Unrelated
+// subtrees and blob content are not examined, and symlinks are never followed.
+//
+// Roots/maps/budgets are ordered before, after. Both lookups run even for equal
+// roots. Only ErrTreeLeafAbsent becomes an absent side; missing/corrupt pages,
+// exhaustion and cancellation remain errors with no deltas. Directory-only
+// paths count as absent FILE leaves. Nil deltas means equal file state, not a
+// graph equality proof. Otherwise exactly one owned immutable delta is returned.
+// Path and output storage are bounded by canonical path limits and two entries.
+// All results, absence/error distinctions and usage are private data; callers
+// must authorize both inputs before disclosure. Frames must not mutate in-call.
+func DiffPrivateTreePath(ctx context.Context, roots [2]derived.TreePageID, frames [2]map[derived.TreePageID][]byte, path model.Path, budget [2]derived.TreeLookupBudget) ([]FileDelta, [2]derived.TreeLookupUsage, error) {
+	var usage [2]derived.TreeLookupUsage
+	if ctx == nil { return nil, usage, ErrFileDiffInput }
+	if err := ctx.Err(); err != nil { return nil, usage, err }
+	if path.Validate() != nil { return nil, usage, ErrFileDiffInput }
+	var rows [2][]model.Operation
+	for i := range roots {
+		row, used, err := derived.LookupTreeLeaf(ctx, roots[i], frames[i], path, budget[i])
+		usage[i] = used
+		if err == derived.ErrTreeLeafAbsent { continue }
+		if err != nil { return nil, usage, err }
+		rows[i] = []model.Operation{row}
+	}
+	deltas, err := DiffFileEntries(ctx, rows[0], rows[1], FileDiffBudget{Entries: 2, PathBytes: 2*65535, Changes: 1})
+	return deltas, usage, err
+}
+
+// CanonicalDAGDiffBudget admits whole-DAG checked replay, then separately
+// bounded before/after enumeration and comparison. Total work includes the
+// sum of those phases; limits are not measured peak-memory or CPU guarantees.
+type CanonicalDAGDiffBudget struct {
+	Replay derived.TreeReplayBudget
+	Diff PrivateTreeDiffBudget
+}
+type CanonicalDAGDiffUsage struct {
+	Replay derived.TreeReplayUsage
+	Trees [2]derived.TreeGraphUsage
+}
+
+// DiffCanonicalDAGTrees derives both selected revisions from a complete
+// topologically ordered canonical DAG, then compares their entire file maps.
+// The selections are ordered before/after and may be equal or occur anywhere
+// in the supplied DAG. All supplied sources/parents and reachable blob/page
+// bytes pass checked replay, including branches outside the selected pair.
+// There is no caller-supplied source-to-tree mapping or fallback fetch.
+//
+// Results are PRIVATE supplied-byte computations, not evidence of authoritative
+// publication, retention or permission to disclose either revision. Callers
+// must authorize all input/output/error/timing visibility. Inputs must remain
+// stable. No durable provider, pagination, resume, text patch, rename/copy
+// inference or public query endpoint is provided. Failure returns no deltas.
+func DiffCanonicalDAGTrees(ctx context.Context, repository [16]byte, selected [2]model.ChangesetID, sources []derived.TreeSourceFrame, blobs map[model.BlobID][]byte, budget CanonicalDAGDiffBudget) ([]FileDelta, CanonicalDAGDiffUsage, error) {
+	var used CanonicalDAGDiffUsage
+	bad := func(err error) ([]FileDelta, CanonicalDAGDiffUsage, error) { return nil, used, err }
+	if ctx == nil || selected[0].Validate() != nil || selected[1].Validate() != nil || len(sources) == 0 { return bad(ErrFileDiffInput) }
+	if err := ctx.Err(); err != nil { return bad(err) }
+	if len(sources) > 64 { return bad(ErrFileDiffLimit) }
+	if _, err := DiffFileEntries(ctx, nil, nil, budget.Diff.Compare); err != nil { return bad(err) }
+	var found [2]bool
+	for _, source := range sources { for i, id := range selected { if source.ID == id { found[i] = true } } }
+	if !found[0] || !found[1] { return bad(ErrFileDiffInput) }
+	writes, pages, replay, err := derived.ReplayCanonicalTreeDAG(ctx, repository, sources, blobs, budget.Replay)
+	used.Replay = replay
+	if err != nil { return bad(err) }
+	var roots [2]derived.TreePageID
+	for _, write := range writes {
+		for i, id := range selected {
+			if write.Result.Identity.Changeset != id { continue }
+			roots[i], err = derived.ParseTreePageID(write.Result.Value.Bytes())
+			if err != nil { return bad(err) }
+		}
+	}
+	deltas, trees, err := DiffPrivateTrees(ctx, roots, [2]map[derived.TreePageID][]byte{pages, pages}, budget.Diff)
+	used.Trees = trees
+	if err != nil { return bad(err) }
+	if err := ctx.Err(); err != nil { return bad(err) }
+	return deltas, used, nil
+}
