@@ -93,6 +93,27 @@ func TestCanonicalTextReplayCombinesTargetAndDeclaredDelta(t *testing.T) {
 		if got, conflict, _, err := PrepareCanonicalTextFileReplay(ctx,repo,selected[1],selected[0],selected[2],path,sources,blobs,short); err != ErrTextLimit || got.Operation != (model.Operation{}) || got.BlobFrame != nil || conflict != nil { t.Fatal(got,conflict,err) }
 		bad := budget; bad.Text.Cells = 0
 		if got, conflict, used, err := PrepareCanonicalTextFileReplay(ctx,repo,selected[1],selected[0],selected[2],path,sources,nil,bad); err != ErrTextLimit || got.Operation != (model.Operation{}) || got.BlobFrame != nil || conflict != nil || used != (TreeFileMergeUsage{}) { t.Fatal(got,conflict,used,err) }
+		corrupt := append([]derived.TreeSourceFrame(nil), sources...)
+		corrupt[1].Frame = append([]byte(nil), sources[1].Frame...)
+		corrupt[1].Frame[len(corrupt[1].Frame)-1] ^= 1
+		for _, check := range []struct {
+			name    string
+			parent  model.ChangesetID
+			sources []derived.TreeSourceFrame
+			budget  TreeTextFileMergeBudget
+			want    error
+		}{
+			{"wrong-actual-parent", selected[2], sources, budget, metadata.ErrFailedPrecondition},
+			{"text-limit-before-parent-membership", selected[2], sources, bad, ErrTextLimit},
+			{"text-limit-before-source-decode", selected[0], corrupt, bad, ErrTextLimit},
+		} {
+			t.Run(check.name, func(t *testing.T) {
+				got, conflict, used, err := PrepareCanonicalTextFileReplay(ctx, repo, selected[1], check.parent, selected[0], path, check.sources, blobs, check.budget)
+				if err != check.want || got.Operation != (model.Operation{}) || got.BlobFrame != nil || conflict != nil || used != (TreeFileMergeUsage{}) {
+					t.Fatalf("wanted %v with no output or usage, got operation=%v blob=%v conflict=%v usage=%+v err=%v", check.want, got.Operation, got.BlobFrame, conflict, used, err)
+				}
+			})
+		}
 		cancelled,cancel := context.WithCancel(ctx); cancel()
 		if got, conflict, _, err := PrepareCanonicalTextFileReplay(cancelled,repo,selected[1],selected[0],selected[2],path,sources,blobs,budget); err != context.Canceled || got.Operation != (model.Operation{}) || got.BlobFrame != nil || conflict != nil { t.Fatal(got,conflict,err) }
 	}
