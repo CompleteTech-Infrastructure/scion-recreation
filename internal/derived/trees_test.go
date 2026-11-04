@@ -1176,6 +1176,33 @@ func TestTreeObjectGraphLiteralReferents(t *testing.T) {
 	}
 }
 
+func TestTreeObjectGraphBlobBudgetAdmission(t *testing.T) {
+	blob, frame := treeCanonicalBlob(t, []byte("small valid payload"))
+	path, err := model.NewPath([]byte("a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, pages, err := BuildSingleLeafTree(context.Background(), path, 1, blob, TreeBuildBudget{1, 60})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blobs := map[model.BlobID][]byte{blob: frame}
+	// A small valid frame fits both the exact frame budget and the normal
+	// ceiling, so later graph/blob checks cannot mask admission failures.
+	for _, limit := range []uint64{uint64(len(frame)), 1 << 20} {
+		used, err := CheckTreeObjectGraph(context.Background(), root, pages, blobs, TreeObjectGraphBudget{graphTestBudget(), limit})
+		if err != nil || used.Graph.Visits != 1 || used.BlobVisits != 1 || used.BlobBytes != uint64(len(frame)) {
+			t.Fatalf("valid budget %d: usage=%+v err=%v", limit, used, err)
+		}
+	}
+	for _, limit := range []uint64{0, (1 << 20) + 1} {
+		used, err := CheckTreeObjectGraph(context.Background(), root, pages, blobs, TreeObjectGraphBudget{graphTestBudget(), limit})
+		if err != metadata.ErrInvalidArgument || used != (TreeObjectGraphUsage{}) {
+			t.Fatalf("invalid budget %d reached graph/blob work: usage=%+v err=%v", limit, used, err)
+		}
+	}
+}
+
 func TestTreeObjectGraphRepeatedBlobBudgetsAndIntegrity(t *testing.T) {
 	blob, frame := treeCanonicalBlob(t, []byte{0, 255, '/', 'x'}) // opaque symlink/binary bytes
 	pathA, _ := model.NewPath([]byte("a")); pathB, _ := model.NewPath([]byte("b"))
