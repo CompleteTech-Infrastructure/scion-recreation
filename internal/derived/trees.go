@@ -444,3 +444,69 @@ func ReplaceExistingTreeLeaf(ctx context.Context, root TreePageID, frames map[Tr
 	if err := ctx.Err(); err != nil { return bad(err) }
 	return replacement, produced, nil
 }
+
+type TreeBuildBudget struct { Pages, Bytes uint64 }
+
+// BuildSingleLeafTree constructs the canonical tree containing exactly one
+// file leaf and its implicit directories. This is empty-tree/missing-suffix
+// groundwork, NOT insertion into an existing tree or a changeset application.
+// All outputs are private candidates; the blob identity is type-checked only,
+// without content/durability/retention/publication or authorization evidence.
+// Exact page count and encoded bytes are admitted before frame construction.
+// Budgets bound produced pages/bytes, not total RSS or measured CPU time.
+func BuildSingleLeafTree(ctx context.Context, path model.Path, tag byte, target model.BlobID, budget TreeBuildBudget) (TreePageID, map[TreePageID][]byte, error) {
+	bad := func(err error) (TreePageID, map[TreePageID][]byte, error) { return TreePageID{}, nil, err }
+	if ctx == nil || path.Validate() != nil || tag < 1 || tag > 3 || target.Validate() != nil ||
+		budget.Pages == 0 || budget.Pages > 4096 || budget.Bytes == 0 || budget.Bytes > 4096*MaxTreePageBytes { return bad(metadata.ErrInvalidArgument) }
+	if err := ctx.Err(); err != nil { return bad(err) }
+	raw := path.Bytes()
+	starts := []int{0}
+	for i, b := range raw { if b == '/' { starts = append(starts, i+1) } }
+	var pages, size uint64
+	for i, start := range starts {
+		if err := ctx.Err(); err != nil { return bad(err) }
+		end := len(raw)
+		if i+1 < len(starts) { end = starts[i+1]-1 }
+		length := uint64(end-start)
+		n := length/256+1
+		targetBytes := uint64(TreePageIDSize)
+		if i == len(starts)-1 { targetBytes = model.TypedIDSize }
+		// Each unary edge consumes one component byte and adds a 40-byte
+		// child row. All nodes have 24 framing/count/tag bytes.
+		encoded := length + 24*n + targetBytes + 39*(n-1)
+		if n > budget.Pages-pages || encoded > budget.Bytes-size { return bad(metadata.ErrResourceExhausted) }
+		pages += n
+		size += encoded
+	}
+	frames := make(map[TreePageID][]byte, int(pages))
+	var root TreePageID
+	for i := len(starts)-1; i >= 0; i-- {
+		start, end := starts[i], len(raw)
+		if i+1 < len(starts) { end = starts[i+1]-1 }
+		component := raw[start:end]
+		var directory []byte
+		if start != 0 { directory = raw[:start-1] }
+		var continuation TreePageID
+		for offset := len(component)/256*256; offset >= 0; offset -= 256 {
+			if err := ctx.Err(); err != nil { return bad(err) }
+			last := offset+255
+			var p UnlinkedTreePage
+			if last >= len(component) {
+				p.Label = component[offset:]
+				if i == len(starts)-1 { p.Tag, p.Blob = tag, target } else { p.Tag, p.Directory = 4, root }
+			} else {
+				p.Label = component[offset:last]
+				p.Children = []TreePageChild{{Edge: component[last], ID: continuation}}
+			}
+			frame, id, err := EncodeTreePageAt(p, directory, component[:offset])
+			if err != nil { return bad(err) }
+			if previous, ok := frames[id]; ok {
+				if !bytes.Equal(previous, frame) { return bad(ErrTreePage) }
+			} else { frames[id] = frame }
+			continuation = id
+		}
+		root = continuation
+	}
+	if err := ctx.Err(); err != nil { return bad(err) }
+	return root, frames, nil
+}

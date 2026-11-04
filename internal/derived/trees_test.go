@@ -452,3 +452,76 @@ func TestReplaceExistingTreeLeafCopiesOnlyPath(t *testing.T) {
 	delete(frames, fileID)
 	if _, _, err := ReplaceExistingTreeLeaf(context.Background(), root, frames, path, 2, newBlob, budget); err != ErrTreePageMissing { t.Fatal("missing path page accepted") }
 }
+
+func TestBuildSingleLeafMatchesLiteralRoots(t *testing.T) {
+	b, err := os.ReadFile("../../tests/fixtures/tree_pages_v1.json")
+	if err != nil { t.Fatal(err) }
+	var f struct {
+		Pages []treeLiteral `json:"pages"`
+		Positive []struct {
+			Name string `json:"name"`
+			Root string `json:"root_id_hex"`
+			PageIDs []string `json:"page_ids"`
+			Entries []struct { Path string `json:"path_hex"`; Mode string `json:"mode"`; Payload string `json:"blob_payload_hex"` } `json:"entries"`
+		} `json:"positive_vectors"`
+	}
+	if err := json.Unmarshal(b, &f); err != nil { t.Fatal(err) }
+	literals := make(map[string][]byte)
+	for _, p := range f.Pages { literals[p.IDHex] = treeHex(t, p.FrameHex) }
+	checked := 0
+	for _, row := range f.Positive {
+		if len(row.Entries) != 1 { continue }
+		e := row.Entries[0]
+		path, err := model.NewPath(treeHex(t, e.Path))
+		if err != nil { t.Fatal(err) }
+		payload := treeHex(t, e.Payload)
+		blob, err := model.HashBlob(context.Background(), uint64(len(payload)), bytes.NewReader(payload))
+		if err != nil { t.Fatal(err) }
+		var tag byte
+		switch e.Mode { case "regular": tag = 1; case "executable": tag = 2; case "symlink": tag = 3; default: t.Fatal("unknown fixture mode") }
+		var total uint64
+		for _, id := range row.PageIDs { total += uint64(len(literals[id])) }
+		budget := TreeBuildBudget{uint64(len(row.PageIDs)), total}
+		root, pages, err := BuildSingleLeafTree(context.Background(), path, tag, blob, budget)
+		if err != nil { t.Fatalf("%s: %v", row.Name, err) }
+		expected, err := ParseTreePageID(treeHex(t, row.Root))
+		if err != nil || root != expected || len(pages) != len(row.PageIDs) { t.Fatalf("%s root/count mismatch", row.Name) }
+		for _, idHex := range row.PageIDs {
+			id, err := ParseTreePageID(treeHex(t, idHex))
+			if err != nil || !bytes.Equal(pages[id], literals[idHex]) { t.Fatalf("%s literal page mismatch", row.Name) }
+		}
+		// Do not claim graph-preflight success for the extreme fixture: that
+		// separate helper's cumulative context-copy cap remains unchanged.
+		if row.Name != "path-length-65535-components-1024" {
+			if _, err := CheckTreePageGraph(context.Background(), root, pages, graphTestBudget()); err != nil { t.Fatal(err) }
+		}
+		for _, limit := range []TreeBuildBudget{{budget.Pages, budget.Bytes-1}, {budget.Pages-1, budget.Bytes}} {
+			want := metadata.ErrResourceExhausted
+			if limit.Pages == 0 { want = metadata.ErrInvalidArgument }
+			id, pages, err := BuildSingleLeafTree(context.Background(), path, tag, blob, limit)
+			if err != want || id != (TreePageID{}) || pages != nil { t.Fatalf("%s bound: %v", row.Name, err) }
+		}
+		checked++
+	}
+	if checked != 9 { t.Fatalf("single-leaf fixture count: %d", checked) }
+}
+
+func TestBuildSingleLeafModesAndCancellation(t *testing.T) {
+	tid, _ := model.NewTypedID(model.BlobKind, [32]byte{1})
+	blob, _ := model.NewBlobID(tid)
+	path, _ := model.NewPath([]byte{'d', '/', 0xff})
+	budget := TreeBuildBudget{4096, 4096*MaxTreePageBytes}
+	seen := make(map[TreePageID]bool)
+	for tag := byte(1); tag <= 3; tag++ {
+		root, frames, err := BuildSingleLeafTree(context.Background(), path, tag, blob, budget)
+		if err != nil || seen[root] { t.Fatal("mode not preserved") }
+		seen[root] = true
+		if _, err := CheckTreePageGraph(context.Background(), root, frames, graphTestBudget()); err != nil { t.Fatal(err) }
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, out, err := BuildSingleLeafTree(ctx, path, 1, blob, budget); err != context.Canceled || out != nil { t.Fatal("canceled build produced output") }
+	if _, out, err := BuildSingleLeafTree(&treeCancelContext{Context: context.Background()}, path, 1, blob, budget); err != context.Canceled || out != nil { t.Fatal("mid-build cancellation lost") }
+	if _, _, err := BuildSingleLeafTree(context.Background(), model.Path{}, 1, blob, budget); err != metadata.ErrInvalidArgument { t.Fatal("empty path accepted") }
+	if _, _, err := BuildSingleLeafTree(context.Background(), path, 4, blob, budget); err != metadata.ErrInvalidArgument { t.Fatal("directory as file accepted") }
+}
