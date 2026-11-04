@@ -369,3 +369,98 @@ func TestLinuxNativeOpenArmsObservation(t *testing.T) {
 		}
 	}
 }
+
+// The display names on traversal FDs are workspace-relative. Metadata lookup
+// must use the held FD even when those names do not exist in the process CWD.
+func TestLinuxNativeEnumerationOutsideCWD(t *testing.T) {
+	t.Chdir(t.TempDir())
+	for _, hardlink := range []bool{false, true} {
+		t.Run(map[bool]string{false: "nested", true: "hardlink"}[hardlink], func(t *testing.T) {
+			root, meta := t.TempDir(), privateMetadataDir(t)
+			watchOK(t, os.Mkdir(filepath.Join(root, "sub"), 0700))
+			watchFile(t, filepath.Join(root, "sub/file"), "baseline")
+			if hardlink {
+				watchOK(t, os.Link(filepath.Join(root, "sub/file"), filepath.Join(t.TempDir(), "alias")))
+			}
+			watchOK(t, Save(meta, Manifest{Base: testChangeset(t, "cwd coverage"), SparseVersion: 1, SparseAll: true, State: Clean}))
+			limits := WatchLimits{Candidates: 128, CandidateBytes: 4096, Queue: 128, Entries: 256, Bytes: 64 << 10, Depth: 8, Descriptors: 2, Attempts: 32, Duration: 2 * time.Second}
+			w, err := OpenNativeWatch(root, meta, limits)
+			if hardlink {
+				if w != nil {
+					_ = w.Close()
+					t.Fatal("multiply linked descendant accepted")
+				}
+				watchIs(t, err, ErrWatchStale)
+				return
+			}
+			watchOK(t, err)
+			defer w.Close()
+			n := w.backend.(*linuxWatch)
+			watchOK(t, n.call(context.Background(), func() error {
+				for _, path := range []string{".", "sub", "sub/file"} {
+					if _, ok := n.paths[path]; !ok {
+						return ErrWatchStale
+					}
+				}
+				if n.peak > linuxWatchDescriptors {
+					return ErrWatchLimit
+				}
+				return nil
+			}))
+		})
+	}
+}
+
+// No Barrier or reconciliation is allowed after arrival: the periodic observer
+// must register new file inodes before later outside-link changes can be seen.
+func TestLinuxNativeRegularArrivalCoverage(t *testing.T) {
+	for _, moved := range []bool{false, true} {
+		t.Run(map[bool]string{false: "create", true: "move-in"}[moved], func(t *testing.T) {
+			w, n, root, _ := linuxFixture(t)
+			path := filepath.Join(root, "sub/arrived")
+			outside := t.TempDir()
+			if moved {
+				incoming := filepath.Join(outside, "incoming")
+				watchFile(t, incoming, "arrived")
+				watchOK(t, os.Rename(incoming, path))
+			} else {
+				watchFile(t, path, "arrived")
+			}
+			deadline := time.Now().Add(2 * time.Second)
+			for {
+				var covered bool
+				watchOK(t, n.call(context.Background(), func() error {
+					_, covered = n.paths["sub/arrived"]
+					return n.failed
+				}))
+				if covered {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("regular arrival never acquired inode coverage without Barrier")
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			_, before, err := w.Snapshot()
+			watchOK(t, err)
+			alias := filepath.Join(outside, "alias")
+			watchOK(t, os.Link(path, alias))
+			watchFile(t, alias, "outside write")
+			deadline = time.Now().Add(2 * time.Second)
+			for {
+				var failure error
+				watchOK(t, n.call(context.Background(), func() error { failure = n.failed; return nil }))
+				if failure != nil {
+					watchIs(t, failure, ErrWatchStale)
+					_, after, _ := w.Snapshot()
+					watchCheck(t, after > before, "outside link did not invalidate generation")
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("outside hard link did not fail closed")
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+		})
+	}
+}

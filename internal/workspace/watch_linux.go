@@ -293,6 +293,24 @@ func (n *linuxWatch) register(path string, info os.FileInfo, fd int) (int, error
 	return wd, nil
 }
 
+// entryInfo resolves names relative to the held directory, never File.Name or
+// the process working directory. O_PATH|O_NOFOLLOW pins even a symlink/special
+// file without following it or opening it for device/FIFO I/O.
+func (n *linuxWatch) entryInfo(dir *os.File, name string) (os.FileInfo, error) {
+	const oPath = 0x200000
+	fd, err := syscall.Openat(int(dir.Fd()), name, oPath|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	n.descriptors++
+	n.peak = max(n.peak, n.descriptors)
+	file := os.NewFile(uintptr(fd), name)
+	info, err := file.Stat()
+	err = errors.Join(err, file.Close())
+	n.descriptors--
+	return info, err
+}
+
 func (n *linuxWatch) maintain(ctx context.Context) error {
 	queue := []string{"."}
 	seen, paths := make(map[int]linuxRegistration), make(map[string]int)
@@ -325,22 +343,26 @@ func (n *linuxWatch) maintain(ctx context.Context) error {
 				if err = ctx.Err(); err != nil {
 					return err
 				}
-				des, e := f.Readdir(1) // descriptor-relative lstat, including DT_UNKNOWN
+				names, e := f.Readdirnames(1) // names only; metadata is resolved with openat below
 				if e != nil && e != io.EOF {
 					return e
 				}
-				for _, de := range des {
+				for _, name := range names {
 					entries++
-					used += len(path) + len(de.Name()) + 17
+					used += len(path) + len(name) + 17
 					if entries > n.limits.Entries || used > min(n.limits.Bytes, linuxWatchBytes) {
 						return ErrWatchLimit
 					}
-					child := de.Name()
+					child := name
 					if path != "." {
 						child = path + "/" + child
 					}
 					if model.ValidatePath([]byte(child)) != nil {
 						return ErrWatchStale
+					}
+					de, err := n.entryInfo(f, name)
+					if err != nil {
+						return err
 					}
 					// Symlinks are parent-directory hints only; never follow targets.
 					if de.IsDir() {
@@ -352,7 +374,7 @@ func (n *linuxWatch) maintain(ctx context.Context) error {
 						// O_PATH pins the inode without opening a raced device/FIFO
 						// for I/O. O_NOFOLLOW refuses a final symlink replacement.
 						const oPath = 0x200000 // Linux O_PATH (not exported by syscall).
-						fd, e := syscall.Openat(int(f.Fd()), de.Name(), oPath|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+						fd, e := syscall.Openat(int(f.Fd()), name, oPath|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
 						if e != nil {
 							return e
 						}
@@ -461,7 +483,10 @@ func (n *linuxWatch) decode(data []byte, events *[]WatchEvent, used *int) error 
 				*used += len(path)
 				*events = append(*events, WatchEvent{WatchPath, []byte(path)})
 			}
-			if mask&syscall.IN_ISDIR != 0 || mask&(syscall.IN_MOVE_SELF|syscall.IN_DELETE_SELF) != 0 {
+			// File arrivals need inode watches too. Attribute changes on watched
+			// files can signal an outside hard link: recheck link-count admission.
+			if mask&syscall.IN_ISDIR != 0 || mask&(syscall.IN_MOVE_SELF|syscall.IN_DELETE_SELF|syscall.IN_CREATE|syscall.IN_MOVED_TO) != 0 ||
+				reg.info.Mode().IsRegular() && mask&syscall.IN_ATTRIB != 0 {
 				n.coverage = true
 			}
 			if reg.info.IsDir() && mask&(syscall.IN_MOVE_SELF|syscall.IN_DELETE_SELF) != 0 || mask&syscall.IN_ISDIR != 0 && mask&(syscall.IN_MOVED_FROM|syscall.IN_DELETE) != 0 {
