@@ -67,3 +67,49 @@ func TestExactCopyIndexAdmissionAndInvalidRows(t *testing.T) {
 	if got, err := NewExactCopyIndex(ctx, source, rows, ExactCopyBudget{4, 4}); err != context.Canceled || got != nil { t.Fatal(got, err) }
 	if got, err := index.Lookup(ctx, ids[0], 1); err != context.Canceled || got.Paths != nil { t.Fatal(got, err) }
 }
+
+func TestTreeExactCopyIndexBindingAndEnumeration(t *testing.T) {
+	source, rows, ids := copyFixture(t)
+	empty, root, err := EncodeTreePageAt(UnlinkedTreePage{}, nil, nil); if err != nil { t.Fatal(err) }
+	frames := map[TreePageID][]byte{root: empty}
+	for _, row := range rows {
+		id, _ := row.Target()
+		next, added, err := SetTreeLeaf(context.Background(), root, frames, row.Path(), byte(row.Tag()), id, TreeRewriteBudget{4096, 4096*MaxTreePageBytes, 4096*MaxTreePageBytes})
+		if err != nil { t.Fatal(err) }
+		for id, frame := range added { frames[id] = frame }; root = next
+	}
+	raw, err := root.MarshalBinary(); if err != nil { t.Fatal(err) }
+	value, err := metadata.NewDerivedValueID(raw); if err != nil { t.Fatal(err) }
+	identity := metadata.DerivedIdentity{Repository: [16]byte{1}, Changeset: source, Kind: "TREE", Version: 1}
+	record := metadata.DerivedResult{Identity: identity, Value: value}
+	budget := TreeEntriesBudget{Graph: TreeGraphBudget{4096, 4096*MaxTreePageBytes, 64<<20}, Entries: 4, PathBytes: 8}
+	index, usage, err := NewTreeExactCopyIndex(context.Background(), identity, record, frames, budget)
+	if err != nil || usage.Terminals != 4 { t.Fatal(index, usage, err) }
+	got, err := index.Lookup(context.Background(), ids[0], 3)
+	if err != nil || got.Source != source || len(got.Paths) != 3 || string(got.Paths[0].Bytes()) != "A" || string(got.Paths[1].Bytes()) != "a" || string(got.Paths[2].Bytes()) != "\xff" { t.Fatal(got, err) }
+	// Successful index has no mutable frame dependency.
+	frames[root][0] ^= 1
+	if again, err := index.Lookup(context.Background(), ids[0], 3); err != nil || len(again.Paths) != 3 { t.Fatal(again, err) }
+	if index, _, err := NewTreeExactCopyIndex(context.Background(), identity, record, frames, budget); err != ErrTreePage || index != nil { t.Fatal(index, err) }
+	frames[root][0] ^= 1
+	for _, which := range []string{"repo", "source", "kind", "version", "value"} {
+		bad := record
+		switch which {
+		case "repo": bad.Identity.Repository[0] ^= 1
+		case "source": bad.Identity.Changeset = model.ChangesetID{}
+		case "kind": bad.Identity.Kind = "COPY"
+		case "version": bad.Identity.Version = 2
+		case "value": bad.Value = metadata.DerivedValueID{}
+		}
+		if index, usage, err := NewTreeExactCopyIndex(context.Background(), identity, bad, frames, budget); err != metadata.ErrInvalidArgument || index != nil || usage != (TreeGraphUsage{}) { t.Fatal(which, index, usage, err) }
+	}
+	for _, which := range []string{"entries", "paths", "reads", "visits"} {
+		b := budget
+		switch which { case "entries": b.Entries = 3; case "paths": b.PathBytes = 7; case "reads": b.Graph.PageBytes = 1; case "visits": b.Graph.Visits = 1 }
+		if index, _, err := NewTreeExactCopyIndex(context.Background(), identity, record, frames, b); err != metadata.ErrResourceExhausted || index != nil { t.Fatal(which, index, err) }
+	}
+	if index, _, err := NewTreeExactCopyIndex(context.Background(), identity, record, nil, budget); err != ErrTreePageMissing || index != nil { t.Fatal(index, err) }
+	if index, _, err := NewTreeExactCopyIndex(nil, identity, record, frames, budget); err != metadata.ErrInvalidArgument || index != nil { t.Fatal(index, err) }
+	ctx, cancel := context.WithCancel(context.Background()); cancel()
+	if index, _, err := NewTreeExactCopyIndex(ctx, identity, record, frames, budget); err != context.Canceled || index != nil { t.Fatal(index, err) }
+}

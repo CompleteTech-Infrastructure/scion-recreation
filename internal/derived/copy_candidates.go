@@ -81,3 +81,29 @@ func (index *ExactCopyIndex) Lookup(ctx context.Context, blob model.BlobID, maxR
 	if err := ctx.Err(); err != nil { return zero, err }
 	return out, nil
 }
+
+// NewTreeExactCopyIndex builds a private exact index from a complete verified
+// page enumeration. identity is the expected TREE-v1 repository/source key;
+// tree must match it exactly and identify the supplied graph root. The caller
+// must obtain tree from an authoritative complete mapping and supply retained
+// frames. Matching caller-supplied fields is NOT provenance or durability proof.
+//
+// This checks page framing/context/topology and completeness under explicit
+// enumeration budgets, but not source changeset bytes or file blobs. It neither
+// authenticates nor authorizes anything. All rows, usage and subsequent index
+// results remain private. Unreachable frames are ignored, input maps/frames must
+// not mutate, and errors return nil index. Enumeration PathBytes charges assembly
+// plus owned paths; index admission then checks the retained raw path bytes under
+// that same numeric cap, not a cumulative allocator/RSS budget. No resume exists.
+func NewTreeExactCopyIndex(ctx context.Context, identity metadata.DerivedIdentity, tree metadata.DerivedResult, frames map[TreePageID][]byte, budget TreeEntriesBudget) (*ExactCopyIndex, TreeGraphUsage, error) {
+	var usage TreeGraphUsage
+	if ctx == nil { return nil, usage, metadata.ErrInvalidArgument }
+	if err := ctx.Err(); err != nil { return nil, usage, err }
+	if identity.Validate() != nil || identity.Kind != "TREE" || identity.Version != 1 || tree.Identity != identity || tree.Value.Validate() != nil { return nil, usage, metadata.ErrInvalidArgument }
+	root, err := ParseTreePageID(tree.Value.Bytes())
+	if err != nil { return nil, usage, err }
+	rows, usage, err := ReadTreeEntries(ctx, root, frames, budget)
+	if err != nil { return nil, usage, err }
+	index, err := NewExactCopyIndex(ctx, identity.Changeset, rows, ExactCopyBudget{Entries: budget.Entries, PathBytes: budget.PathBytes})
+	return index, usage, err
+}
