@@ -50,7 +50,7 @@ func DeriveFirstParentLineOrigins(ctx context.Context, current model.ChangesetID
 	bad := func(err error) ([]LineOriginSpan, LineOriginUsage, error) { return nil, used, err }
 	if ctx == nil || current.Validate() != nil { return bad(ErrLineOriginInput) }
 	if err := ctx.Err(); err != nil { return bad(err) }
-	if budget.InputBytes == 0 || budget.InputBytes > 1<<20 || budget.Lines == 0 || budget.Lines > 4096 || budget.Cells == 0 || budget.Cells > 1<<20 || budget.CompareBytes == 0 || budget.CompareBytes > 64<<20 || budget.Spans == 0 || budget.Spans > budget.Lines { return bad(ErrLineOriginBudget) }
+	if !validLineOriginBudget(budget) { return bad(ErrLineOriginBudget) }
 	if uint64(len(before)) > budget.InputBytes || uint64(len(after)) > budget.InputBytes-uint64(len(before)) { return bad(ErrLineOriginBudget) }
 	used.InputBytes = uint64(len(before)+len(after))
 	split := func(data []byte) ([][]byte, error) {
@@ -113,4 +113,91 @@ func DeriveFirstParentLineOrigins(ctx context.Context, current model.ChangesetID
 	}
 	if err := ctx.Err(); err != nil { return bad(err) }
 	return spans, used, nil
+}
+
+func validLineOriginBudget(b LineOriginBudget) bool {
+	return b.InputBytes > 0 && b.InputBytes <= 1<<20 && b.Lines > 0 && b.Lines <= 4096 && b.Cells > 0 && b.Cells <= 1<<20 && b.CompareBytes > 0 && b.CompareBytes <= 64<<20 && b.Spans > 0 && b.Spans <= b.Lines
+}
+
+var ErrLineOriginAbsent = errors.New("selected path has no current file")
+
+// CanonicalBlameBudget admits complete DAG/history work plus at most one LCS
+// attempt per changed text blob in the selected current file lifetime. Each
+// attempt has its own Derive ceiling; summed work is not one LCS quantum.
+// BlobBytes separately caps aggregate complete frames decoded for blame (at
+// most 1 MiB), beyond the history replay's earlier blob integrity passes.
+type CanonicalBlameBudget struct {
+	History CanonicalPathHistoryBudget
+	Derive LineOriginBudget
+	BlobBytes uint64
+}
+type CanonicalBlameUsage struct {
+	History CanonicalPathHistoryUsage
+	BlobBytes, Updates uint64
+	Lines LineOriginUsage
+}
+// CanonicalLineOrigins is a PRIVATE source/path-bound text result. Mode and Blob
+// describe the selected present regular/executable file; empty content is valid.
+// Spans use this algorithm's zero-based intervals, not public RPC numbering.
+type CanonicalLineOrigins struct {
+	Source model.ChangesetID
+	Path model.Path
+	Mode model.OperationTag
+	Blob model.BlobID
+	Spans []LineOriginSpan
+}
+
+// ReadCanonicalDAGLineOrigins derives origins internally from checked canonical
+// DAG/path history. It starts at the latest absent-to-present event in the
+// selected first-parent lineage, so deletion/re-add never inherits old origins.
+// Earlier lifetimes are not text-classified (but still integrity-checked by
+// replay). Mode-only regular/executable changes preserve origins. Every state
+// in the current lifetime must be explicitly admitted regular/executable text;
+// symlink states reject, NUL rejects, and a currently absent path has a distinct
+// PRIVATE ErrLineOriginAbsent result. No rename/copy/all-parent inference occurs.
+//
+// Source publication, durable retention and authorization remain external.
+// This is not a durable index or public endpoint. Inputs must stay stable.
+// All errors return a zero result; usage/errors must never expose hidden data.
+func ReadCanonicalDAGLineOrigins(ctx context.Context, repository [16]byte, source model.ChangesetID, path model.Path, sources []TreeSourceFrame, blobs map[model.BlobID][]byte, budget CanonicalBlameBudget) (CanonicalLineOrigins, CanonicalBlameUsage, error) {
+	var used CanonicalBlameUsage
+	bad := func(err error) (CanonicalLineOrigins, CanonicalBlameUsage, error) { return CanonicalLineOrigins{}, used, err }
+	if ctx == nil || source.Validate() != nil || path.Validate() != nil { return bad(ErrLineOriginInput) }
+	if err := ctx.Err(); err != nil { return bad(err) }
+	if !validLineOriginBudget(budget.Derive) || budget.BlobBytes == 0 || budget.BlobBytes > 1<<20 { return bad(ErrLineOriginBudget) }
+	history, historyUsage, err := ReadCanonicalDAGPathHistory(ctx, repository, source, path, sources, blobs, budget.History)
+	used.History = historyUsage
+	if err != nil { return bad(err) }
+	if len(history) == 0 || !history[0].AfterPresent { return bad(ErrLineOriginAbsent) }
+	start := -1
+	for i, event := range history { if !event.BeforePresent && event.AfterPresent { start = i; break } }
+	if start == -1 { return bad(ErrLineOriginInput) }
+	var previous model.Operation
+	var content []byte
+	var spans []LineOriginSpan
+	for i := start; i >= 0; i-- {
+		if err := ctx.Err(); err != nil { return bad(err) }
+		event := history[i]
+		if !event.AfterPresent || (i != start && (!event.BeforePresent || event.Before != previous)) { return bad(ErrLineOriginInput) }
+		tag := event.After.Tag()
+		if tag != model.SetRegular && tag != model.SetExecutable { return bad(ErrLineOriginInput) }
+		id, present := event.After.Target(); if !present { return bad(ErrLineOriginInput) }
+		priorID, hadPrior := previous.Target()
+		if hadPrior && priorID == id { previous = event.After; continue }
+		frame, exists := blobs[id]; if !exists { return bad(ErrTreeBlobMissing) }
+		if uint64(len(frame)) > budget.BlobBytes-used.BlobBytes { return bad(ErrLineOriginBudget) }
+		used.BlobBytes += uint64(len(frame))
+		var decoded bytes.Buffer
+		if _, err := model.DecodeBlob(ctx, bytes.NewReader(frame), id, &decoded, uint64(len(frame))); err != nil { return bad(err) }
+		var prior []model.ChangesetID
+		for _, span := range spans { for line := span.Start; line < span.End; line++ { if err := ctx.Err(); err != nil { return bad(err) }; prior = append(prior, span.Origin) } }
+		used.Updates++
+		nextSpans, work, err := DeriveFirstParentLineOrigins(ctx, event.Changeset, content, decoded.Bytes(), prior, budget.Derive)
+		used.Lines.InputBytes += work.InputBytes; used.Lines.Lines += work.Lines; used.Lines.Cells += work.Cells; used.Lines.CompareBytes += work.CompareBytes
+		if err != nil { return bad(err) }
+		spans, content, previous = nextSpans, decoded.Bytes(), event.After
+	}
+	if err := ctx.Err(); err != nil { return bad(err) }
+	id, _ := previous.Target()
+	return CanonicalLineOrigins{Source: source, Path: path, Mode: previous.Tag(), Blob: id, Spans: spans}, used, nil
 }

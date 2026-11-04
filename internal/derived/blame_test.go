@@ -1,6 +1,7 @@
 package derived
 
 import (
+	"bytes"
 	"context"
 	"reflect"
 	"testing"
@@ -81,4 +82,54 @@ func TestFirstParentLineOriginsCancellationDiscardsPartialIntervals(t *testing.T
 	if out, _, err := DeriveFirstParentLineOrigins(cancel, current, before, after, []model.ChangesetID{a, b}, blameBudget()); err != context.Canceled || out != nil { t.Fatal("late cancellation exposed partial origins") }
 	ctx, stop := context.WithCancel(context.Background()); stop()
 	if out, _, err := DeriveFirstParentLineOrigins(ctx, current, before, after, []model.ChangesetID{a, b}, blameBudget()); err != context.Canceled || out != nil { t.Fatal("precancellation ignored") }
+}
+
+func TestCanonicalDAGLineOriginsResetLifetimeAndBindSource(t *testing.T) {
+	ctx := context.Background(); repo := [16]byte{10}
+	path, _ := model.NewPath([]byte("a")); missing, _ := model.NewPath([]byte("missing"))
+	binary, binaryFrame := treeCanonicalBlob(t, []byte{0})
+	base, baseFrame := treeCanonicalBlob(t, []byte("a\nb\n"))
+	inserted, insertedFrame := treeCanonicalBlob(t, []byte("a\nx\nb\n"))
+	final, finalFrame := treeCanonicalBlob(t, []byte("a\nx\nb"))
+	blobs := map[model.BlobID][]byte{binary: binaryFrame, base: baseFrame, inserted: insertedFrame, final: finalFrame}
+	original := make(map[model.BlobID][]byte); for id, frame := range blobs { original[id] = append([]byte(nil), frame...) }
+	var sources []TreeSourceFrame
+	for _, state := range []struct { tag model.OperationTag; blob model.BlobID }{{model.SetRegular, binary}, {model.Delete, model.BlobID{}}, {model.SetRegular, base}, {model.SetRegular, inserted}, {model.SetExecutable, inserted}, {model.SetExecutable, final}, {model.SetSymlink, final}} {
+		var target *model.BlobID; if state.tag != model.Delete { target = &state.blob }
+		op, err := model.NewOperation(path, state.tag, target); if err != nil { t.Fatal(err) }
+		change := model.ChangesetInput{RepoID: repo, Operations: []model.Operation{op}}
+		if len(sources) != 0 { change.Parents = []model.ChangesetID{sources[len(sources)-1].ID} }
+		sources = append(sources, treeReplaySource(t, change))
+	}
+	graph := TreeObjectGraphBudget{graphTestBudget(), 1<<20}
+	step := TreeCheckedWriteBudget{graph, graph, TreeChangesetBudget{TreeRewriteBudget{4096, 4096*MaxTreePageBytes, 4096*MaxTreePageBytes}, 4096, model.MaxChangesetPayload}}
+	history := CanonicalPathHistoryBudget{TreeReplayBudget{7, 1<<20, 4096, 4096*MaxTreePageBytes, step}, PathHistoryChainBudget{7, 1<<20, 7, TreeLookupBudget{4096, 4096*MaxTreePageBytes}}}
+	budget := CanonicalBlameBudget{history, blameBudget(), uint64(len(baseFrame)+len(insertedFrame)+len(finalFrame))}
+	got, used, err := ReadCanonicalDAGLineOrigins(ctx, repo, sources[5].ID, path, sources, blobs, budget)
+	want := []LineOriginSpan{{0, 1, sources[2].ID}, {1, 2, sources[3].ID}, {2, 3, sources[5].ID}}
+	if err != nil || got.Source != sources[5].ID || got.Path != path || got.Mode != model.SetExecutable || got.Blob != final || !reflect.DeepEqual(got.Spans, want) || used.Updates != 3 || used.BlobBytes != budget.BlobBytes || used.Lines != (LineOriginUsage{25, 13, 31, 48}) { t.Fatalf("canonical blame: %+v %+v %v", got, used, err) }
+	// Executable-only changes preserve every origin and do not re-decode
+	// the unchanged blob after its current-lifetime predecessor was verified.
+	modeOnly, modeUsage, err := ReadCanonicalDAGLineOrigins(ctx, repo, sources[4].ID, path, sources, blobs, budget)
+	wantMode := []LineOriginSpan{{0, 1, sources[2].ID}, {1, 2, sources[3].ID}, {2, 3, sources[2].ID}}
+	if err != nil || modeOnly.Mode != model.SetExecutable || !reflect.DeepEqual(modeOnly.Spans, wantMode) || modeUsage.Updates != 2 || modeUsage.BlobBytes != uint64(len(baseFrame)+len(insertedFrame)) { t.Fatal("mode-only change took line ownership") }
+	for _, tc := range []struct { source model.ChangesetID; path model.Path; want error }{{sources[0].ID, path, ErrLineOriginBinary}, {sources[1].ID, path, ErrLineOriginAbsent}, {sources[6].ID, path, ErrLineOriginInput}, {sources[5].ID, missing, ErrLineOriginAbsent}} {
+		out, _, err := ReadCanonicalDAGLineOrigins(ctx, repo, tc.source, tc.path, sources, blobs, budget)
+		if err != tc.want || !reflect.DeepEqual(out, CanonicalLineOrigins{}) { t.Fatalf("explicit absent/binary/type policy: %v", err) }
+	}
+	for _, dimension := range []string{"blob", "cells", "compare", "spans"} {
+		short := budget
+		switch dimension { case "blob": short.BlobBytes--; case "cells": short.Derive.Cells = 15; case "compare": short.Derive.CompareBytes = 23; case "spans": short.Derive.Spans = 2 }
+		if out, _, err := ReadCanonicalDAGLineOrigins(ctx, repo, sources[5].ID, path, sources, blobs, short); err != ErrLineOriginBudget || !reflect.DeepEqual(out, CanonicalLineOrigins{}) { t.Fatalf("%s exhaustion exposed partial origins: %v", dimension, err) }
+	}
+	if out, _, err := ReadCanonicalDAGLineOrigins(ctx, repo, sources[5].ID, path, sources, nil, budget); err == nil || !reflect.DeepEqual(out, CanonicalLineOrigins{}) { t.Fatal("missing retained blob accepted") }
+	if out, _, err := ReadCanonicalDAGLineOrigins(ctx, [16]byte{11}, sources[5].ID, path, sources, blobs, budget); err == nil || !reflect.DeepEqual(out, CanonicalLineOrigins{}) { t.Fatal("foreign repository accepted") }
+	bad := append([]TreeSourceFrame(nil), sources...); bad[6].Frame = append([]byte(nil), bad[6].Frame...); bad[6].Frame[len(bad[6].Frame)-1] ^= 1
+	if out, _, err := ReadCanonicalDAGLineOrigins(ctx, repo, sources[5].ID, path, bad, blobs, budget); err == nil || !reflect.DeepEqual(out, CanonicalLineOrigins{}) { t.Fatal("off-lineage source corruption ignored") }
+	// The final completion checkpoint occurs after private spans exist.
+	probe := &blameCancelContext{Context: ctx}
+	if _, _, err := ReadCanonicalDAGLineOrigins(probe, repo, sources[5].ID, path, sources, blobs, budget); err != nil { t.Fatal(err) }
+	cancel := &blameCancelContext{Context: ctx, at: probe.calls}
+	if out, _, err := ReadCanonicalDAGLineOrigins(cancel, repo, sources[5].ID, path, sources, blobs, budget); err != context.Canceled || !reflect.DeepEqual(out, CanonicalLineOrigins{}) { t.Fatal("final cancellation exposed origins") }
+	for id, frame := range blobs { if !bytes.Equal(frame, original[id]) { t.Fatal("canonical blame mutated blob input") } }
 }
