@@ -453,3 +453,48 @@ func TestRepositoryPolicyVersionCannotWrap(t *testing.T) {
 	}
 	repositoryTestCheck(t, e, context.Background(), admin, repositoryTestScope(), max, authz.RepositoryAdmin, true)
 }
+
+// Compilation is not publication: the second authorization check must reject
+// changed identity/context state without advancing the head or changing rights.
+func TestRepositoryPolicyUpdateRecheckFailurePreservesHead(t *testing.T) {
+	for _, failure := range []string{"canceled", "expired", "clock_error", "zero_clock"} {
+		t.Run(failure, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			clockCalls := 0
+			clock := func() (time.Time, error) {
+				clockCalls++
+				if clockCalls == 2 {
+					switch failure {
+					case "canceled":
+						cancel()
+					case "expired":
+						return time.Unix(200, 0), nil
+					case "clock_error":
+						return time.Unix(150, 0), errors.New("private clock failure")
+					case "zero_clock":
+						return time.Time{}, nil
+					}
+				}
+				return repositoryTestClock()
+			}
+			e := repositoryTestEngine(t, repositoryTestPolicy(), clock)
+			next := repositoryTestPolicy()
+			next.Version, next.Members[0].Active = 1, false
+			admin := repositoryTestIdentity("fixture-issuer", "administrator", authz.Human, repositoryTestAudience)
+			err := e.Update(ctx, admin, repositoryTestScope(), 0, next)
+			if err != authz.ErrRepositoryDenied || clockCalls != 2 {
+				t.Fatalf("failed recheck = %v, clock calls=%d; want fixed denial at second check", err, clockCalls)
+			}
+			writer := repositoryTestIdentity("fixture-issuer", "writer", authz.Human, repositoryTestAudience)
+			repositoryTestCheck(t, e, context.Background(), writer, repositoryTestScope(), 0, authz.RepositoryWrite, true)
+			repositoryTestCheck(t, e, context.Background(), writer, repositoryTestScope(), 1, authz.RepositoryWrite, false)
+			// The failed call must not consume the version or poison later calls.
+			if err := e.Update(context.Background(), admin, repositoryTestScope(), 0, next); err != nil {
+				t.Fatalf("retry after failed recheck: %v", err)
+			}
+			repositoryTestCheck(t, e, context.Background(), writer, repositoryTestScope(), 1, authz.RepositoryWrite, false)
+			repositoryTestCheck(t, e, context.Background(), admin, repositoryTestScope(), 1, authz.RepositoryAdmin, true)
+		})
+	}
+}
