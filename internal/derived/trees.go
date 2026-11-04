@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"sort"
 
 	"canopy.local/canopy/internal/model"
 	"canopy.local/canopy/internal/storage/metadata"
@@ -335,4 +336,111 @@ func CheckTreePageGraph(ctx context.Context, root TreePageID, frames map[TreePag
 	}
 	if err := ctx.Err(); err != nil { return used, err }
 	return used, nil
+}
+
+var ErrTreeLeafAbsent = errors.New("existing tree leaf required")
+
+type TreeRewriteBudget struct { Pages, ReadBytes, WriteBytes uint64 }
+
+// ReplaceExistingTreeLeaf computes an exact existing-file SET using structural
+// path copying. It returns a candidate root plus only newly addressed frames;
+// no input frame is changed. Equal mode/target returns the original root and no
+// frames. It does NOT insert/delete, normalize structural edits, or apply a
+// simultaneous changeset. Directory paths are not existing file leaves.
+//
+// Caller MUST already have a validated retained base graph; only this path is
+// checked here, never unrelated subtrees. This helper cannot establish that
+// precondition. Neither old/new blobs nor storage receipts are verified here.
+// Output is PRIVATE candidate data, NOT durable publication or authorization.
+// No storage interface is introduced. Inputs must not change concurrently.
+// Pages/read/write bytes bound this non-resumable attempt; resource exhaustion
+// is not corruption. Larger jobs need a separately bounded resumable updater.
+func ReplaceExistingTreeLeaf(ctx context.Context, root TreePageID, frames map[TreePageID][]byte, path model.Path, tag byte, target model.BlobID, budget TreeRewriteBudget) (TreePageID, map[TreePageID][]byte, error) {
+	bad := func(err error) (TreePageID, map[TreePageID][]byte, error) { return TreePageID{}, nil, err }
+	if ctx == nil || root.Validate() != nil || path.Validate() != nil || tag < 1 || tag > 3 || target.Validate() != nil ||
+		budget.Pages == 0 || budget.Pages > 4096 || budget.ReadBytes == 0 || budget.ReadBytes > 4096*MaxTreePageBytes ||
+		budget.WriteBytes == 0 || budget.WriteBytes > 4096*MaxTreePageBytes { return bad(metadata.ErrInvalidArgument) }
+	raw := path.Bytes()
+	type ancestor struct { id TreePageID; page UnlinkedTreePage; directory, prefix []byte; child int; directoryEdge bool }
+	var chain []ancestor
+	var readBytes, writeBytes uint64
+	current := root
+	start, pos, end := 0, 0, bytes.IndexByte(raw, '/')
+	if end < 0 { end = len(raw) }
+	for {
+		if err := ctx.Err(); err != nil { return bad(err) }
+		if uint64(len(chain)) >= budget.Pages { return bad(metadata.ErrResourceExhausted) }
+		frame, ok := frames[current]
+		if !ok { return bad(ErrTreePageMissing) }
+		if len(frame) > MaxTreePageBytes { return bad(ErrTreePage) }
+		if uint64(len(frame)) > budget.ReadBytes-readBytes { return bad(metadata.ErrResourceExhausted) }
+		readBytes += uint64(len(frame))
+		var directory []byte
+		if start != 0 { directory = raw[:start-1] }
+		prefix := raw[start:pos]
+		page, err := DecodeTreePageAt(frame, current, directory, prefix)
+		if err != nil { return bad(err) }
+		if !bytes.HasPrefix(raw[pos:end], page.Label) { return bad(ErrTreeLeafAbsent) }
+		chain = append(chain, ancestor{id: current, page: page, directory: directory, prefix: prefix})
+		pos += len(page.Label)
+		if pos == end {
+			if end == len(raw) {
+				if page.Tag < 1 || page.Tag > 3 { return bad(ErrTreeLeafAbsent) }
+				if page.Tag == tag && page.Blob == target {
+					if err := ctx.Err(); err != nil { return bad(err) }
+					return root, nil, nil
+				}
+				break
+			}
+			if page.Tag != 4 { return bad(ErrTreeLeafAbsent) }
+			chain[len(chain)-1].directoryEdge = true
+			current = page.Directory
+			start, pos = end+1, end+1
+			n := bytes.IndexByte(raw[start:], '/')
+			end = len(raw)
+			if n >= 0 { end = start+n }
+			continue
+		}
+		edge := raw[pos]
+		i := sort.Search(len(page.Children), func(i int) bool { return page.Children[i].Edge >= edge })
+		if i == len(page.Children) || page.Children[i].Edge != edge { return bad(ErrTreeLeafAbsent) }
+		chain[len(chain)-1].child = i
+		current = page.Children[i].ID
+		pos++
+	}
+	// Comparing occupied identities also reads bytes. Charge external and
+	// already-produced frame comparisons before scanning; length mismatch
+	// needs no content scan and is immediately corruption.
+	compareExisting := func(existing, wanted []byte) error {
+		if len(existing) != len(wanted) { return ErrTreePage }
+		n := uint64(len(existing))
+		if n > budget.ReadBytes-readBytes { return metadata.ErrResourceExhausted }
+		readBytes += n
+		if !bytes.Equal(existing, wanted) { return ErrTreePage }
+		return nil
+	}
+	produced := make(map[TreePageID][]byte)
+	var replacement TreePageID
+	for i := len(chain)-1; i >= 0; i-- {
+		if err := ctx.Err(); err != nil { return bad(err) }
+		c := chain[i]
+		if i == len(chain)-1 { c.page.Tag, c.page.Blob = tag, target } else if c.directoryEdge {
+			c.page.Directory = replacement
+		} else { c.page.Children[c.child].ID = replacement }
+		// File mode/target and parent references have fixed widths, so exact
+		// output size equals this old frame's size, known before allocation.
+		n := uint64(len(frames[c.id]))
+		if n > budget.WriteBytes-writeBytes { return bad(metadata.ErrResourceExhausted) }
+		writeBytes += n
+		frame, id, err := EncodeTreePageAt(c.page, c.directory, c.prefix)
+		if err != nil { return bad(err) }
+		if existing, ok := frames[id]; ok {
+			if err := compareExisting(existing, frame); err != nil { return bad(err) }
+		} else if existing, ok := produced[id]; ok {
+			if err := compareExisting(existing, frame); err != nil { return bad(err) }
+		} else { produced[id] = frame }
+		replacement = id
+	}
+	if err := ctx.Err(); err != nil { return bad(err) }
+	return replacement, produced, nil
 }

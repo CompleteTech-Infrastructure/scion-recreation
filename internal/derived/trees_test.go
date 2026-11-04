@@ -535,3 +535,178 @@ func TestTreeGraphDoesNotDeduplicateDifferentContexts(t *testing.T) {
 	used, err := CheckTreePageGraph(context.Background(), rootID, frames, graphTestBudget())
 	if err != ErrTreePage || used.Visits != 4 { t.Fatalf("second context bypassed: %+v %v", used, err) }
 }
+
+func TestReplaceExistingTreeLeafCopiesOnlyPath(t *testing.T) {
+	tid, _ := model.NewTypedID(model.BlobKind, [32]byte{1})
+	oldBlob, _ := model.NewBlobID(tid)
+	tid, _ = model.NewTypedID(model.BlobKind, [32]byte{2})
+	newBlob, _ := model.NewBlobID(tid)
+	frames := make(map[TreePageID][]byte)
+	encode := func(p UnlinkedTreePage, dir, prefix string) TreePageID {
+		b, id, err := EncodeTreePageAt(p, []byte(dir), []byte(prefix))
+		if err != nil { t.Fatal(err) }
+		frames[id] = b
+		return id
+	}
+	fileID := encode(UnlinkedTreePage{Label: []byte("file"), Tag: 1, Blob: oldBlob}, "dir", "")
+	dirID := encode(UnlinkedTreePage{Label: []byte("ir"), Tag: 4, Directory: fileID}, "", "d")
+	siblingID := encode(UnlinkedTreePage{Tag: 1, Blob: oldBlob}, "", "z")
+	root := encode(UnlinkedTreePage{Children: []TreePageChild{{'d', dirID}, {'z', siblingID}}}, "", "")
+	if _, err := CheckTreePageGraph(context.Background(), root, frames, graphTestBudget()); err != nil { t.Fatal(err) }
+	original := make(map[TreePageID][]byte)
+	for id, frame := range frames { original[id] = append([]byte(nil), frame...) }
+	path, _ := model.NewPath([]byte("dir/file"))
+	exactBytes := uint64(len(frames[root])+len(frames[dirID])+len(frames[fileID]))
+	budget := TreeRewriteBudget{3, exactBytes, exactBytes}
+	next, added, err := ReplaceExistingTreeLeaf(context.Background(), root, frames, path, 2, newBlob, budget)
+	if err != nil || next == root || len(added) != 3 { t.Fatalf("replace: %d %v", len(added), err) }
+	for id, frame := range original { if !bytes.Equal(frame, frames[id]) { t.Fatal("base frame changed") } }
+	if _, ok := added[siblingID]; ok { t.Fatal("unrelated subtree rewritten") }
+	combined := make(map[TreePageID][]byte)
+	for id, frame := range frames { combined[id] = frame }
+	for id, frame := range added { combined[id] = frame }
+	if _, err := CheckTreePageGraph(context.Background(), next, combined, graphTestBudget()); err != nil { t.Fatal(err) }
+	// Reusing already-occupied candidate IDs scans each new frame again.
+	// All three comparisons must be admitted, not hidden behind the path read.
+	occupiedBudget := budget
+	occupiedBudget.ReadBytes = 2*exactBytes
+	if got, out, err := ReplaceExistingTreeLeaf(context.Background(), root, combined, path, 2, newBlob, occupiedBudget); err != nil || got != next || len(out) != 0 { t.Fatalf("exact occupied comparison budget: %v", err) }
+	occupiedBudget.ReadBytes--
+	if got, out, err := ReplaceExistingTreeLeaf(context.Background(), root, combined, path, 2, newBlob, occupiedBudget); err != metadata.ErrResourceExhausted || got != (TreePageID{}) || out != nil { t.Fatalf("occupied read exceeds budget by one: %v", err) }
+	if _, _, err := ReplaceExistingTreeLeaf(context.Background(), root, combined, path, 2, newBlob, budget); err != metadata.ErrResourceExhausted { t.Fatal("occupied comparisons bypassed read admission") }
+	page, err := DecodeTreePageAt(combined[next], next, nil, nil)
+	if err != nil || page.Children[1].ID != siblingID { t.Fatal("unrelated identity lost") }
+	dir := page.Children[0].ID
+	page, err = DecodeTreePageAt(combined[dir], dir, nil, []byte("d"))
+	if err != nil { t.Fatal(err) }
+	page, err = DecodeTreePageAt(combined[page.Directory], page.Directory, []byte("dir"), nil)
+	if err != nil || page.Tag != 2 || page.Blob != newBlob { t.Fatal("replacement terminal mismatch") }
+	same, noFrames, err := ReplaceExistingTreeLeaf(context.Background(), next, combined, path, 2, newBlob, budget)
+	if err != nil || same != next || len(noFrames) != 0 { t.Fatal("identical replacement rewrote pages") }
+	// Same old frame sizes allow each budget dimension to be tested exactly.
+	for dimension := 0; dimension < 3; dimension++ {
+		limit := budget
+		switch dimension { case 0: limit.Pages--; case 1: limit.ReadBytes--; case 2: limit.WriteBytes-- }
+		id, out, err := ReplaceExistingTreeLeaf(context.Background(), root, frames, path, 2, newBlob, limit)
+		if err != metadata.ErrResourceExhausted || id != (TreePageID{}) || out != nil { t.Fatalf("budget %d: %v", dimension, err) }
+	}
+	for _, name := range []string{"dir", "dir/missing", "z/child", "absent"} {
+		p, _ := model.NewPath([]byte(name))
+		if _, _, err := ReplaceExistingTreeLeaf(context.Background(), root, frames, p, 1, newBlob, budget); err != ErrTreeLeafAbsent { t.Fatalf("path %s: %v", name, err) }
+	}
+	if _, _, err := ReplaceExistingTreeLeaf(&treeCancelContext{Context: context.Background()}, root, frames, path, 2, newBlob, budget); err != context.Canceled { t.Fatal("cancellation lost") }
+	// An occupied new identity with different bytes is corruption, not overwrite.
+	frames[next] = []byte("occupied with inconsistent bytes")
+	if _, out, err := ReplaceExistingTreeLeaf(context.Background(), root, frames, path, 2, newBlob, budget); err != ErrTreePage || out != nil { t.Fatal("occupied ID overwritten") }
+	delete(frames, next)
+	delete(frames, fileID)
+	if _, _, err := ReplaceExistingTreeLeaf(context.Background(), root, frames, path, 2, newBlob, budget); err != ErrTreePageMissing { t.Fatal("missing path page accepted") }
+}
+
+func TestReplaceExistingTreeLeafSecondChildAndOccupiedBytes(t *testing.T) {
+	oldTID, err := model.NewTypedID(model.BlobKind, [32]byte{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldBlob, err := model.NewBlobID(oldTID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newTID, err := model.NewTypedID(model.BlobKind, [32]byte{2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	newBlob, err := model.NewBlobID(newTID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, leafID, err := EncodeTreePageAt(UnlinkedTreePage{Tag: 1, Blob: oldBlob}, nil, []byte("z"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootFrame, root, err := EncodeTreePageAt(UnlinkedTreePage{
+		Children: []TreePageChild{{'a', leafID}, {'z', leafID}},
+	}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frames := map[TreePageID][]byte{root: rootFrame, leafID: leaf}
+	if _, err := CheckTreePageGraph(context.Background(), root, frames, graphTestBudget()); err != nil {
+		t.Fatalf("base graph: %v", err)
+	}
+	path, err := model.NewPath([]byte("z"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pathBytes := uint64(len(rootFrame) + len(leaf))
+	budget := TreeRewriteBudget{Pages: 2, ReadBytes: pathBytes, WriteBytes: pathBytes}
+	next, added, err := ReplaceExistingTreeLeaf(context.Background(), root, frames, path, 2, newBlob, budget)
+	if err != nil || next == root || len(added) != 2 {
+		t.Fatalf("second-child replacement: root=%v frames=%d err=%v", next, len(added), err)
+	}
+	combined := make(map[TreePageID][]byte)
+	for id, frame := range frames {
+		combined[id] = frame
+	}
+	for id, frame := range added {
+		combined[id] = frame
+	}
+	page, err := DecodeTreePageAt(combined[next], next, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Children) != 2 || page.Children[0].Edge != 'a' || page.Children[0].ID != leafID ||
+		page.Children[1].Edge != 'z' || page.Children[1].ID == leafID {
+		t.Fatalf("wrong child rewritten or sibling lost: %+v", page.Children)
+	}
+	replaced, err := DecodeTreePageAt(combined[page.Children[1].ID], page.Children[1].ID, nil, []byte("z"))
+	if err != nil || replaced.Tag != 2 || replaced.Blob != newBlob {
+		t.Fatalf("second-child terminal: tag=%d blob=%v err=%v", replaced.Tag, replaced.Blob, err)
+	}
+	if _, err := CheckTreePageGraph(context.Background(), next, combined, graphTestBudget()); err != nil {
+		t.Fatalf("candidate graph: %v", err)
+	}
+
+	// Occupy only the new root ID, so the additional read is exactly its
+	// candidate frame. The new leaf is still produced by the rewrite.
+	comparisonBudget := budget
+	comparisonBudget.ReadBytes += uint64(len(added[next]))
+	for _, tc := range []struct {
+		name    string
+		corrupt bool
+		short   bool
+		want    error
+	}{
+		{"identical-at-exact-budget", false, false, nil},
+		{"equal-length-corruption-at-exact-budget", true, false, ErrTreePage},
+		{"admission-before-corrupt-byte-comparison", true, true, metadata.ErrResourceExhausted},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			occupied := make(map[TreePageID][]byte)
+			for id, frame := range frames {
+				occupied[id] = frame
+			}
+			candidate := append([]byte(nil), added[next]...)
+			if tc.corrupt {
+				candidate[len(candidate)-1] ^= 1
+			}
+			occupied[next] = candidate
+			expectedOccupied := append([]byte(nil), candidate...)
+			limit := comparisonBudget
+			if tc.short {
+				limit.ReadBytes--
+			}
+			got, output, err := ReplaceExistingTreeLeaf(context.Background(), root, occupied, path, 2, newBlob, limit)
+			if tc.want != nil {
+				if err != tc.want || got != (TreePageID{}) || output != nil {
+					t.Fatalf("wanted %v and no output, got root=%v frames=%d err=%v", tc.want, got, len(output), err)
+				}
+			} else if err != nil || got != next || len(output) != 1 {
+				t.Fatalf("exact occupied comparison: root=%v frames=%d err=%v", got, len(output), err)
+			}
+			if !bytes.Equal(occupied[next], expectedOccupied) {
+				t.Fatal("occupied bytes were overwritten")
+			}
+		})
+	}
+}
