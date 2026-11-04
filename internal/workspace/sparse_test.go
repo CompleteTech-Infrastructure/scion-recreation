@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"testing"
 
+	"canopy.local/canopy/internal/derived"
 	"canopy.local/canopy/internal/model"
 )
 
@@ -113,4 +114,55 @@ func TestSparseTransitionPlansOnlyLiteralMembershipChanges(t *testing.T) {
 	// Output slice mutation cannot modify the immutable supplied rows.
 	plan[0] = SparseTransition{}
 	if rows[0].Path() != testPath(t, []byte("*.go")) { t.Fatal("output aliased input rows") }
+}
+
+func TestCanonicalSparseTransitionBindsComputedSnapshot(t *testing.T) {
+	ctx := context.Background(); repo := [16]byte{8}
+	blob, err := model.HashBlob(ctx, 0, bytes.NewReader(nil)); if err != nil { t.Fatal(err) }
+	var encoded bytes.Buffer; if err := model.EncodeBlob(ctx, &encoded, 0, bytes.NewReader(nil)); err != nil { t.Fatal(err) }
+	blobs := map[model.BlobID][]byte{blob: encoded.Bytes()}
+	row := func(raw string, tag model.OperationTag) model.Operation {
+		p := testPath(t, []byte(raw)); var target *model.BlobID; if tag != model.Delete { target = &blob }
+		op, err := model.NewOperation(p, tag, target); if err != nil { t.Fatal(err) }; return op
+	}
+	source := func(change model.ChangesetInput) derived.TreeSourceFrame {
+		v, err := model.NewChangeset(change); if err != nil { t.Fatal(err) }
+		id, err := model.HashChangeset(ctx, v); if err != nil { t.Fatal(err) }
+		var frame bytes.Buffer; if err := model.EncodeChangeset(ctx, &frame, v); err != nil { t.Fatal(err) }
+		return derived.TreeSourceFrame{ID: id, Frame: frame.Bytes()}
+	}
+	literal := row("*.go", model.SetRegular); oldRow := row("a/b", model.SetExecutable); newRow := row("z/\xff", model.SetSymlink)
+	root := source(model.ChangesetInput{RepoID: repo, Operations: []model.Operation{literal, oldRow}})
+	left := source(model.ChangesetInput{RepoID: repo, Parents: []model.ChangesetID{root.ID}, Operations: []model.Operation{newRow}})
+	right := source(model.ChangesetInput{RepoID: repo, Parents: []model.ChangesetID{root.ID}, Operations: []model.Operation{row("a/b", model.Delete)}})
+	merge := source(model.ChangesetInput{RepoID: repo, Parents: []model.ChangesetID{left.ID, right.ID}})
+	sources := []derived.TreeSourceFrame{root, left, right, merge}
+	var sourceBytes uint64; for _, s := range sources { sourceBytes += uint64(len(s.Frame)) }
+	old, _ := CompileSparseSelection(1, false, []model.Path{testPath(t, []byte("a"))})
+	next, _ := CompileSparseSelection(1, false, []model.Path{testPath(t, []byte("z"))})
+	graph := derived.TreeGraphBudget{Visits: 4096, PageBytes: 4096*derived.MaxTreePageBytes, ContextBytes: 64<<20}
+	objects := derived.TreeObjectGraphBudget{Graph: graph, BlobBytes: 1<<20}
+	step := derived.TreeCheckedWriteBudget{Parent: objects, Candidate: objects, Rewrite: derived.TreeChangesetBudget{Rewrite: derived.TreeRewriteBudget{Pages: 4096, ReadBytes: 4096*derived.MaxTreePageBytes, WriteBytes: 4096*derived.MaxTreePageBytes}, Operations: 4096, InputBytes: model.MaxChangesetPayload}}
+	budget := CanonicalSparseBudget{Replay: derived.TreeReplayBudget{Sources: 4, SourceBytes: sourceBytes, Pages: 4096, PageBytes: 4096*derived.MaxTreePageBytes, Step: step}, Snapshot: derived.TreeEntriesBudget{Graph: graph, Entries: 3, PathBytes: 20}, Transition: SparseTransitionBudget{3, 10, 2}}
+	plan, used, err := PlanCanonicalSparseTransition(ctx, repo, merge.ID, sources, blobs, old, next, budget)
+	if err != nil || len(plan) != 2 || plan[0] != (SparseTransition{oldRow, false}) || plan[1] != (SparseTransition{newRow, true}) || used.Replay.Sources != 4 || used.Snapshot.Visits == 0 { t.Fatalf("computed sparse intents: %+v %+v %v", plan, used, err) }
+	// Selecting an earlier source uses its own map, never a later descendant.
+	if out, _, err := PlanCanonicalSparseTransition(ctx, repo, root.ID, sources, blobs, old, next, budget); err != nil || len(out) != 1 || out[0] != (SparseTransition{oldRow, false}) { t.Fatal("selected revision changed during planning") }
+	if out, used, err := PlanCanonicalSparseTransition(ctx, repo, merge.ID, sources, blobs, old, old, budget); err != nil || len(out) != 0 || used.Replay.Sources != 4 || used.Snapshot.Visits == 0 { t.Fatal("unchanged selection skipped canonical verification") }
+	for _, which := range []string{"source bytes", "snapshot entries", "snapshot paths", "transition paths", "changes"} {
+		short := budget
+		switch which { case "source bytes": short.Replay.SourceBytes--; case "snapshot entries": short.Snapshot.Entries--; case "snapshot paths": short.Snapshot.PathBytes--; case "transition paths": short.Transition.PathBytes--; case "changes": short.Transition.Changes-- }
+		if out, _, err := PlanCanonicalSparseTransition(ctx, repo, merge.ID, sources, blobs, old, next, short); err == nil || out != nil { t.Fatalf("%s exhaustion leaked intents", which) }
+	}
+	unknown := source(model.ChangesetInput{RepoID: repo, Message: []byte("absent")})
+	if out, usage, err := PlanCanonicalSparseTransition(ctx, repo, unknown.ID, sources, blobs, old, next, budget); err != ErrSparseSelection || out != nil || usage != (CanonicalSparseUsage{}) { t.Fatal("unknown source reached replay") }
+	bad := append([]derived.TreeSourceFrame(nil), sources...); bad[2].Frame = append([]byte(nil), bad[2].Frame...); bad[2].Frame[len(bad[2].Frame)-1] ^= 1
+	if out, usage, err := PlanCanonicalSparseTransition(ctx, repo, root.ID, bad, blobs, old, old, budget); err == nil || out != nil || usage.Snapshot.Visits != 0 { t.Fatal("off-selection corruption ignored") }
+	if out, _, err := PlanCanonicalSparseTransition(ctx, repo, merge.ID, []derived.TreeSourceFrame{root, left, merge}, blobs, old, next, budget); err == nil || out != nil { t.Fatal("missing additional parent ignored") }
+	if out, _, err := PlanCanonicalSparseTransition(ctx, repo, merge.ID, sources, nil, old, next, budget); err == nil || out != nil { t.Fatal("missing blob accepted") }
+	if out, used, err := PlanCanonicalSparseTransition(ctx, repo, merge.ID, sources, blobs, nil, next, budget); err != ErrSparseSelection || out != nil || used != (CanonicalSparseUsage{}) { t.Fatal("nil selector reached replay") }
+	if out, _, err := PlanCanonicalSparseTransition(ctx, [16]byte{9}, merge.ID, sources, blobs, old, next, budget); err == nil || out != nil { t.Fatal("foreign source accepted") }
+	if out, _, err := PlanCanonicalSparseTransition(nil, repo, merge.ID, sources, blobs, old, next, budget); err != ErrSparseSelection || out != nil { t.Fatal("nil context accepted") }
+	cancelled, cancel := context.WithCancel(ctx); cancel()
+	if out, _, err := PlanCanonicalSparseTransition(cancelled, repo, merge.ID, sources, blobs, old, next, budget); err != context.Canceled || out != nil { t.Fatal("cancellation ignored") }
 }

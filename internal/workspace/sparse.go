@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	"canopy.local/canopy/internal/derived"
 	"canopy.local/canopy/internal/model"
 )
 
@@ -153,4 +154,58 @@ func PlanSparseTransition(ctx context.Context, rows []model.Operation, previous,
 	}
 	if err := ctx.Err(); err != nil { return nil, err }
 	return plan, nil
+}
+
+// CanonicalSparseBudget admits complete DAG replay, whole selected-tree
+// enumeration, and transition planning as separate bounded phases. It is not
+// sparse traversal or a measured memory ceiling; excluded paths are still read
+// privately during verification/enumeration. Total admitted work is their sum.
+type CanonicalSparseBudget struct {
+	Replay derived.TreeReplayBudget
+	Snapshot derived.TreeEntriesBudget
+	Transition SparseTransitionBudget
+}
+type CanonicalSparseUsage struct {
+	Replay derived.TreeReplayUsage
+	Snapshot derived.TreeGraphUsage
+}
+
+// PlanCanonicalSparseTransition derives the selected revision from a complete
+// supplied canonical DAG, enumerates its file map, then plans a literal sparse
+// selection change at THAT SAME revision. No caller-provided row/source or tree
+// mapping assertion is used. Every DAG parent and referenced blob/page passes
+// checked replay, including off-selection ancestry. Missing inputs fail closed.
+//
+// Output remains a PRIVATE intent, never permission to fetch/delete/overwrite.
+// Source publication, retained storage, current visibility, local dirty-state
+// reconciliation and durable checkout/manifest updates remain external. This
+// performs no filesystem action and does not optimize subtree traversal. Inputs
+// must remain stable. Any failure returns nil, never partial intents.
+func PlanCanonicalSparseTransition(ctx context.Context, repository [16]byte, source model.ChangesetID, sources []derived.TreeSourceFrame, blobs map[model.BlobID][]byte, previous, next *SparseSelection, budget CanonicalSparseBudget) ([]SparseTransition, CanonicalSparseUsage, error) {
+	var used CanonicalSparseUsage
+	bad := func(err error) ([]SparseTransition, CanonicalSparseUsage, error) { return nil, used, err }
+	if ctx == nil || source.Validate() != nil || previous == nil || next == nil || len(sources) == 0 { return bad(ErrSparseSelection) }
+	if err := ctx.Err(); err != nil { return bad(err) }
+	if len(sources) > 64 { return bad(ErrSparseBudget) }
+	if _, err := PlanSparseTransition(ctx, nil, previous, next, budget.Transition); err != nil { return bad(err) }
+	found := false
+	for _, input := range sources { if input.ID == source { found = true; break } }
+	if !found { return bad(ErrSparseSelection) }
+	writes, pages, replay, err := derived.ReplayCanonicalTreeDAG(ctx, repository, sources, blobs, budget.Replay)
+	used.Replay = replay
+	if err != nil { return bad(err) }
+	var root derived.TreePageID
+	for _, write := range writes {
+		if write.Result.Identity.Changeset != source { continue }
+		root, err = derived.ParseTreePageID(write.Result.Value.Bytes())
+		if err != nil { return bad(err) }
+		break
+	}
+	rows, snapshot, err := derived.ReadTreeEntries(ctx, root, pages, budget.Snapshot)
+	used.Snapshot = snapshot
+	if err != nil { return bad(err) }
+	plan, err := PlanSparseTransition(ctx, rows, previous, next, budget.Transition)
+	if err != nil { return bad(err) }
+	if err := ctx.Err(); err != nil { return bad(err) }
+	return plan, used, nil
 }
