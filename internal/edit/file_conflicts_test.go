@@ -367,3 +367,47 @@ func TestPrepareFileOperationsLateCancellationDiscardsPrefix(t *testing.T) {
 	late := &preparationCancelContext{Context: context.Background(), cancelAt: baseline.calls+1}
 	if out, err := PrepareFileOperations(late, []ResolvedFileEntry{{a,state},{b,state}}, budget); err != context.Canceled || out != nil { t.Fatal(out, err) }
 }
+
+func TestMergeFileEntriesCollectsAllConflictsWithoutPartialResolution(t *testing.T) {
+	path := func(s string) model.Path { p, err := model.NewPath([]byte(s)); if err != nil { t.Fatal(err) }; return p }
+	a, b, c := fileFixture(t, model.SetRegular, "a"), fileFixture(t, model.SetRegular, "b"), fileFixture(t, model.SetRegular, "c")
+	entries := []FileMergeEntry{
+		{path("A"), a, b, c},
+		{path("a"), a, a, b},
+		{path("\xff"), a, AbsentFile(), c},
+	}
+	got, conflicts, err := MergeFileEntries(context.Background(), entries, FileMergeBudget{3,3,8})
+	if err != nil || got != nil || len(conflicts) != 2 { t.Fatal(got, conflicts, err) }
+	for i, entry := range []FileMergeEntry{entries[0], entries[2]} {
+		if conflicts[i].Path != entry.Path || conflicts[i].Sides != (FileConflict{entry.Base, entry.Left, entry.Right}) { t.Fatal(conflicts) }
+	}
+	conflicts[0] = PathFileConflict{}
+	if entries[0].Path != path("A") || entries[0].Left != b { t.Fatal("output aliases input slice") }
+	entries[0].Right = b; entries[2].Left = c
+	got, conflicts, err = MergeFileEntries(context.Background(), entries, FileMergeBudget{3,3,9})
+	if err != nil || conflicts != nil || len(got) != 3 { t.Fatal(got, conflicts, err) }
+	for i, entry := range entries {
+		want, conflict, err := MergeFileVersions(context.Background(), entry.Base, entry.Left, entry.Right, 9)
+		if err != nil || conflict != nil || got[i] != (ResolvedFileEntry{entry.Path, want}) { t.Fatal(got, err) }
+	}
+}
+
+func TestMergeFileEntriesSharedAdmissionAndLateCancellation(t *testing.T) {
+	a, _ := model.NewPath([]byte("a")); b, _ := model.NewPath([]byte("b"))
+	state := fileFixture(t, model.SetSymlink, "x")
+	entries := []FileMergeEntry{{a,state,state,state},{b,state,state,state}}
+	for _, budget := range []FileMergeBudget{{1,2,6}, {2,1,6}, {2,2,5}, {}, {4097,2,6}, {2,65<<20,6}, {2,2,65<<20}} {
+		if got, conflicts, err := MergeFileEntries(context.Background(), entries, budget); err != ErrFileBudget || got != nil || conflicts != nil { t.Fatal(got, conflicts, err) }
+	}
+	for _, bad := range [][]FileMergeEntry{{entries[0],entries[0]}, {entries[1],entries[0]}, {{a,state,state,FileVersion{}}}, {{model.Path{},state,state,state}}} {
+		if got, conflicts, err := MergeFileEntries(context.Background(), bad, FileMergeBudget{2,2,6}); err != ErrFileState || got != nil || conflicts != nil { t.Fatal(got, conflicts, err) }
+	}
+	if got, conflicts, err := MergeFileEntries(context.Background(), nil, FileMergeBudget{1,1,0}); err != nil || got != nil || conflicts != nil { t.Fatal(got, conflicts, err) }
+	if got, conflicts, err := MergeFileEntries(context.Background(), []FileMergeEntry{{a,AbsentFile(),AbsentFile(),AbsentFile()}}, FileMergeBudget{1,1,0}); err != nil || conflicts != nil || len(got) != 1 || !got[0].Version.IsAbsent() { t.Fatal(got, conflicts, err) }
+	baseline := &preparationCancelContext{Context: context.Background()}
+	if got, conflicts, err := MergeFileEntries(baseline, entries[:1], FileMergeBudget{2,2,6}); err != nil || conflicts != nil || len(got) != 1 { t.Fatal(got, conflicts, err) }
+	// Second preflight adds one check, then cancel at second merge's entry.
+	late := &preparationCancelContext{Context: context.Background(), cancelAt: baseline.calls+1}
+	if got, conflicts, err := MergeFileEntries(late, entries, FileMergeBudget{2,2,6}); err != context.Canceled || got != nil || conflicts != nil { t.Fatal(got, conflicts, err) }
+	if got, conflicts, err := MergeFileEntries(nil, entries, FileMergeBudget{2,2,6}); err != ErrFileState || got != nil || conflicts != nil { t.Fatal(got, conflicts, err) }
+}
