@@ -182,14 +182,44 @@ type CanonicalPathHistoryUsage struct {
 // rename/copy detection or durable index. All inputs must remain stable. Usage
 // and error distinctions are private and cannot bypass authorization filtering.
 func ReadCanonicalPathHistory(ctx context.Context, repository [16]byte, start model.ChangesetID, path model.Path, sources []TreeSourceFrame, blobs map[model.BlobID][]byte, budget CanonicalPathHistoryBudget) ([]PathHistoryStep, CanonicalPathHistoryUsage, error) {
+	return readCanonicalPathHistory(ctx, repository, start, path, sources, blobs, budget, false)
+}
+
+// ReadCanonicalDAGPathHistory verifies the complete supplied topological DAG,
+// including every parent's repository membership, then reads only the selected
+// target's first-parent history. The target may occur anywhere in the input;
+// unrelated branches are verified but never unioned into that history. Every
+// mapping comes from checked replay in this call. Missing ancestry fails.
+//
+// Replay budgets cover the whole supplied DAG. History.Nodes/Changes/Lookup
+// cover only the selected walk; History.SourceBytes additionally caps retained
+// decoded payload across ALL supplied sources before bridge allocation. These
+// are separate phases, not a single work quantum or peak-memory measurement.
+// Publication, retention and authorization remain external. Outputs are private,
+// non-resumable and all-or-nothing, with the same limits as the chain API.
+func ReadCanonicalDAGPathHistory(ctx context.Context, repository [16]byte, start model.ChangesetID, path model.Path, sources []TreeSourceFrame, blobs map[model.BlobID][]byte, budget CanonicalPathHistoryBudget) ([]PathHistoryStep, CanonicalPathHistoryUsage, error) {
+	return readCanonicalPathHistory(ctx, repository, start, path, sources, blobs, budget, true)
+}
+
+func readCanonicalPathHistory(ctx context.Context, repository [16]byte, start model.ChangesetID, path model.Path, sources []TreeSourceFrame, blobs map[model.BlobID][]byte, budget CanonicalPathHistoryBudget, completeDAG bool) ([]PathHistoryStep, CanonicalPathHistoryUsage, error) {
 	var used CanonicalPathHistoryUsage
 	bad := func(err error) ([]PathHistoryStep, CanonicalPathHistoryUsage, error) { return nil, used, err }
 	h := budget.History
 	if ctx == nil || start.Validate() != nil || path.Validate() != nil || h.Nodes == 0 || h.Nodes > 4096 || h.Changes == 0 || h.Changes > h.Nodes || h.SourceBytes == 0 || h.SourceBytes > model.MaxChangesetPayload || h.Lookup.Pages == 0 || h.Lookup.Pages > 4096 || h.Lookup.ReadBytes == 0 || h.Lookup.ReadBytes > 4096*MaxTreePageBytes { return bad(metadata.ErrInvalidArgument) }
 	if err := ctx.Err(); err != nil { return bad(err) }
-	if len(sources) == 0 || sources[len(sources)-1].ID != start { return bad(metadata.ErrInvalidArgument) }
-	if uint64(len(sources)) > h.Nodes { return bad(metadata.ErrResourceExhausted) }
-	writes, pages, replay, err := ReplayCanonicalTreeChain(ctx, repository, sources, blobs, budget.Replay)
+	if len(sources) == 0 { return bad(metadata.ErrInvalidArgument) }
+	if completeDAG {
+		if len(sources) > 64 { return bad(metadata.ErrResourceExhausted) }
+		found := false
+		for _, source := range sources { if source.ID == start { found = true; break } }
+		if !found { return bad(metadata.ErrInvalidArgument) }
+	} else {
+		if sources[len(sources)-1].ID != start { return bad(metadata.ErrInvalidArgument) }
+		if uint64(len(sources)) > h.Nodes { return bad(metadata.ErrResourceExhausted) }
+	}
+	replayFn := ReplayCanonicalTreeChain
+	if completeDAG { replayFn = ReplayCanonicalTreeDAG }
+	writes, pages, replay, err := replayFn(ctx, repository, sources, blobs, budget.Replay)
 	used.Replay = replay
 	if err != nil { return bad(err) }
 	// Replay has verified exact frame lengths. Reserve aggregate owned source
