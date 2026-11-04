@@ -190,20 +190,52 @@ type CanonicalFileSide struct {
 // copies are bounded but this is not a peak-memory ceiling. Frames must not
 // mutate during the call. Any verification error yields zero result/no conflict.
 func MergeCanonicalFileVersions(ctx context.Context, sides [3]CanonicalFileSide, maxBytes uint64) (FileVersion, *FileConflict, error) {
+	versions, err := verifyCanonicalFileSides(ctx, sides, maxBytes)
+	if err != nil { return FileVersion{}, nil, err }
+	return MergeFileVersions(ctx, versions[0], versions[1], versions[2], maxBytes)
+}
+
+// MergeCanonicalTextFileVersions verifies every present canonical blob before
+// applying MergeTextFileVersions, including its whole-file equality fast paths.
+// Callers explicitly choose text processing: only concurrent present regular/
+// executable edits enter text analysis; delete/modify, additions and symlink/
+// type cases keep existing exact conflicts. NUL rejection is not a classifier;
+// opaque equality fast paths intentionally preserve binary and symlink bytes.
+//
+// Descriptor presence/mode, source/tree binding, correct base and authorization
+// remain caller prerequisites, as for CanonicalFileSide. No output is published.
+// Bytes admits combined decoded payloads, excluding headers, and bounds text
+// output separately. Copying/staging is bounded but not a peak-memory guarantee.
+// All budgets must be valid before decoding; work limits are charged only when
+// text analysis runs. Errors return zero result/no conflict, never unverified
+// content. Inputs must not mutate during the call.
+func MergeCanonicalTextFileVersions(ctx context.Context, sides [3]CanonicalFileSide, budget ThreeWayTextBudget) (FileVersion, *FileConflict, error) {
 	if ctx == nil { return FileVersion{}, nil, ErrFileState }
 	if err := ctx.Err(); err != nil { return FileVersion{}, nil, err }
-	if maxBytes > 64<<20 { return FileVersion{}, nil, ErrFileBudget }
+	if budget.Bytes == 0 || budget.Bytes > 64<<20 || budget.Lines == 0 || budget.Lines > 1000000 || budget.Cells == 0 || budget.Cells > 4000000 || budget.Hunks == 0 || budget.Hunks > 1000000 {
+		return FileVersion{}, nil, ErrTextLimit
+	}
+	versions, err := verifyCanonicalFileSides(ctx, sides, budget.Bytes)
+	if err != nil { return FileVersion{}, nil, err }
+	return MergeTextFileVersions(ctx, versions[0], versions[1], versions[2], budget)
+}
+
+// Shared verification must finish before either merge path can expose states.
+func verifyCanonicalFileSides(ctx context.Context, sides [3]CanonicalFileSide, maxBytes uint64) ([3]FileVersion, error) {
+	if ctx == nil { return [3]FileVersion{}, ErrFileState }
+	if err := ctx.Err(); err != nil { return [3]FileVersion{}, err }
+	if maxBytes > 64<<20 { return [3]FileVersion{}, ErrFileBudget }
 	frameAllowance := maxBytes
 	for _, side := range sides {
 		if !side.Present {
-			if side.Mode != model.Delete || side.ID != (model.BlobID{}) || side.Frame != nil { return FileVersion{}, nil, ErrFileState }
+			if side.Mode != model.Delete || side.ID != (model.BlobID{}) || side.Frame != nil { return [3]FileVersion{}, ErrFileState }
 			continue
 		}
-		if side.Mode < model.SetRegular || side.Mode > model.SetSymlink || side.ID.Validate() != nil { return FileVersion{}, nil, ErrFileState }
+		if side.Mode < model.SetRegular || side.Mode > model.SetSymlink || side.ID.Validate() != nil { return [3]FileVersion{}, ErrFileState }
 		frameAllowance += 22
 	}
 	for _, side := range sides {
-		if uint64(len(side.Frame)) > frameAllowance { return FileVersion{}, nil, ErrFileBudget }
+		if uint64(len(side.Frame)) > frameAllowance { return [3]FileVersion{}, ErrFileBudget }
 		frameAllowance -= uint64(len(side.Frame))
 	}
 	versions := [3]FileVersion{AbsentFile(), AbsentFile(), AbsentFile()}
@@ -212,12 +244,12 @@ func MergeCanonicalFileVersions(ctx context.Context, sides [3]CanonicalFileSide,
 		if !side.Present { continue }
 		var content bytes.Buffer
 		n, err := model.DecodeBlob(ctx, bytes.NewReader(side.Frame), side.ID, &content, remaining)
-		if err != nil { return FileVersion{}, nil, err }
+		if err != nil { return [3]FileVersion{}, err }
 		remaining -= n
 		payload := content.Bytes()
 		if payload == nil { payload = []byte{} }
 		versions[i], err = PresentFile(side.Mode, payload)
-		if err != nil { return FileVersion{}, nil, err }
+		if err != nil { return [3]FileVersion{}, err }
 	}
-	return MergeFileVersions(ctx, versions[0], versions[1], versions[2], maxBytes)
+	return versions, nil
 }
