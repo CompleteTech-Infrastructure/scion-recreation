@@ -119,3 +119,17 @@ func TestFirstParentBisectUnknownOutsideAdjacentBoundary(t *testing.T) {
 	if got, _, err := AnalyzeFirstParentBisect(nil,graph,ids[0],ids[4],nil,budget); err != ErrBisectInput || !reflect.DeepEqual(got,BisectAnalysis{}) { t.Fatal(got,err) }
 	if got, _, err := AnalyzeFirstParentBisect(ctx,graph,ids[0],ids[0],nil,budget); err != ErrBisectInput || !reflect.DeepEqual(got,BisectAnalysis{}) { t.Fatal(got,err) }
 }
+
+func TestFirstParentBisectChargesRepeatedCanonicalParents(t *testing.T) {
+	ctx := context.Background(); graph, ids := bisectFixture(t,2)
+	value, err := model.NewChangeset(model.ChangesetInput{RepoID:[16]byte{9},Parents:[]model.ChangesetID{ids[1],ids[1],ids[0]},Message:[]byte("repeated parents")}); if err != nil { t.Fatal(err) }
+	id, err := model.HashChangeset(ctx,value); if err != nil { t.Fatal(err) }
+	var frame bytes.Buffer; if err := model.EncodeChangeset(ctx,&frame,value); err != nil { t.Fatal(err) }
+	if _, err := graph.AddFrame(ctx,id,frame.Bytes()); err != nil { t.Fatal(err) }
+	observations := []RevisionObservation{{ids[0],OutcomePass},{ids[1],OutcomePass},{id,OutcomeFail}}
+	budget := BisectBudget{3,4,3,1}
+	got, used, err := AnalyzeFirstParentBisect(ctx,graph,ids[0],id,observations,budget)
+	if err != nil || got.State != BisectObservedBoundary || !reflect.DeepEqual(got.Candidates,[]model.ChangesetID{id}) || got.HasNext || used != (BisectUsage{3,4,3}) { t.Fatal(got,used,err) }
+	budget.ParentReferences--
+	if got, _, err := AnalyzeFirstParentBisect(ctx,graph,ids[0],id,observations,budget); err != ErrBisectBudget || !reflect.DeepEqual(got,BisectAnalysis{}) { t.Fatal(got,err) }
+}
