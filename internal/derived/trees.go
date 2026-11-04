@@ -259,8 +259,9 @@ var ErrTreePageMissing = errors.New("incomplete derived page graph")
 
 // TreeGraphBudget bounds one non-resumable private validation attempt, not a
 // whole repository. Visits/PageBytes cannot exceed the contract's work quantum.
-// ContextBytes bounds cumulative walker-owned path copies, not decoder
-// temporaries, input map storage, allocator overhead or total process RSS.
+// ContextBytes bounds cumulative walker-owned edge/label copies and explicit
+// path-buffer growth copies, not decoder temporaries, input map storage,
+// zero-initialization, allocator overhead or total process RSS.
 // The implementation additionally caps this copy counter at 64 MiB.
 // A valid graph exceeding a bound returns resource exhaustion, never corruption.
 type TreeGraphBudget struct { Visits, PageBytes, ContextBytes uint64 }
@@ -286,12 +287,31 @@ func walkTreePageGraph(ctx context.Context, root TreePageID, frames map[TreePage
 		budget.PageBytes == 0 || budget.PageBytes > 4096*MaxTreePageBytes || budget.ContextBytes == 0 || budget.ContextBytes > 64<<20 {
 		return used, metadata.ErrInvalidArgument
 	}
-	type work struct { id TreePageID; directory, component []byte; exit bool }
+	// DFS preserves every pending sibling's prefix in this one path buffer.
+	// Frames store restoration offsets, not copied directory/component bytes.
+	// A child appends its edge; a directory appends '/', resetting component.
+	type work struct { id TreePageID; base, directoryEnd, componentStart int; edge byte; appendEdge, exit bool }
 	stack := []work{{id: root}}
 	active := make(map[TreePageID]bool)
-	chargeContext := func(n int) bool {
-		if uint64(n) > budget.ContextBytes-used.ContextBytes { return false }
-		used.ContextBytes += uint64(n)
+	var path []byte
+	appendContext := func(b []byte) bool {
+		need := len(path)+len(b)
+		if uint64(need) > model.MaxPathBytes { return false }
+		cost := uint64(len(b))
+		capacity := cap(path)
+		if need > capacity {
+			capacity = max(64, capacity*2, need)
+			capacity = min(capacity, int(model.MaxPathBytes))
+			cost += uint64(len(path)) // explicit backing-buffer growth copy
+		}
+		if cost > budget.ContextBytes-used.ContextBytes { return false }
+		used.ContextBytes += cost
+		if need > cap(path) {
+			next := make([]byte, len(path), capacity)
+			copy(next, path)
+			path = next
+		}
+		path = append(path, b...)
 		return true
 	}
 	for len(stack) != 0 {
@@ -302,43 +322,33 @@ func walkTreePageGraph(ctx context.Context, root TreePageID, frames map[TreePage
 		if used.Visits == budget.Visits { return used, metadata.ErrResourceExhausted }
 		used.Visits++
 		if active[w.id] { return used, ErrTreePage }
+		if w.base > len(path) { return used, ErrTreePage }
+		path = path[:w.base]
+		if w.appendEdge && !appendContext([]byte{w.edge}) { return used, metadata.ErrResourceExhausted }
 		frame, ok := frames[w.id]
 		if !ok { return used, ErrTreePageMissing }
 		if len(frame) > MaxTreePageBytes { return used, ErrTreePage }
 		if uint64(len(frame)) > budget.PageBytes-used.PageBytes { return used, metadata.ErrResourceExhausted }
 		used.PageBytes += uint64(len(frame))
-		p, err := DecodeTreePageAt(frame, w.id, w.directory, w.component)
+		p, err := DecodeTreePageAt(frame, w.id, path[:w.directoryEnd], path[w.componentStart:])
 		if err != nil { return used, err }
 		if p.Tag != 0 { used.Terminals++ }
 		active[w.id] = true
 		stack = append(stack, work{id: w.id, exit: true})
-		if !chargeContext(len(w.component)+len(p.Label)) { return used, metadata.ErrResourceExhausted }
-		component := make([]byte, len(w.component)+len(p.Label))
-		copy(component, w.component)
-		copy(component[len(w.component):], p.Label)
+		if !appendContext(p.Label) { return used, metadata.ErrResourceExhausted }
 		if leaf != nil && p.Tag >= 1 && p.Tag <= 3 {
-			if err := leaf(w.directory, component, p); err != nil { return used, err }
+			// Callback slices are borrowed only for this call. The internal
+			// enumeration consumer copies admitted output before returning.
+			if err := leaf(path[:w.directoryEnd], path[w.componentStart:], p); err != nil { return used, err }
 		}
-		// Bound queued frames as well as executed work. Context copies are
-		// charged before allocation. PageBytes counts frame bytes processed,
-		// not heap usage; decoder temporaries are outside ContextBytes.
 		for _, child := range p.Children {
 			if err := ctx.Err(); err != nil { return used, err }
-			if len(stack) >= 4096 || !chargeContext(len(component)+1) { return used, metadata.ErrResourceExhausted }
-			prefix := make([]byte, len(component)+1)
-			copy(prefix, component)
-			prefix[len(component)] = child.Edge
-			stack = append(stack, work{id: child.ID, directory: w.directory, component: prefix})
+			if len(stack) >= 4096 { return used, metadata.ErrResourceExhausted }
+			stack = append(stack, work{id: child.ID, base: len(path), directoryEnd: w.directoryEnd, componentStart: w.componentStart, edge: child.Edge, appendEdge: true})
 		}
 		if p.Tag == 4 {
-			n := len(w.directory)+len(component)
-			if len(w.directory) != 0 { n++ }
-			if len(stack) >= 4096 || !chargeContext(n) { return used, metadata.ErrResourceExhausted }
-			directory := make([]byte, 0, n)
-			directory = append(directory, w.directory...)
-			if len(directory) != 0 { directory = append(directory, '/') }
-			directory = append(directory, component...)
-			stack = append(stack, work{id: p.Directory, directory: directory})
+			if len(stack) >= 4096 { return used, metadata.ErrResourceExhausted }
+			stack = append(stack, work{id: p.Directory, base: len(path), directoryEnd: len(path), componentStart: len(path)+1, edge: '/', appendEdge: true})
 		}
 	}
 	if err := ctx.Err(); err != nil { return used, err }

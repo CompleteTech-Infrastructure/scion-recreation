@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"encoding/hex"
+	"encoding/json"
+	"os"
 	"reflect"
 	"testing"
 
@@ -322,4 +325,54 @@ func TestPrivateExactPathDiff(t *testing.T) {
 	if got, _, err := DiffPrivateTreePath(context.Background(), roots, both, model.Path{}, budget); got != nil || err != ErrFileDiffInput { t.Fatal(got, err) }
 	ctx, cancel := context.WithCancel(context.Background()); cancel()
 	if got, _, err := DiffPrivateTreePath(ctx, roots, both, path, budget); got != nil || err != context.Canceled { t.Fatal(got, err) }
+}
+
+func TestPrivateTreeDiffMaximumPathIntegration(t *testing.T) {
+	b, err := os.ReadFile("../../tests/fixtures/tree_pages_v1.json"); if err != nil { t.Fatal(err) }
+	var fixture struct {
+		Pages []struct { ID string `json:"id_hex"`; Frame string `json:"frame_hex"` } `json:"pages"`
+		Cases []struct {
+			Name string `json:"name"`; Root string `json:"root_id_hex"`
+			Entries []struct { Path string `json:"path_hex"`; Mode string `json:"mode"`; Payload string `json:"blob_payload_hex"` } `json:"entries"`
+		} `json:"positive_vectors"`
+	}
+	if err := json.Unmarshal(b, &fixture); err != nil { t.Fatal(err) }
+	decode := func(s string) []byte { t.Helper(); b, err := hex.DecodeString(s); if err != nil { t.Fatal(err) }; return b }
+	before := make(map[derived.TreePageID][]byte)
+	for _, p := range fixture.Pages {
+		id, err := derived.ParseTreePageID(decode(p.ID)); if err != nil { t.Fatal(err) }
+		before[id] = decode(p.Frame)
+	}
+	checked := 0
+	for _, c := range fixture.Cases {
+		if c.Name != "component-length-65535" && c.Name != "path-length-65535-components-1024" { continue }
+		checked++
+		if len(c.Entries) != 1 || c.Entries[0].Mode != "regular" { t.Fatal("extreme fixture shape changed") }
+		root, err := derived.ParseTreePageID(decode(c.Root)); if err != nil { t.Fatal(err) }
+		path, err := model.NewPath(decode(c.Entries[0].Path)); if err != nil { t.Fatal(err) }
+		payload := decode(c.Entries[0].Payload)
+		blob, err := model.HashBlob(context.Background(), uint64(len(payload)), bytes.NewReader(payload)); if err != nil { t.Fatal(err) }
+		next, added, err := derived.SetTreeLeaf(context.Background(), root, before, path, byte(model.SetExecutable), blob, derived.TreeRewriteBudget{4096, 4096*derived.MaxTreePageBytes, 4096*derived.MaxTreePageBytes})
+		if err != nil { t.Fatal(err) }
+		after := make(map[derived.TreePageID][]byte)
+		for id, frame := range before { after[id] = frame }; for id, frame := range added { after[id] = frame }
+		side := derived.TreeEntriesBudget{Graph: derived.TreeGraphBudget{4096, 4096*derived.MaxTreePageBytes, 194302}, Entries: 1, PathBytes: 2*model.MaxPathBytes}
+		budget := PrivateTreeDiffBudget{Side: [2]derived.TreeEntriesBudget{side, side}, Compare: FileDiffBudget{2, 2*model.MaxPathBytes, 1}}
+		roots := [2]derived.TreePageID{root, next}; frames := [2]map[derived.TreePageID][]byte{before, after}
+		rows, usage, err := DiffPrivateTrees(context.Background(), roots, frames, budget)
+		if err != nil || len(rows) != 1 { t.Fatalf("%s graph diff: %v", c.Name, err) }
+		old, _ := model.NewOperation(path, model.SetRegular, &blob); changed, _ := model.NewOperation(path, model.SetExecutable, &blob)
+		want := FileDelta{Path: path, Before: old, After: changed, BeforePresent: true, AfterPresent: true, ModeChanged: true}
+		if rows[0] != want { t.Fatal("extreme mode-only delta changed content/path") }
+		for _, u := range usage { if u.ContextBytes != 194302 { t.Fatal("integrated graph did not use exact admitted copy budget") } }
+		lookups := [2]derived.TreeLookupBudget{{4096, 4096*derived.MaxTreePageBytes}, {4096, 4096*derived.MaxTreePageBytes}}
+		point, _, err := DiffPrivateTreePath(context.Background(), roots, frames, path, lookups)
+		if err != nil || len(point) != 1 || point[0] != want { t.Fatal("point and whole-tree diff disagree") }
+		if rows, used, err := DiffPrivateTrees(context.Background(), [2]derived.TreePageID{root, root}, [2]map[derived.TreePageID][]byte{before, before}, budget); err != nil || rows != nil || used[0].ContextBytes != 194302 || used[1].ContextBytes != 194302 { t.Fatal("equal extreme roots skipped validation") }
+		for _, index := range []int{0, 1} {
+			short := budget; short.Side[index].Graph.ContextBytes--
+			if rows, _, err := DiffPrivateTrees(context.Background(), roots, frames, short); err != metadata.ErrResourceExhausted || rows != nil { t.Fatal("one-byte-short extreme graph exposed diff") }
+		}
+	}
+	if checked != 2 { t.Fatal("maximum-path integration coverage changed") }
 }
