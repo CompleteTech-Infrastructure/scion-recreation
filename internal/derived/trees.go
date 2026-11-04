@@ -1203,3 +1203,25 @@ func PrepareCheckedTreeWrite(ctx context.Context, identity metadata.DerivedIdent
 	if err := ctx.Err(); err != nil { return bad(err) }
 	return candidate, added, used, nil
 }
+
+// PrepareCanonicalTreeWrite verifies an exact canonical changeset frame before
+// entering the checked parent/rewrite/candidate pipeline. Rewrite.InputBytes
+// limits the source payload (the 22-byte object header is additional), and the
+// complete supplied frame is admitted before decoding. Decoder/Snapshot copies
+// are bounded by that payload limit, not a peak-memory or operation-count bound;
+// Rewrite.Operations is enforced on the decoded changeset before tree work.
+//
+// Expected source identity is caller-supplied. Valid bytes do not establish
+// publication, authoritative parent mapping, retention or permission to read or
+// write. All PrepareCheckedTreeWrite phase budgets and private-output caveats
+// still apply. Inputs must remain stable; there is no fetch or durable mutation.
+func PrepareCanonicalTreeWrite(ctx context.Context, identity metadata.DerivedIdentity, sourceFrame []byte, parent *metadata.DerivedResult, frames map[TreePageID][]byte, blobs map[model.BlobID][]byte, budget TreeCheckedWriteBudget) (metadata.DerivedWrite, map[TreePageID][]byte, TreeCheckedWriteUsage, error) {
+	bad := func(err error) (metadata.DerivedWrite, map[TreePageID][]byte, TreeCheckedWriteUsage, error) { return metadata.DerivedWrite{}, nil, TreeCheckedWriteUsage{}, err }
+	limit := budget.Rewrite.InputBytes
+	if ctx == nil || identity.Validate() != nil || identity.Kind != "TREE" || identity.Version != 1 || limit == 0 || limit > model.MaxChangesetPayload { return bad(metadata.ErrInvalidArgument) }
+	if err := ctx.Err(); err != nil { return bad(err) }
+	if uint64(len(sourceFrame)) > limit+22 { return bad(metadata.ErrResourceExhausted) }
+	source, err := model.DecodeChangeset(ctx, bytes.NewReader(sourceFrame), identity.Changeset, limit)
+	if err != nil { return bad(err) }
+	return PrepareCheckedTreeWrite(ctx, identity, source.Snapshot(), parent, frames, blobs, budget)
+}

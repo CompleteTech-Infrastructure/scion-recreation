@@ -1515,6 +1515,74 @@ func TestPrepareCheckedTreeWriteNoopsEmptyAndPhaseCancellation(t *testing.T) {
 	if len(frames) != 1 { t.Fatal("checked phases mutated caller map") }
 }
 
+func TestPrepareCanonicalTreeWriteAdmitsExactSource(t *testing.T) {
+	ctx := context.Background()
+	empty, root, _ := EncodeTreePageAt(UnlinkedTreePage{}, nil, nil)
+	frames := map[TreePageID][]byte{root: empty}
+	blob, blobFrame := treeCanonicalBlob(t, []byte("content"))
+	path, _ := model.NewPath([]byte("a")); op, _ := model.NewOperation(path, model.SetRegular, &blob)
+	change := model.ChangesetInput{RepoID: [16]byte{1}, Operations: []model.Operation{op}}
+	identity := treeBindingIdentity(t, change)
+	value, err := model.NewChangeset(change); if err != nil { t.Fatal(err) }
+	var encoded bytes.Buffer
+	if err := model.EncodeChangeset(ctx, &encoded, value); err != nil { t.Fatal(err) }
+	source := encoded.Bytes()
+	sourceBefore := append([]byte(nil), source...)
+	graph := TreeObjectGraphBudget{graphTestBudget(), 1<<20}
+	budget := TreeCheckedWriteBudget{graph, graph, TreeChangesetBudget{TreeRewriteBudget{4096, 4096*MaxTreePageBytes, 4096*MaxTreePageBytes}, 4096, uint64(len(source)-22)}}
+	blobs := map[model.BlobID][]byte{blob: blobFrame}
+	want, wantFrames, wantUsage, err := PrepareCheckedTreeWrite(ctx, identity, change, nil, frames, blobs, budget); if err != nil { t.Fatal(err) }
+	got, added, used, err := PrepareCanonicalTreeWrite(ctx, identity, source, nil, frames, blobs, budget)
+	if err != nil || metadata.CompareDerivedWrite(got, want) != nil || used != wantUsage || len(added) != len(wantFrames) { t.Fatalf("canonical admission changed checked result: %v", err) }
+	for id, frame := range added { if !bytes.Equal(frame, wantFrames[id]) { t.Fatal("canonical admission changed page bytes") } }
+	checkBad := func(name string, callContext context.Context, id metadata.DerivedIdentity, frame []byte, b TreeCheckedWriteBudget) {
+		t.Helper()
+		write, out, usage, err := PrepareCanonicalTreeWrite(callContext, id, frame, nil, frames, blobs, b)
+		if err == nil || write.Result != (metadata.DerivedResult{}) || write.Parents != nil || out != nil || usage != (TreeCheckedWriteUsage{}) { t.Fatalf("%s reached tree work or leaked output: %+v %v", name, usage, err) }
+	}
+	short := budget; short.Rewrite.InputBytes--
+	checkBad("one byte short", ctx, identity, source, short)
+	for _, n := range []uint64{0, model.MaxChangesetPayload+1} { invalid := budget; invalid.Rewrite.InputBytes = n; checkBad("invalid payload cap", ctx, identity, source, invalid) }
+	checkBad("truncated", ctx, identity, source[:len(source)-1], budget)
+	// Permit the extra byte in admission so the canonical decoder itself must
+	// reject trailing data rather than relying on the outer length bound.
+	larger := budget; larger.Rewrite.InputBytes++
+	checkBad("trailing", ctx, identity, append(append([]byte(nil), source...), 0), larger)
+	corrupt := append([]byte(nil), source...); corrupt[len(corrupt)-1] ^= 1
+	checkBad("digest or syntax", ctx, identity, corrupt, budget)
+	wrongKind := append([]byte(nil), source...); wrongKind[13] = byte(model.BlobKind)
+	checkBad("kind", ctx, identity, wrongKind, budget)
+	other := change; other.Message = []byte("different")
+	checkBad("expected digest", ctx, treeBindingIdentity(t, other), source, budget)
+	wrongRepo := identity; wrongRepo.Repository[0]++
+	checkBad("repository", ctx, wrongRepo, source, budget)
+	wrongDerived := identity; wrongDerived.Version++
+	checkBad("derived version", ctx, wrongDerived, source, budget)
+	checkBad("nil context", nil, identity, source, budget)
+	cancelled, cancel := context.WithCancel(ctx); cancel()
+	checkBad("cancelled", cancelled, identity, source, budget)
+	// The decoder admits both canonical operations under the payload cap, but
+	// the separate rewrite operation cap must reject before any tree work.
+	pathB, _ := model.NewPath([]byte("b")); opB, _ := model.NewOperation(pathB, model.SetRegular, &blob)
+	two := change; two.Operations = []model.Operation{op, opB}
+	twoValue, err := model.NewChangeset(two); if err != nil { t.Fatal(err) }
+	var twoEncoded bytes.Buffer
+	if err := model.EncodeChangeset(ctx, &twoEncoded, twoValue); err != nil { t.Fatal(err) }
+	oneOperation := budget; oneOperation.Rewrite.Operations = 1; oneOperation.Rewrite.InputBytes = uint64(twoEncoded.Len()-22)
+	writeLimit, outLimit, usedLimit, err := PrepareCanonicalTreeWrite(ctx, treeBindingIdentity(t, two), twoEncoded.Bytes(), nil, frames, blobs, oneOperation)
+	if err != metadata.ErrResourceExhausted || writeLimit.Result != (metadata.DerivedResult{}) || writeLimit.Parents != nil || outLimit != nil || usedLimit != (TreeCheckedWriteUsage{}) { t.Fatal("decoded operation limit reached tree work") }
+	// Checkpoint 1 is wrapper admission, 2-4 read the complete header,
+	// and 5-6 begin/read the repository payload. Cancel after that read,
+	// within decoding and before source verification or tree work completes.
+	midDecode := &treePhaseCancelContext{Context: ctx, cancelAt: 6}
+	writeCancel, outCancel, usedCancel, err := PrepareCanonicalTreeWrite(midDecode, identity, source, nil, frames, blobs, budget)
+	if err != context.Canceled || midDecode.calls != 6 || writeCancel.Result != (metadata.DerivedResult{}) || writeCancel.Parents != nil || outCancel != nil || usedCancel != (TreeCheckedWriteUsage{}) { t.Fatal("mid-source-decode cancellation leaked output") }
+	// Later candidate-integrity failure still yields no prepared write.
+	write, out, usage, err := PrepareCanonicalTreeWrite(ctx, identity, source, nil, frames, nil, budget)
+	if err == nil || write.Result != (metadata.DerivedResult{}) || out != nil || usage.Parent.Graph.Visits != 1 || usage.Candidate.BlobVisits != 1 { t.Fatal("canonical source skipped candidate validation") }
+	if len(frames) != 1 || !bytes.Equal(frames[root], empty) || !bytes.Equal(source, sourceBefore) { t.Fatal("canonical preparation mutated input") }
+}
+
 type setTestEntry struct {
 	path string
 	tag  byte
