@@ -851,11 +851,15 @@ type admissionInput struct {
 	ctx       context.Context
 	src       io.Reader
 	remaining uint64
+	failure   error // sticky non-EOF source error, even if a decoder consumes its bytes
 }
 
 func (r *admissionInput) Read(b []byte) (int, error) {
 	if err := r.ctx.Err(); err != nil {
 		return 0, err
+	}
+	if r.failure != nil {
+		return 0, r.failure
 	}
 	if len(b) == 0 {
 		return 0, nil
@@ -879,6 +883,11 @@ func (r *admissionInput) Read(b []byte) (int, error) {
 		return 0, ErrAdmissionInvalid
 	}
 	r.remaining -= uint64(n)
+	// io.ReadFull may discard an error when these bytes complete its buffer.
+	// Retain non-EOF failures so no decoder or final input probe can hide them.
+	if err != nil && err != io.EOF {
+		r.failure = err
+	}
 	if n == 0 && err == nil {
 		return 0, io.ErrNoProgress
 	}
@@ -887,6 +896,9 @@ func (r *admissionInput) Read(b []byte) (int, error) {
 func (r *admissionInput) ReadByte() (byte, error) {
 	var b [1]byte
 	n, err := r.Read(b[:])
+	if err != nil && err != io.EOF {
+		return 0, err
+	}
 	if n == 1 {
 		return b[0], nil
 	}
