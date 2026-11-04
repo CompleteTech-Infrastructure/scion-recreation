@@ -311,3 +311,38 @@ func TestIdentityTrustSnapshotAndLookupBoundary(t *testing.T) {
 		t.Fatal("nil context accepted")
 	}
 }
+
+func TestIdentityCancellationDuringClockLookup(t *testing.T) {
+	for _, cancelAt := range []int{0, 1, 2} {
+		t.Run(fmt.Sprintf("clock_call_%d", cancelAt), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			r := vectorResolver(t, "authority")
+			clockCalls, revocationCalls := 0, 0
+			r.now = func() (time.Time, error) {
+				clockCalls++
+				if clockCalls == cancelAt {
+					cancel()
+				}
+				return time.Unix(150, 0), nil
+			}
+			r.check = func(context.Context, IdentityClaims) (RevocationState, error) {
+				revocationCalls++
+				return RevocationActive, nil
+			}
+			got, err := r.Resolve(ctx, vectorCredential(vectorClaims()))
+			if cancelAt == 0 {
+				if err != nil || got.Principal.Subject != vectorClaims().Subject || clockCalls != 2 || revocationCalls != 1 {
+					t.Fatalf("uncanceled resolution changed: identity=%+v err=%v clocks=%d revocations=%d", got, err, clockCalls, revocationCalls)
+				}
+				return
+			}
+			if got != (Identity{}) || err != ErrUnauthenticated || err.Error() != "unauthenticated" {
+				t.Fatal("clock cancellation must return zero identity and fixed safe error")
+			}
+			if clockCalls != cancelAt || revocationCalls != cancelAt-1 {
+				t.Fatalf("work continued after cancellation: clocks=%d revocations=%d", clockCalls, revocationCalls)
+			}
+		})
+	}
+}
