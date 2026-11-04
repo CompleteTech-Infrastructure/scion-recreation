@@ -171,3 +171,32 @@ func TestFileEntryDiffRejectsAndBudgets(t *testing.T) {
 		if got, err := DiffFileEntries(ctx, nil, nil, FileDiffBudget{1, 1, 1}); got != nil || !errors.Is(err, context.Canceled) { t.Fatal(got, err) }
 	}
 }
+
+func TestFileEntryDiffBudgetAdmission(t *testing.T) {
+	// Empty selections cannot exhaust input or output budgets: each rejection
+	// below must come from the budget's admission constraint itself.
+	for _, tc := range []struct {
+		name   string
+		budget FileDiffBudget
+	}{
+		{"entries-above-maximum", FileDiffBudget{1000001, 1, 1}},
+		{"path-bytes-above-maximum", FileDiffBudget{1, (64 << 20) + 1, 1}},
+		{"changes-above-entries", FileDiffBudget{1, 1, 2}},
+		{"zero-entries", FileDiffBudget{0, 1, 1}},
+		{"zero-path-bytes", FileDiffBudget{1, 0, 1}},
+		{"zero-changes", FileDiffBudget{1, 1, 0}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := DiffFileEntries(context.Background(), nil, nil, tc.budget)
+			if got != nil || !errors.Is(err, ErrFileDiffLimit) {
+				t.Fatalf("budget %+v admitted: deltas=%v err=%v", tc.budget, got, err)
+			}
+		})
+	}
+	t.Run("exact-maxima", func(t *testing.T) {
+		got, err := DiffFileEntries(context.Background(), nil, nil, FileDiffBudget{1000000, 64 << 20, 1000000})
+		if err != nil || len(got) != 0 {
+			t.Fatalf("maximum budget rejected: deltas=%v err=%v", got, err)
+		}
+	})
+}
