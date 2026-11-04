@@ -1493,3 +1493,44 @@ func TestReplayCanonicalTreeChainOwnsParentMappings(t *testing.T) {
 	if !bytes.Equal(blobBefore, blobs[blob]) { t.Fatal("result mutation changed blob input") }
 	for i, source := range sources { if _, err := model.DecodeChangeset(ctx, bytes.NewReader(source.Frame), source.ID, step.Rewrite.InputBytes); err != nil { t.Fatalf("source %d mutated: %v", i, err) } }
 }
+
+func TestReplayCanonicalTreeDAGVerifiesAllParents(t *testing.T) {
+	ctx := context.Background(); repo := [16]byte{3}
+	blob, frame := treeCanonicalBlob(t, nil); blobs := map[model.BlobID][]byte{blob: frame}
+	path, _ := model.NewPath([]byte("a"))
+	regular, _ := model.NewOperation(path, model.SetRegular, &blob)
+	executable, _ := model.NewOperation(path, model.SetExecutable, &blob)
+	remove, _ := model.NewOperation(path, model.Delete, nil)
+	root := treeReplaySource(t, model.ChangesetInput{RepoID: repo, Operations: []model.Operation{regular}})
+	left := treeReplaySource(t, model.ChangesetInput{RepoID: repo, Parents: []model.ChangesetID{root.ID}, Operations: []model.Operation{executable}})
+	right := treeReplaySource(t, model.ChangesetInput{RepoID: repo, Parents: []model.ChangesetID{root.ID}, Operations: []model.Operation{remove}})
+	mergeLeft := treeReplaySource(t, model.ChangesetInput{RepoID: repo, Parents: []model.ChangesetID{left.ID, right.ID}})
+	mergeRight := treeReplaySource(t, model.ChangesetInput{RepoID: repo, Parents: []model.ChangesetID{right.ID, left.ID}})
+	sources := []TreeSourceFrame{root, left, right, mergeLeft, mergeRight}
+	var frameBytes uint64; for _, s := range sources { frameBytes += uint64(len(s.Frame)) }
+	graph := TreeObjectGraphBudget{graphTestBudget(), 22}
+	step := TreeCheckedWriteBudget{graph, graph, TreeChangesetBudget{TreeRewriteBudget{4096, 4096*MaxTreePageBytes, 4096*MaxTreePageBytes}, 4096, model.MaxChangesetPayload}}
+	budget := TreeReplayBudget{5, frameBytes, 3, 144, step}
+	writes, pages, usage, err := ReplayCanonicalTreeDAG(ctx, repo, sources, blobs, budget)
+	if err != nil || len(writes) != 5 || len(pages) != 3 || usage != (TreeReplayUsage{5, frameBytes, 3, 144}) { t.Fatalf("DAG exact replay: %+v %v", usage, err) }
+	if writes[3].Result.Value != writes[1].Result.Value || writes[4].Result.Value != writes[2].Result.Value || writes[3].Result.Value == writes[4].Result.Value || len(writes[3].Parents) != 1 || writes[3].Parents[0] != writes[1].Result || len(writes[4].Parents) != 1 || writes[4].Parents[0] != writes[2].Result { t.Fatal("all-parent verification changed parent-zero-only tree derivation") }
+	if out, frames, _, err := ReplayCanonicalTreeChain(ctx, repo, sources, blobs, budget); err != metadata.ErrFailedPrecondition || out != nil || frames != nil { t.Fatal("DAG input silently changed chain API semantics") }
+	for _, bad := range [][]TreeSourceFrame{{root, left, mergeLeft}, {root, mergeLeft, left, right}, {root, root}, {left}} {
+		if out, frames, _, err := ReplayCanonicalTreeDAG(ctx, repo, bad, blobs, budget); err == nil || out != nil || frames != nil { t.Fatal("incomplete/out-of-order/duplicate DAG exposed partial outputs") }
+	}
+	foreign := treeReplaySource(t, model.ChangesetInput{RepoID: [16]byte{9}})
+	foreignMerge := treeReplaySource(t, model.ChangesetInput{RepoID: repo, Parents: []model.ChangesetID{left.ID, foreign.ID}})
+	if out, frames, _, err := ReplayCanonicalTreeDAG(ctx, repo, []TreeSourceFrame{root, left, foreign, foreignMerge}, blobs, budget); err != metadata.ErrInvalidArgument || out != nil || frames != nil { t.Fatal("foreign nonzero-parent ancestry admitted") }
+	// Independent same-repository roots are valid; a merge still takes only
+	// parent zero's tree rather than unioning the second root's empty tree.
+	otherRoot := treeReplaySource(t, model.ChangesetInput{RepoID: repo})
+	joined := treeReplaySource(t, model.ChangesetInput{RepoID: repo, Parents: []model.ChangesetID{root.ID, otherRoot.ID}})
+	joinedWrites, _, _, err := ReplayCanonicalTreeDAG(ctx, repo, []TreeSourceFrame{root, otherRoot, joined}, blobs, budget)
+	if err != nil || len(joinedWrites) != 3 || joinedWrites[2].Result.Value != writes[0].Result.Value { t.Fatal("multiple roots failed parent-zero semantics") }
+	short := budget; short.Pages--
+	if out, frames, used, err := ReplayCanonicalTreeDAG(ctx, repo, sources, blobs, short); err != metadata.ErrResourceExhausted || out != nil || frames != nil || used.Sources != 2 { t.Fatal("later DAG exhaustion leaked earlier result") }
+	corrupt := append([]TreeSourceFrame(nil), sources...); corrupt[4].Frame = append([]byte(nil), corrupt[4].Frame...); corrupt[4].Frame[len(corrupt[4].Frame)-1] ^= 1
+	if out, frames, used, err := ReplayCanonicalTreeDAG(ctx, repo, corrupt, blobs, budget); err == nil || out != nil || frames != nil || used.Sources != 5 { t.Fatal("late DAG corruption leaked prior mappings") }
+	cancelled, cancel := context.WithCancel(ctx); cancel()
+	if out, frames, _, err := ReplayCanonicalTreeDAG(cancelled, repo, sources, blobs, budget); err != context.Canceled || out != nil || frames != nil { t.Fatal("DAG replay ignored cancellation") }
+}
