@@ -1,0 +1,16 @@
+{
+  "worktree": {
+    "setup": [
+      "go mod download"
+    ],
+    "teardown": "echo \"Setup starts no persistent services; Paseo handles worktree removal.\""
+  },
+  "scripts": {
+    "diff-check": {
+      "command": "git diff --check"
+    },
+    "test": {
+      "command": "go test ./..."
+    }
+  }
+}
