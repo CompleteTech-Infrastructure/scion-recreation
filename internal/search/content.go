@@ -41,8 +41,9 @@ func (s *contentStage) Write(p []byte) (int, error) {
 // BuildContentSnapshot consumes only a canonical PathSnapshot, re-verifying
 // every referenced blob against its exact typed identity. Full frames are
 // admitted before decoding; repeated references count repeatedly. A private
-// staging writer retains at most FileBytes, discarding excess while the decoder
-// still verifies the entire frame. Oversize is a classification, not truncated
+// staging writer retains at most FileBytes for regular/executable files and no
+// payload for symlinks, while the decoder still verifies the entire frame.
+// Oversize is a classification, not truncated
 // text; malformed/missing frames are errors, never classification shortcuts.
 //
 // Files <=4096, aggregate frame/text bytes <=1MiB. Staging, owned text copies
@@ -114,6 +115,9 @@ func buildContentSnapshot(ctx context.Context, paths *PathSnapshot, previous *Co
 		if uint64(len(frame)) > budget.FrameBytes-used.FrameBytes { return bad(metadata.ErrResourceExhausted) }
 		used.FrameBytes += uint64(len(frame))
 		stage := &contentStage{limit: budget.FileBytes}
+		// Symlinks never expose text, even when their payload exceeds FileBytes
+		// or contains NUL/invalid UTF-8. Discard only staging bytes, not validation.
+		if row.Tag() == model.SetSymlink { stage.limit = 0 }
 		n, err := model.DecodeBlob(ctx, bytes.NewReader(frame), id, stage, budget.FrameBytes)
 		if err != nil { return bad(err) }
 		entry := ContentEntry{Operation: row}

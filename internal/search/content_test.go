@@ -3,6 +3,7 @@ package search
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"reflect"
 	"testing"
 
@@ -133,4 +134,130 @@ func TestCanonicalContentAdmissionAndLiteralSearch(t *testing.T) {
 	for _, frame := range blobs { for i := range frame { frame[i]=0 } }
 	again, _, err := snapshot.Contains(ctx,repo,id,"go",query)
 	if err != nil || !reflect.DeepEqual(again,rows[1:3]) || snapshot.Entries()[1].Text != "go\n" { t.Fatal("snapshot aliases input/output") }
+}
+
+// Build through canonical replay so these tests do not manufacture trusted
+// PathSnapshot rows. Faults are injected only after this admission succeeds.
+func symlinkStagingFixture(t testing.TB, tag model.OperationTag, payload []byte) (*PathSnapshot, map[model.BlobID][]byte, ContentBudget) {
+	t.Helper()
+	ctx := context.Background()
+	blob, err := model.HashBlob(ctx, uint64(len(payload)), bytes.NewReader(payload))
+	if err != nil { t.Fatal(err) }
+	var frame bytes.Buffer
+	if err := model.EncodeBlob(ctx, &frame, uint64(len(payload)), bytes.NewReader(payload)); err != nil { t.Fatal(err) }
+	blobs := map[model.BlobID][]byte{blob: frame.Bytes()}
+	path, err := model.NewPath([]byte("entry"))
+	if err != nil { t.Fatal(err) }
+	row, err := model.NewOperation(path, tag, &blob)
+	if err != nil { t.Fatal(err) }
+	repo := [16]byte{6}
+	change, err := model.NewChangeset(model.ChangesetInput{RepoID: repo, Operations: []model.Operation{row}})
+	if err != nil { t.Fatal(err) }
+	id, err := model.HashChangeset(ctx, change)
+	if err != nil { t.Fatal(err) }
+	var source bytes.Buffer
+	if err := model.EncodeChangeset(ctx, &source, change); err != nil { t.Fatal(err) }
+	graph := derived.TreeGraphBudget{Visits: 4096, PageBytes: 4096*derived.MaxTreePageBytes, ContextBytes: 64<<20}
+	objects := derived.TreeObjectGraphBudget{Graph: graph, BlobBytes: 1<<20}
+	step := derived.TreeCheckedWriteBudget{Parent: objects, Candidate: objects, Rewrite: derived.TreeChangesetBudget{Rewrite: derived.TreeRewriteBudget{Pages: 4096, ReadBytes: 4096*derived.MaxTreePageBytes, WriteBytes: 4096*derived.MaxTreePageBytes}, Operations: 4096, InputBytes: model.MaxChangesetPayload}}
+	paths, _, err := BuildCanonicalPathSnapshot(ctx, repo, id, []derived.TreeSourceFrame{{ID: id, Frame: source.Bytes()}}, blobs, PathSnapshotBudget{Replay: derived.TreeReplayBudget{Sources: 1, SourceBytes: uint64(source.Len()), Pages: 4096, PageBytes: 4096*derived.MaxTreePageBytes, Step: step}, Snapshot: derived.TreeEntriesBudget{Graph: graph, Entries: 1, PathBytes: 10}})
+	if err != nil { t.Fatal(err) }
+	return paths, blobs, ContentBudget{Files: 1, FrameBytes: uint64(frame.Len()), FileBytes: uint64(len(payload)), TextBytes: uint64(len(payload))}
+}
+
+func TestContentSymlinkDiscardPreservesClassificationAndReuse(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct{name string; payload []byte}{
+		{"empty", nil}, {"text", []byte("target/path")}, {"binary", []byte{'x', 0, 'y'}},
+		{"invalid-utf8", []byte{0xff}}, {"multiple-chunks", bytes.Repeat([]byte("x"), 65537)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			paths, blobs, full := symlinkStagingFixture(t, model.SetSymlink, tc.payload)
+			for _, limit := range []uint64{0, 1, 32768, 1<<20} {
+				budget := full; budget.FileBytes = limit; budget.TextBytes = 0
+				snapshot, used, err := BuildContentSnapshot(ctx, paths, blobs, budget)
+				wantUsage := ContentUsage{Files: 1, FrameBytes: full.FrameBytes}
+				if err != nil || used != wantUsage || snapshot == nil { t.Fatalf("limit %d: %+v %v", limit, used, err) }
+				want := []ContentEntry{{Operation: paths.rows[0], Class: ContentSymlink}}
+				if !reflect.DeepEqual(snapshot.Entries(), want) { t.Fatalf("limit %d: symlink payload exposed or misclassified", limit) }
+				if got, work, err := snapshot.Contains(ctx, paths.repository, paths.source, "x", ContentQueryBudget{Work: 1, Matches: 1}); err != nil || len(got) != 0 || work != 0 { t.Fatal("symlink participated in text search") }
+				repeated, reuse, err := BuildContentSnapshotReusing(ctx, paths, snapshot, nil, budget)
+				if err != nil || reuse != (ContentReuseUsage{Admission: ContentUsage{Files: 1}, Reused: 1}) || !reflect.DeepEqual(repeated.Entries(), want) { t.Fatalf("repeat: %+v %v", reuse, err) }
+			}
+		})
+	}
+	// A zero-retention writer consumes every chunk without retaining a prefix
+	// or aliasing the decoder's scratch buffer, including repeated empty writes.
+	stage := &contentStage{}
+	for _, chunk := range [][]byte{nil, []byte("target"), bytes.Repeat([]byte{0xff}, 32768), nil} {
+		if n, err := stage.Write(chunk); err != nil || n != len(chunk) || stage.data != nil { t.Fatal("discard writer retained data or returned short write") }
+	}
+}
+
+func TestContentSymlinkDiscardStillRejectsInvalidFrames(t *testing.T) {
+	ctx := context.Background()
+	paths, blobs, budget := symlinkStagingFixture(t, model.SetSymlink, bytes.Repeat([]byte("x"), 65537))
+	budget.FileBytes = 1<<20; budget.TextBytes = 0
+	id, _ := paths.rows[0].Target()
+	frame := blobs[id]
+	for _, kind := range []string{"digest", "truncated", "trailing", "header", "length"} {
+		t.Run(kind, func(t *testing.T) {
+			bad := bytes.Clone(frame)
+			switch kind {
+			case "digest": bad[len(bad)-1] ^= 1
+			case "truncated": bad = bad[:len(bad)-1]
+			case "trailing": bad = append(bad, 0)
+			case "header": bad[0] ^= 1
+			case "length": bad[21] ^= 1
+			}
+			admitted := budget; admitted.FrameBytes = uint64(len(bad))
+			out, used, err := BuildContentSnapshot(ctx, paths, map[model.BlobID][]byte{id: bad}, admitted)
+			if err == nil || out != nil || used != (ContentUsage{Files: 1, FrameBytes: uint64(len(bad))}) { t.Fatalf("invalid frame became classification: %+v %v", used, err) }
+		})
+	}
+	if out, used, err := BuildContentSnapshot(ctx, paths, nil, budget); err != metadata.ErrFailedPrecondition || out != nil || used != (ContentUsage{Files: 1}) { t.Fatalf("missing frame: %+v %v", used, err) }
+	short := budget; short.FrameBytes--
+	if out, used, err := BuildContentSnapshot(ctx, paths, blobs, short); err != metadata.ErrResourceExhausted || out != nil || used != (ContentUsage{Files: 1}) { t.Fatalf("frame admission: %+v %v", used, err) }
+	probe := &pathCancelContext{Context: ctx}
+	if out, _, err := BuildContentSnapshot(probe, paths, blobs, budget); err != nil || out == nil { t.Fatal("cancellation probe failed") }
+	for stop := 1; stop <= probe.calls; stop++ {
+		cancel := &pathCancelContext{Context: ctx, stop: stop}
+		out, used, err := BuildContentSnapshot(cancel, paths, blobs, budget)
+		if err != context.Canceled || out != nil || used.TextBytes != 0 || used.Files > 1 || used.FrameBytes > budget.FrameBytes { t.Fatalf("checkpoint %d: %+v %v", stop, used, err) }
+	}
+}
+
+func TestContentSymlinkDiscardDoesNotCrossReuseModes(t *testing.T) {
+	ctx := context.Background()
+	payload := []byte("target")
+	linkPaths, blobs, budget := symlinkStagingFixture(t, model.SetSymlink, payload)
+	link, _, err := BuildContentSnapshot(ctx, linkPaths, blobs, budget)
+	if err != nil { t.Fatal(err) }
+	for _, tag := range []model.OperationTag{model.SetRegular, model.SetExecutable} {
+		filePaths, _, _ := symlinkStagingFixture(t, tag, payload)
+		if out, _, err := BuildContentSnapshotReusing(ctx, filePaths, link, nil, budget); err != metadata.ErrFailedPrecondition || out != nil { t.Fatal("discarded symlink payload reused as file text") }
+		file, used, err := BuildContentSnapshotReusing(ctx, filePaths, link, blobs, budget)
+		if err != nil || used.Reused != 0 || used.Admission != (ContentUsage{1, budget.FrameBytes, uint64(len(payload))}) { t.Fatalf("file decode: %+v %v", used, err) }
+		if got := file.Entries(); len(got) != 1 || got[0].Text != string(payload) || got[0].Class != ContentText || got[0].Operation != filePaths.rows[0] { t.Fatal("regular/executable staging was discarded") }
+		if out, _, err := BuildContentSnapshotReusing(ctx, linkPaths, file, nil, budget); err != metadata.ErrFailedPrecondition || out != nil { t.Fatal("file text reused as symlink") }
+		zeroText := budget; zeroText.TextBytes = 0
+		back, used, err := BuildContentSnapshotReusing(ctx, linkPaths, file, blobs, zeroText)
+		if err != nil || used.Reused != 0 || used.Admission != (ContentUsage{Files: 1, FrameBytes: budget.FrameBytes}) || !reflect.DeepEqual(back.Entries(), link.Entries()) { t.Fatalf("symlink decode: %+v %v", used, err) }
+	}
+}
+
+func BenchmarkContentSymlinkDiscard(b *testing.B) {
+	for _, size := range []int{32, 32769, 262144} {
+		b.Run(fmt.Sprint(size), func(b *testing.B) {
+			paths, blobs, budget := symlinkStagingFixture(b, model.SetSymlink, bytes.Repeat([]byte("x"), size))
+			budget.TextBytes = 0
+			b.ReportAllocs()
+			b.SetBytes(int64(size))
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				out, used, err := BuildContentSnapshot(context.Background(), paths, blobs, budget)
+				if err != nil || out == nil || used != (ContentUsage{Files: 1, FrameBytes: budget.FrameBytes}) { b.Fatal("symlink snapshot failed") }
+			}
+		})
+	}
 }
