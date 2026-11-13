@@ -13,9 +13,11 @@ import (
 	"testing"
 )
 
-// Frozen verbatim from accepted FND-03 canonical.md (SHA-256
+// Checked-in literals match the candidate api/contracts/canonical.md (SHA-256
 // eceab23e153e7d96558858ef76448d41b34bf844315b5d37cea4f0404df4b9c2).
-// Its independent script and vector-run.txt are pinned in the task evidence.
+// Historical source scripts, vector-run.txt and approval receipts are unavailable
+// here. tests/conformance/oracle.py independently checks the current literals
+// against that contract; this fresh check does not establish historical approval.
 // Expected preimages, digests, TIDs and text never call model code to derive them.
 var frozenVectors = []struct{ name, preimage, digest, tid, text string }{
 	{"blob_empty", "43414e4f5059004f424a000001010000000000000000", "d300c179fc91e6df3575c746e504ce7edbfa118fae5cb3446df7696157cc7235", "000101d300c179fc91e6df3575c746e504ce7edbfa118fae5cb3446df7696157cc7235", "canopy:1:01:d300c179fc91e6df3575c746e504ce7edbfa118fae5cb3446df7696157cc7235"},
@@ -160,7 +162,7 @@ func TestObjectIDIndependentVectors(t *testing.T) {
 }
 
 // A test-only projection of observed immutable values, never the expected oracle.
-// Product codecs are deliberately absent; frozen accepted preimages above are
+// Product codecs are deliberately absent; checked-in literal preimages above are
 // the independent expected bytes. This is not an interoperability claim.
 func observedPreimage(t *testing.T, v ChangesetInput) []byte {
 	t.Helper()
