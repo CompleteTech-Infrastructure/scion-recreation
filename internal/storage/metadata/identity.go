@@ -103,7 +103,9 @@ const postgresIdentityBudget = `SELECT count(*)<=128 AND coalesce(sum(weight),0)
  UNION ALL SELECT 0 FROM pg_inherits i JOIN pg_class p ON p.oid=i.inhparent JOIN pg_namespace pn ON pn.oid=p.relnamespace
  JOIN pg_class c ON c.oid=i.inhrelid JOIN pg_namespace cn ON cn.oid=c.relnamespace
  WHERE pn.nspname='scion_metadata' OR cn.nspname='scion_metadata'
- UNION ALL SELECT octet_length(p.prosrc)+coalesce(octet_length(p.probin),0)+coalesce(pg_column_size(p.proconfig),0) FROM pg_proc p
+ UNION ALL SELECT octet_length(p.prosrc)+coalesce(octet_length(p.probin),0)+coalesce(pg_column_size(p.proconfig),0)
+ +coalesce(octet_length(p.proargdefaults::text),0)+coalesce(octet_length(p.prosqlbody::text),0)
+ +coalesce(pg_column_size(p.proargnames),0)+coalesce(pg_column_size(p.proallargtypes),0) FROM pg_proc p
  JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='scion_metadata'
  ) entries LIMIT 129
 ) bounded`

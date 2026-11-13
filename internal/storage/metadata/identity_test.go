@@ -125,6 +125,10 @@ func TestPostgresDatabaseIdentityDriftReal(t *testing.T) {
 		"inheritance": "CREATE TABLE public.shadow() INHERITS(scion_metadata.publications)",
 		"oversize function": "CREATE FUNCTION scion_metadata.big() RETURNS text LANGUAGE sql AS " +
 			"$fn$ SELECT '" + strings.Repeat("x", 70000) + "'::text $fn$",
+		"oversize default": "CREATE FUNCTION scion_metadata.bigdefault(arg text DEFAULT '" +
+			strings.Repeat("x", 70000) + "') RETURNS text LANGUAGE sql AS $fn$ SELECT arg $fn$",
+		"oversize parsed body": "CREATE FUNCTION scion_metadata.bigsql() RETURNS text LANGUAGE sql BEGIN ATOMIC SELECT '" +
+			strings.Repeat("x", 70000) + "'::text; END",
 		"excess objects": `DO $body$ BEGIN FOR i IN 1..130 LOOP EXECUTE format('CREATE TABLE scion_metadata.extra%s(v int)',i); END LOOP; END $body$`,
 	} {
 		t.Run(name, func(t *testing.T) {
