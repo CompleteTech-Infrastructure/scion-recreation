@@ -105,6 +105,51 @@ Its seven strings are `s`, `k`, `i`, `p`, `human`, `a`, `t`; credential hash is
 session is `02` followed by 31 zero bytes, generation is 0, and times are 100/200.
 This vector freezes transcript bytes, not a valid credential/signature pair.
 
+### Complete signed fixture
+
+The following complete vector is deterministic test data, not an issuer key or
+credential for a real deployment. Hex values decode to raw bytes; all other
+strings are the literal ASCII bytes shown. The session credential hash is the
+`credential_hash_hex` value. The verifier uses Unix second 150, audience
+`authority`, the two public keys below under their stated issuer/key IDs, and
+an explicitly active identity-revocation fixture. The expected result is a
+verified session with exactly these claims and `session_proof_hash_hex`.
+That fixture result establishes neither durable enrollment nor policy rights.
+
+```json
+{
+  "identity_seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "session_seed_hex": "6363636363636363636363636363636363636363636363636363636363636363",
+  "identity_public_key_hex": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+  "session_public_key_hex": "a7f6dfaf8f38b89ba8ce649b594f91e4d01fdc57f9c9493df43b5e50a9987367",
+  "identity_claims": {
+    "issuer": "issuer-A", "key_id": "key-1",
+    "subject": "opaque-secret-subject", "principal_class": "human",
+    "audience": "authority", "not_before_unix": 100, "expires_at_unix": 200
+  },
+  "identity_signature_hex": "a9afd982ddb18892a6f722bc53c2cd8be1d36c27bc5f9be06185d3f5b9ac99d80c5134c4fd25c01278733748519eb11019a3896caf5d867fcfb835f18698c800",
+  "credential_hash_hex": "7398e14f066616f836e19b00e281079e2c72887ec0ae17ab5c00e01e74bca8df",
+  "session_version": 1,
+  "session_claims": {
+    "authority_issuer": "session-issuer", "key_id": "session-key",
+    "principal_issuer": "issuer-A", "principal_subject": "opaque-secret-subject",
+    "principal_class": "human", "audience": "authority",
+    "tenant_hex": "74656e616e7400ff",
+    "repository_hex": "01000000000000000000000000000000",
+    "session_hex": "0200000000000000000000000000000000000000000000000000000000000000",
+    "generation": 0, "not_before_unix": 110, "expires_at_unix": 190
+  },
+  "session_signature_hex": "f3ca28cc2822fb713b1bc59d2b8f18713bc1c0bf53fbe73fd0e71bc42870bb745e6f0782df1d048d374f01ee3a84361f66211270c083799fa8ae9e16a1cc070c",
+  "session_proof_hash_hex": "7e2269839a15c12ee1d768e6e617f1c4bfe0beb8a0ffe04511f04509ecc98549",
+  "verifier_time_unix": 150
+}
+```
+
+Reproduce it by framing the identity claims above, signing with the identity
+seed, hashing that transcript and signature, then framing and signing the
+session claims with the session seed. Hash the latter transcript and signature
+for the proof hash. No JSON bytes or extra version byte enter either transcript.
+
 `TestSessionAuthenticityAndProvenance` compares `SessionTranscript` against the
 independent `sessionVector` framing and verifies real Ed25519 signatures and
 proof hashes. Its identity seed is bytes 0..31; session seed is 32 copies of 99.
