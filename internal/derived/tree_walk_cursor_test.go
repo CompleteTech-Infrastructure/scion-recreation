@@ -56,9 +56,17 @@ func cursorStore(t *testing.T, a *cursorAuthority, frames map[derived.TreePageID
 		t.Fatal(e)
 	}
 	t.Cleanup(func() { _ = s.Close() })
-	done, e := s.RecoverTemps(context.Background())
-	if e != nil || !done {
-		t.Fatal(done, e)
+	for i := 0; ; i++ {
+		done, e := s.RecoverTemps(context.Background())
+		if e != nil {
+			t.Fatal(e)
+		}
+		if done {
+			break
+		}
+		if i == 10 {
+			t.Fatal("fixture recovery did not complete")
+		}
 	}
 	for id, b := range frames {
 		if _, e := s.Stage(context.Background(), id, bytes.NewReader(b)); e != nil {
