@@ -355,11 +355,9 @@ func TestDecodeRejectsMalformedChangesets(t *testing.T) {
 	first, _ := NewOperation(path(t, pair[0].path), pair[0].tag, &blob)
 	secondOp, _ := NewOperation(path(t, pair[1].path), pair[1].tag, &blob)
 	input := ChangesetInput{Author: metadata(t, []byte("A"), 0, 0), Operations: []Operation{first, secondOp}}
-	value, err := NewChangeset(input)
-	if err != nil {
-		t.Fatal(err)
-	}
-	frame, typed := decodeTestFrame(t, ChangesetKind, observedPreimage(t, value.Snapshot())[22:])
+	// Serialize deliberately invalid input directly: the public constructor
+	// rejects this conflict before a Changeset can reach an encoder.
+	frame, typed := decodeTestFrame(t, ChangesetKind, observedPreimage(t, input)[22:])
 	id, err := NewChangesetID(typed)
 	if err != nil {
 		t.Fatal(err)
