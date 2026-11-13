@@ -218,6 +218,10 @@ func TestHarnessIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		python, err = filepath.Abs(python)
+		if err != nil {
+			t.Fatal(err)
+		}
 		configured := filepath.Join(t.TempDir(), "python space'quote")
 		if err := os.Symlink(python, configured); err != nil {
 			t.Fatal(err)
