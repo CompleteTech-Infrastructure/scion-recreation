@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
 )
 
 const (
@@ -384,7 +385,8 @@ type Changeset struct {
 }
 
 // ValidateChangeset preflights the complete final payload before any cloning.
-// It validates local value syntax, not the resulting parent-derived tree.
+// It validates local value syntax and unavoidable SET leaf conflicts, not the
+// resulting parent-derived tree.
 func ValidateChangeset(v ChangesetInput) (uint64, error) {
 	if uint64(len(v.Parents)) > MaxParents || uint64(len(v.Operations)) > MaxOperations {
 		return 0, errors.New("changeset count exceeds limit")
@@ -450,6 +452,36 @@ func ValidateChangeset(v ChangesetInput) (uint64, error) {
 		}
 		if err := add(n); err != nil {
 			return 0, err
+		}
+	}
+	// All paths, ordering and size bounds are checked before this pass. Search
+	// for each SET's descendant range by comparing against a virtual path + "/"
+	// without allocating it. Adjacent-operation checks are insufficient: "a-"
+	// sorts between "a" and "a/b". DELETE descendants remain valid replacements.
+	// Until rejection SET descendant ranges are disjoint, so the scans visit
+	// each DELETE at most once. Memory is constant; searches use O(n log n)
+	// bounded raw-path comparisons, followed by at most O(n) scan comparisons.
+	for i, o := range v.Operations {
+		if o.tag == Delete {
+			continue
+		}
+		path := o.path.raw
+		rest := v.Operations[i+1:]
+		start := sort.Search(len(rest), func(j int) bool {
+			raw := rest[j].path.raw
+			if len(raw) > len(path) && raw[:len(path)] == path {
+				return raw[len(path)] >= '/'
+			}
+			return raw > path
+		})
+		for _, descendant := range rest[start:] {
+			raw := descendant.path.raw
+			if len(raw) <= len(path) || raw[:len(path)] != path || raw[len(path)] != '/' {
+				break
+			}
+			if descendant.tag != Delete {
+				return 0, errors.New("conflicting SET leaf paths")
+			}
 		}
 	}
 	return size, nil

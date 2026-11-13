@@ -10,8 +10,10 @@ import (
 	"testing"
 )
 
-// frozenVectors is the independent literal oracle frozen by accepted OBJ-01-A
-// in object_types_test.go. Its source is pinned in tests/provenance.json.
+// frozenVectors contains the checked-in literals in object_types_test.go.
+// Historical approval/source receipts (including tests/provenance.json) are
+// unavailable here. tests/conformance/oracle.py supplies a fresh independent
+// check against the candidate contract; it does not establish historical approval.
 func TestEncodeAndHashFrozenCanonicalVectors(t *testing.T) {
 	for _, vector := range frozenVectors {
 		t.Run(vector.name, func(t *testing.T) {
@@ -64,7 +66,7 @@ func TestChangesetOrderAndSimultaneousDelta(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		// Independent literal: canonical payload with the same accepted parent
+		// Independent literal: canonical payload with the same supplied parent
 		// TID twice; SHA-256 is then checked over these fixed bytes.
 		want := unhex(t, "43414e4f5059004f424a0000010200000000000000730000000000000000000000000000000000000002000102f6737fd55f7bd71004146b225ab018e6146aee88859063fe5064c0dd83973eee000102f6737fd55f7bd71004146b225ab018e6146aee88859063fe5064c0dd83973eee00000001410000000000000000000000000000000000000000")
 		var output bytes.Buffer

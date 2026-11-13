@@ -2,6 +2,7 @@ package model
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -12,9 +13,11 @@ import (
 	"testing"
 )
 
-// Frozen verbatim from accepted FND-03 canonical.md (SHA-256
+// Checked-in literals match the candidate api/contracts/canonical.md (SHA-256
 // eceab23e153e7d96558858ef76448d41b34bf844315b5d37cea4f0404df4b9c2).
-// Its independent script and vector-run.txt are pinned in the task evidence.
+// Historical source scripts, vector-run.txt and approval receipts are unavailable
+// here. tests/conformance/oracle.py independently checks the current literals
+// against that contract; this fresh check does not establish historical approval.
 // Expected preimages, digests, TIDs and text never call model code to derive them.
 var frozenVectors = []struct{ name, preimage, digest, tid, text string }{
 	{"blob_empty", "43414e4f5059004f424a000001010000000000000000", "d300c179fc91e6df3575c746e504ce7edbfa118fae5cb3446df7696157cc7235", "000101d300c179fc91e6df3575c746e504ce7edbfa118fae5cb3446df7696157cc7235", "canopy:1:01:d300c179fc91e6df3575c746e504ce7edbfa118fae5cb3446df7696157cc7235"},
@@ -159,7 +162,7 @@ func TestObjectIDIndependentVectors(t *testing.T) {
 }
 
 // A test-only projection of observed immutable values, never the expected oracle.
-// Product codecs are deliberately absent; frozen accepted preimages above are
+// Product codecs are deliberately absent; checked-in literal preimages above are
 // the independent expected bytes. This is not an interoperability claim.
 func observedPreimage(t *testing.T, v ChangesetInput) []byte {
 	t.Helper()
@@ -474,6 +477,150 @@ func TestObjectOperationOrder(t *testing.T) {
 	}
 	if len(v.Snapshot().Parents) != 2 {
 		t.Fatal("deduplicated parents")
+	}
+}
+
+func TestObjectChangesetRejectSetAncestorConflicts(t *testing.T) {
+	// Every SET mode is a leaf, including symlinks. Lexical siblings may sit
+	// between an ancestor and its descendants in canonical byte order.
+	for _, ancestor := range []OperationTag{SetRegular, SetExecutable, SetSymlink} {
+		for _, descendant := range []OperationTag{SetRegular, SetExecutable, SetSymlink} {
+			for _, paths := range [][]string{
+				{"a", "a/b"},
+				{"a", "a-", "a/b"},
+				{"a", "a-", "a/b", "a/c/d"},
+				{"\xff", "\xff-", "\xff/b"},
+				{"a/b", "a/b-", "a/b/c"},
+			} {
+				t.Run(fmt.Sprintf("%d_%d_%x", ancestor, descendant, paths), func(t *testing.T) {
+					ops := make([]Operation, len(paths))
+					for i, p := range paths {
+						tag := descendant
+						if i == 0 {
+							tag = ancestor
+						} else if len(paths) == 4 && i == 2 {
+							// An earlier descendant DELETE cannot hide a later SET.
+							tag = Delete
+						}
+						ops[i] = operation(t, []byte(p), tag)
+					}
+					input := ChangesetInput{Operations: ops}
+					if n, err := ValidateChangeset(input); err == nil || n != 0 {
+						t.Fatalf("conflict preflight: size=%d error=%v", n, err)
+					}
+					value, err := NewChangeset(input)
+					if err == nil {
+						t.Error("constructor accepted conflicting SET leaves")
+					}
+					// Exercise only exported constructors and codec entry points;
+					// the failed constructor must not yield an encodable value.
+					var out bytes.Buffer
+					if err := EncodeChangeset(context.Background(), &out, value); err == nil || out.Len() != 0 {
+						t.Fatalf("invalid value emitted bytes=%d error=%v", out.Len(), err)
+					}
+					if id, err := HashChangeset(context.Background(), value); err == nil || id != (ChangesetID{}) {
+						t.Fatalf("invalid value hashed: id=%v error=%v", id, err)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestObjectChangesetAllowsReplacementsAndDistinctBytePaths(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		paths []string
+		tags  []OperationTag
+	}{
+		{"file_to_directory", []string{"a", "a/b"}, []OperationTag{Delete, SetRegular}},
+		{"directory_to_file", []string{"a", "a/b", "a/c"}, []OperationTag{SetRegular, Delete, Delete}},
+		{"directory_to_symlink", []string{"a", "a-", "a/b", "a/c/d"}, []OperationTag{SetSymlink, SetRegular, Delete, Delete}},
+		{"deleted_ancestor", []string{"a", "a/b", "a/b/c"}, []OperationTag{Delete, Delete, SetExecutable}},
+		{"byte_prefix_not_component", []string{"a", "a-", "ab/c"}, []OperationTag{SetRegular, SetRegular, SetRegular}},
+		{"case", []string{"A", "a/b"}, []OperationTag{SetRegular, SetRegular}},
+		{"normalization", []string{"e\xcc\x81/b", "\xc3\xa9"}, []OperationTag{SetRegular, SetRegular}},
+		{"backslash", []string{"a/b", "a\\b"}, []OperationTag{SetRegular, SetSymlink}},
+		{"percent", []string{"%61", "a/b"}, []OperationTag{SetRegular, SetRegular}},
+		{"non_utf8", []string{"\xfe", "\xff/b"}, []OperationTag{SetRegular, SetRegular}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ops := make([]Operation, len(tc.paths))
+			for i, p := range tc.paths {
+				ops[i] = operation(t, []byte(p), tc.tags[i])
+			}
+			value, err := NewChangeset(ChangesetInput{Operations: ops})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var out bytes.Buffer
+			if err := EncodeChangeset(context.Background(), &out, value); err != nil {
+				t.Fatal(err)
+			}
+			id, err := HashChangeset(context.Background(), value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			decoded, err := DecodeChangeset(context.Background(), bytes.NewReader(out.Bytes()), id, MaxChangesetPayload)
+			if err != nil || !reflect.DeepEqual(decoded.Snapshot(), value.Snapshot()) {
+				t.Fatalf("round trip: error=%v", err)
+			}
+			if n := testing.AllocsPerRun(10, func() {
+				if _, err := ValidateChangeset(ChangesetInput{Operations: ops}); err != nil {
+					panic(err)
+				}
+			}); n != 0 {
+				t.Fatalf("validation allocated: %g", n)
+			}
+		})
+	}
+}
+
+func TestObjectChangesetConflictOracle(t *testing.T) {
+	// Exhaust all absent/DELETE/SET assignments to paths spanning both sides
+	// of '/' in byte order. The independent oracle checks every SET pair.
+	paths := []string{"a", "a-", "a.", "a/b", "a/b-", "a/b/c", "a0"}
+	for assignment := 0; assignment < 2187; assignment++ { // 3^7
+		var ops []Operation
+		var leaves []string
+		remaining := assignment
+		for _, p := range paths {
+			state := remaining % 3
+			remaining /= 3
+			if state == 0 {
+				continue
+			}
+			tag := Delete
+			if state == 2 {
+				tag = SetRegular
+				leaves = append(leaves, p)
+			}
+			ops = append(ops, operation(t, []byte(p), tag))
+		}
+		conflict := false
+		for i, a := range leaves {
+			for _, b := range leaves[i+1:] {
+				conflict = conflict || strings.HasPrefix(b, a+"/") || strings.HasPrefix(a, b+"/")
+			}
+		}
+		if _, err := ValidateChangeset(ChangesetInput{Operations: ops}); (err != nil) != conflict {
+			t.Fatalf("assignment %d leaves %q: conflict=%v error=%v", assignment, leaves, conflict, err)
+		}
+	}
+}
+
+func TestObjectChangesetConflictPathBounds(t *testing.T) {
+	for _, p := range []string{
+		strings.Repeat("x", int(MaxPathBytes)),
+		strings.Repeat("x/", MaxPathComponents-1) + "x",
+	} {
+		input := ChangesetInput{Operations: []Operation{operation(t, []byte(p), SetRegular)}}
+		if _, err := ValidateChangeset(input); err != nil {
+			t.Fatalf("maximum path rejected: %v", err)
+		}
+		if n := testing.AllocsPerRun(10, func() { _, _ = ValidateChangeset(input) }); n != 0 {
+			t.Fatalf("maximum path validation allocated: %g", n)
+		}
 	}
 }
 
