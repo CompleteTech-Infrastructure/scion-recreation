@@ -134,11 +134,10 @@ func (v *SessionVerifier) VerifySession(ctx context.Context, credential *Identit
 	if err != nil || identity.Principal != c.Principal || identity.Audience != c.Audience || c.NotBeforeUnix < credential.Claims.NotBeforeUnix || c.ExpiresAtUnix > credential.Claims.ExpiresAtUnix {
 		return deny, ErrUnauthenticated
 	}
-	h := sha256.New()
-	h.Write(identityTranscript(credential.Claims))
-	h.Write(credential.Signature)
-	var digest [32]byte
-	copy(digest[:], h.Sum(nil))
+	digest, err := IdentityCredentialHash(credential)
+	if err != nil {
+		return deny, ErrUnauthenticated
+	}
 	if digest != c.CredentialHash {
 		return deny, ErrUnauthenticated
 	}
@@ -146,9 +145,24 @@ func (v *SessionVerifier) VerifySession(ctx context.Context, credential *Identit
 	if err != nil || now.IsZero() || now.Unix() < c.NotBeforeUnix || now.Unix() >= c.ExpiresAtUnix || ctx.Err() != nil {
 		return deny, ErrUnauthenticated
 	}
-	h.Reset()
+	h := sha256.New()
 	h.Write(transcript)
 	h.Write(proof.Signature)
 	copy(digest[:], h.Sum(nil))
 	return VerifiedSession{owner: v, claims: c, proofHash: digest}, nil
+}
+
+// IdentityCredentialHash is bounded canonical hashing, NOT signature verification,
+// authentication, enrollment or permission. Signing adapters must authenticate
+// independently. No caller-owned mutable storage is returned.
+func IdentityCredentialHash(c *IdentityCredential) ([32]byte, error) {
+	if c == nil || !validIdentityClaims(c.Claims) || len(c.Signature) != ed25519.SignatureSize {
+		return [32]byte{}, ErrUnauthenticated
+	}
+	h := sha256.New()
+	h.Write(identityTranscript(c.Claims))
+	h.Write(c.Signature)
+	var digest [32]byte
+	copy(digest[:], h.Sum(nil))
+	return digest, nil
 }

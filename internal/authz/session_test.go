@@ -59,6 +59,14 @@ func sessionDenied(t *testing.T, v *SessionVerifier, ctx context.Context, c *Ide
 
 func TestSessionAuthenticityAndProvenance(t *testing.T) {
 	v, c, p, _ := sessionFixture(t)
+	if digest, err := IdentityCredentialHash(c); err != nil || digest != p.Claims.CredentialHash {
+		t.Fatal("credential hash mismatch")
+	}
+	for _, bad := range []*IdentityCredential{nil, {}, {Claims: c.Claims, Signature: []byte{1}}} {
+		if digest, err := IdentityCredentialHash(bad); err != ErrUnauthenticated || digest != ([32]byte{}) {
+			t.Fatal("malformed credential hash")
+		}
+	}
 	want := sessionVector(p.Claims)
 	got, err := SessionTranscript(p.Claims)
 	if err != nil || !bytes.Equal(got, want) {
