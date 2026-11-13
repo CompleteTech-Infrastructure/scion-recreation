@@ -6,6 +6,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -100,6 +102,130 @@ func TestLinuxNativeKernelEvents(t *testing.T) {
 			watchUnknown(t, w, meta)
 		})
 	}
+}
+
+// Exhaust a real private inotify queue without draining it. A second private
+// queue records the raw kernel overflow receipt; the backend's own decoded mask
+// must independently contain IN_Q_OVERFLOW. No records or loss flags are injected.
+func TestLinuxNativeKernelOverflow(t *testing.T) {
+	config, err := os.ReadFile("/proc/sys/fs/inotify/max_queued_events")
+	if err != nil {
+		t.Skipf("actual kernel overflow blocked: queue configuration unavailable: %v", err)
+	}
+	queued, err := strconv.Atoi(strings.TrimSpace(string(config)))
+	if err != nil || queued < 1 || queued > 65536 {
+		t.Skipf("actual kernel overflow blocked: max_queued_events=%q outside bounded [1,65536] workload", config)
+	}
+	w, n, root, meta := linuxFixture(t)
+	staleScan := watchScan(t, w)
+	staleProof := watchProof(w, staleScan)
+	_, before, err := w.Snapshot()
+	watchOK(t, err)
+	witness, err := syscall.InotifyInit1(syscall.IN_NONBLOCK | syscall.IN_CLOEXEC)
+	watchOK(t, err)
+	defer syscall.Close(witness)
+	_, err = syscall.InotifyAddWatch(witness, root, linuxWatchMask)
+	watchOK(t, err)
+	cycles := queued/2 + 2 // create + delete alone exceed the configured queue
+	losses := 0
+	var observed uint32
+	var released bool
+	err = n.call(context.Background(), func() error {
+		// Production's smaller pending budget normally fails closed before it
+		// reaches the kernel overflow record. Widen only this private test
+		// owner's pending/byte budgets to exercise that record in step/drain.
+		// Single-byte root filenames keep the total decoded bytes <= 65536.
+		n.pendingCap = queued + 1
+		n.limits.Bytes = linuxWatchBytes
+		n.masks = 0
+		prior := n.observe
+		defer func() { n.observe = prior }()
+		n.observe = func(events []WatchEvent) error {
+			for _, event := range events {
+				if event.Kind == WatchLoss {
+					losses++
+				}
+			}
+			return prior(events)
+		}
+		// The sole backend owner is occupied by this request: its periodic
+		// drain cannot run until all mutations are complete. At most one
+		// empty fixture file exists; storage and syscall counts are bounded.
+		deadline := time.Now().Add(10 * time.Second)
+		for i := 0; i < cycles; i++ {
+			if time.Now().After(deadline) {
+				return context.DeadlineExceeded
+			}
+			fd, e := syscall.Openat(int(n.root.Fd()), "o", syscall.O_WRONLY|syscall.O_CREAT|syscall.O_EXCL|syscall.O_CLOEXEC, 0600)
+			if e != nil {
+				return e
+			}
+			if e = syscall.Close(fd); e != nil {
+				return e
+			}
+			if e = syscall.Unlinkat(int(n.root.Fd()), "o"); e != nil {
+				return e
+			}
+		}
+		result := n.step(context.Background(), true)
+		observed = n.masks
+		released = n.fd == -1 && n.root == nil && n.descriptors == 0 && len(n.watches) == 0
+		return result
+	})
+	watchIs(t, err, ErrWatchStale)
+	watchCheck(t, observed&syscall.IN_Q_OVERFLOW != 0, "backend did not decode actual kernel overflow: masks=%#x", observed)
+	watchCheck(t, losses == 1 && released, "overflow losses=%d released=%v", losses, released)
+
+	// Inspect unmodified kernel bytes on the independent witness queue.
+	var buf [16 << 10]byte
+	records, overflows := 0, 0
+	for {
+		count, e := syscall.Read(witness, buf[:])
+		if errors.Is(e, syscall.EAGAIN) {
+			break
+		}
+		watchOK(t, e)
+		watchCheck(t, count > 0, "unexpected empty witness read")
+		data := buf[:count]
+		for len(data) > 0 {
+			watchCheck(t, len(data) >= syscall.SizeofInotifyEvent, "truncated kernel header")
+			size := int(binary.NativeEndian.Uint32(data[12:]))
+			watchCheck(t, size <= len(data)-syscall.SizeofInotifyEvent, "truncated kernel name")
+			record := data[:syscall.SizeofInotifyEvent+size]
+			mask := binary.NativeEndian.Uint32(record[4:])
+			if mask&syscall.IN_Q_OVERFLOW != 0 {
+				watchCheck(t, int32(binary.NativeEndian.Uint32(record)) == -1 && size == 0, "invalid overflow receipt: %x", record)
+				overflows++
+				t.Logf("kernel overflow receipt: wd=-1 mask=%#x raw=%x", mask, record)
+			}
+			records++
+			watchCheck(t, records <= queued+1, "witness queue exceeded configured bound")
+			data = data[len(record):]
+		}
+	}
+	watchCheck(t, overflows == 1 && records == queued+1, "witness records=%d overflow=%d configured=%d", records, overflows, queued)
+	t.Logf("actual kernel: max_queued_events=%d cycles=%d witness_records=%d backend_masks=%#x loss_deliveries=%d released=%v", queued, cycles, records, observed, losses, released)
+	_, after, err := w.Snapshot()
+	watchOK(t, err)
+	watchCheck(t, after > before, "overflow did not invalidate clean generation")
+	watchUnknown(t, w, meta)
+	watchIs(t, w.Finish(context.Background(), staleScan, staleProof), ErrWatchStale)
+	watchIs(t, n.Barrier(context.Background()), ErrWatchStale)
+	watchUnknown(t, w, meta)
+
+	// A terminal backend requires a fresh owner and full bounded inventory;
+	// only then may this unchanged fixture supply a new trusted content proof.
+	watchOK(t, w.Close())
+	fresh, err := OpenNativeWatch(root, meta, n.limits)
+	watchOK(t, err)
+	defer fresh.Close()
+	watchUnknown(t, fresh, meta)
+	reconciled := watchScan(t, fresh)
+	watchCheck(t, reconciled.Progress.Complete && reconciled.Progress.RestartAtRoot, "overflow recovery omitted full reconciliation: %+v", reconciled.Progress)
+	watchOK(t, fresh.Finish(context.Background(), reconciled, watchProof(fresh, reconciled)))
+	disk, err := Load(meta)
+	watchOK(t, err)
+	watchCheck(t, disk.State == Clean, "reconciled fixture did not persist clean")
 }
 
 // The delivery callback runs after drain reaches EAGAIN. Use it only as a
