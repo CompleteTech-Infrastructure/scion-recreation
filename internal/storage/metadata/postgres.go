@@ -224,7 +224,8 @@ func (p *Postgres) InitializeSchema(ctx context.Context) error {
 	}
 	// Compare the actual catalog, never just a mutable version marker. The fixed
 	// v1 fingerprint covers tables, columns, constraints, indexes, trigger enable
-	// state and function body. Unknown catalog layouts fail closed, never migrate.
+	// state, function body, rewrite rules and incoming/outgoing inheritance.
+	// Unknown catalog layouts fail closed, never migrate.
 	var catalog string
 	if err = tx.QueryRow(ctx, postgresCatalog).Scan(&catalog); err != nil {
 		return postgresSchemaError(ctx, err)
@@ -269,5 +270,11 @@ const postgresCatalog = `SELECT coalesce(jsonb_agg(v ORDER BY v::text)::text,'[]
  FROM pg_index i JOIN pg_class c ON c.oid=i.indrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='scion_metadata'
  UNION ALL SELECT jsonb_build_array('trigger',c.relname,t.tgenabled,pg_get_triggerdef(t.oid))
  FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='scion_metadata' AND NOT t.tgisinternal
+ UNION ALL SELECT jsonb_build_array('rule',c.relname,r.rulename,r.ev_enabled,pg_get_ruledef(r.oid))
+ FROM pg_rewrite r JOIN pg_class c ON c.oid=r.ev_class JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='scion_metadata'
+ UNION ALL SELECT jsonb_build_array('inheritance',pn.nspname,p.relname,cn.nspname,c.relname,i.inhseqno,i.inhdetachpending)
+ FROM pg_inherits i JOIN pg_class p ON p.oid=i.inhparent JOIN pg_namespace pn ON pn.oid=p.relnamespace
+ JOIN pg_class c ON c.oid=i.inhrelid JOIN pg_namespace cn ON cn.oid=c.relnamespace
+ WHERE pn.nspname='scion_metadata' OR cn.nspname='scion_metadata'
  UNION ALL SELECT jsonb_build_array('function',pg_get_functiondef(p.oid)) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='scion_metadata'
 ) s`

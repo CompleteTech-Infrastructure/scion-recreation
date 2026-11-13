@@ -345,3 +345,34 @@ func TestPostgresRollbackCleanupBoundReal(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// Rules can silently discard accepted INSERTs; inherited rows can bypass parent
+// uniqueness and immutable triggers. Both are incompatible even if their other
+// endpoint lives outside the metadata schema and the version marker is intact.
+func TestPostgresOperationalSchemaDriftReal(t *testing.T) {
+	for _, change := range []string{
+		"CREATE RULE discard_publications AS ON INSERT TO scion_metadata.publications DO INSTEAD NOTHING",
+		"CREATE RULE discard_mutations AS ON INSERT TO scion_metadata.mutations DO INSTEAD NOTHING",
+		"CREATE TABLE public.shadow_publications () INHERITS (scion_metadata.publications)",
+		"CREATE TABLE public.shadow_mutations () INHERITS (scion_metadata.mutations)",
+		"CREATE TABLE public.external_parent (); ALTER TABLE scion_metadata.publications INHERIT public.external_parent",
+	} {
+		t.Run(change, func(t *testing.T) {
+			p, c := postgresRepairFixture(t)
+			if _, err := c.Exec(context.Background(), change); err != nil {
+				t.Fatal(err)
+			}
+			var version int
+			var definition string
+			if err := c.QueryRow(context.Background(), "SELECT version,definition FROM scion_metadata.schema_version WHERE singleton").Scan(&version, &definition); err != nil {
+				t.Fatal(err)
+			}
+			if version != 1 || definition != postgresDDL {
+				t.Fatal("fixture changed marker")
+			}
+			if err := p.InitializeSchema(context.Background()); err != ErrFailedPrecondition {
+				t.Fatalf("operational schema drift accepted: %v", err)
+			}
+		})
+	}
+}
