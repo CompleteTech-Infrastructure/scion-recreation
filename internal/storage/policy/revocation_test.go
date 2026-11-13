@@ -285,3 +285,45 @@ func TestPolicyRevocationExpiryAndCancellationDuringLockWait(t *testing.T) {
 		})
 	}
 }
+
+func TestPolicyRevocationRejectsCorruptRetainedCredentialTarget(t *testing.T) {
+	for _, session := range []bool{false, true} {
+		t.Run(fmt.Sprint("session=", session), func(t *testing.T) {
+			f := managementSetup(t)
+			admin, writer, _, a, _ := f.bootstrap(t)
+			enrollFixture(t, a, admin, writer, 2)
+			ctx := context.Background()
+			mutate := func() (Receipt, error) {
+				if session {
+					return a.RevokeSession(ctx, admin, SessionRevocation{SessionID: writer.Session.Claims.Session, RequestID: fixtureRequest(3)})
+				}
+				return a.RevokeCredential(ctx, admin, CredentialRevocation{CredentialHash: writer.Session.Claims.CredentialHash, RequestID: fixtureRequest(3)})
+			}
+			r, err := mutate()
+			if err != nil || r.TargetCredentialHash != writer.Session.Claims.CredentialHash {
+				t.Fatal("signed target revoke", r, err)
+			}
+			assertReceiptAudit(t, f, admin, r)
+			// Privileged fixture corruption is a negative probe, never a positive
+			// admission path. Restore the trigger before current catalog checks.
+			bad := r
+			bad.TargetCredentialHash[0] ^= 1
+			if _, err := f.db.Exec(ctx, "ALTER TABLE scion_policy.admin_results DISABLE TRIGGER USER"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.db.Exec(ctx, "UPDATE scion_policy.admin_results SET receipt=$1 WHERE request_id=$2", encodeReceipt(bad), r.RequestID[:]); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.db.Exec(ctx, "ALTER TABLE scion_policy.admin_results ENABLE TRIGGER USER"); err != nil {
+				t.Fatal(err)
+			}
+			before := policyCounts(t, f)
+			if got, err := mutate(); got != (Receipt{}) || !errors.Is(err, metadata.ErrCorruptData) {
+				t.Fatal("corrupt retained target was replayed", got, err)
+			}
+			if after := policyCounts(t, f); after != before {
+				t.Fatal("corrupt replay changed durable state", before, after)
+			}
+		})
+	}
+}
