@@ -8,6 +8,7 @@ import (
  "context"
  "encoding/binary"
  "errors"
+ "fmt"
  "io"
  "os"
  "os/exec"
@@ -404,4 +405,80 @@ func TestStoreShortPayloadAndEnvelopeWrites(t *testing.T) {
    noTemps(t,root)
   })
  }
+}
+
+// Real files plus injected EIO/cancellation; this does not simulate power loss.
+// Seed: REVIEW-BLOB-REUSE-UNKNOWN-v1.
+func TestStoreUncertainActivationRetry(t *testing.T) {
+ for _,reuse:=range []bool{false,true} {
+  for _,point:=range []string{"afterLink","finalSync","remove","directorySync","stagingSync","cancelAfterLink"} {
+   t.Run(fmt.Sprintf("reused=%t/%s",reuse,point),func(t *testing.T){
+    root:=privateDir(t)
+    payload:=[]byte("REVIEW-BLOB-REUSE-UNKNOWN-v1")
+    id,frame:=fixture(t,payload)
+    final:=filepath.Join(root,blobName(id))
+    var before os.FileInfo
+    if reuse {
+     first:=ready(t,root,options(),diskOps{before:func(p string)error{
+      if p=="afterLink"{return syscall.EIO};return nil
+     }})
+     result,err:=first.Put(context.Background(),id,uint64(len(payload)),bytes.NewReader(frame))
+     requireError(t,err,ErrOutcomeUnknown);requireError(t,err,syscall.EIO)
+     if result!=(PutResult{}){t.Fatal("uncertain first activation reported success")}
+     if err=first.Close();err!=nil{t.Fatal(err)}
+     before,err=os.Stat(final);if err!=nil{t.Fatal(err)}
+    }
+    ctx,cancel:=context.WithCancel(context.Background());defer cancel()
+    reached:=false
+    s:=ready(t,root,options(),diskOps{before:func(p string)error{
+     if point=="cancelAfterLink" && p=="afterLink"{reached=true;cancel();return nil}
+     if p==point{reached=true;return syscall.EIO};return nil
+    }})
+    result,err:=s.Put(ctx,id,uint64(len(payload)),bytes.NewReader(frame))
+    if !reached{t.Fatal("fault boundary not reached")}
+    if result!=(PutResult{}){t.Fatal("unconfirmed operation reported success")}
+    requireError(t,err,ErrOutcomeUnknown)
+    if point=="cancelAfterLink"{requireError(t,err,context.Canceled)}else{
+     requireError(t,err,ErrUnavailable);requireError(t,err,syscall.EIO)
+    }
+    noTemps(t,root)
+    if err=s.Close();err!=nil{t.Fatal(err)}
+    after,err:=os.Stat(final);if err!=nil{t.Fatal(err)}
+    if reuse && !os.SameFile(before,after){t.Fatal("retry replaced original object")}
+    reopened:=ready(t,root,options(),diskOps{})
+    reader,err:=reopened.OpenCanonical(context.Background(),id);if err!=nil{t.Fatal(err)}
+    got,readErr:=io.ReadAll(reader);closeErr:=reader.Close()
+    if readErr!=nil || closeErr!=nil || !bytes.Equal(got,frame){
+     t.Fatalf("invalid activated content: read=%v close=%v",readErr,closeErr)
+    }
+    // Only a retry completing every barrier may acknowledge reuse.
+    if !put(t,reopened,id,frame,uint64(len(payload))).Reused{t.Fatal("retry did not reuse")}
+    noTemps(t,root)
+   })
+  }
+ }
+}
+
+func TestStoreUncertainReuseRejectsCorruption(t *testing.T) {
+ root:=privateDir(t);payload:=[]byte("REVIEW-BLOB-REUSE-UNKNOWN-v1")
+ id,frame:=fixture(t,payload)
+ first:=ready(t,root,options(),diskOps{before:func(p string)error{
+  if p=="afterLink"{return syscall.EIO};return nil
+ }})
+ result,err:=first.Put(context.Background(),id,uint64(len(payload)),bytes.NewReader(frame))
+ requireError(t,err,ErrOutcomeUnknown)
+ if result!=(PutResult{}){t.Fatal("uncertain first activation reported success")}
+ if err=first.Close();err!=nil{t.Fatal(err)}
+ path:=filepath.Join(root,blobName(id));data,err:=os.ReadFile(path);if err!=nil{t.Fatal(err)}
+ data[len(data)-1]^=1
+ if err=os.Chmod(path,0600);err!=nil{t.Fatal(err)}
+ if err=os.WriteFile(path,data,0600);err!=nil{t.Fatal(err)}
+ if err=os.Chmod(path,0400);err!=nil{t.Fatal(err)}
+ s:=ready(t,root,options(),diskOps{})
+ result,err=s.Put(context.Background(),id,uint64(len(payload)),bytes.NewReader(frame))
+ requireError(t,err,ErrCorruptData);requireError(t,err,ErrOutcomeUnknown)
+ if result!=(PutResult{}){t.Fatal("corrupt existing object acknowledged")}
+ current,err:=os.ReadFile(path);if err!=nil{t.Fatal(err)}
+ if !bytes.Equal(current,data){t.Fatal("corrupt existing object replaced")}
+ noTemps(t,root)
 }

@@ -332,7 +332,9 @@ func (s *Filesystem) Put(ctx context.Context,id model.BlobID,declaredPayload uin
  if err==nil{err=s.root.Link(".staging/"+name,final)}
  reused:=errors.Is(err,os.ErrExist)
  if err!=nil && !reused{return result,diskError(err)}
- activated=!reused
+ // EEXIST proves presence, not that a previous activation completed its syncs.
+ // Both paths remain uncertain until this call completes every durability barrier.
+ activated=true
  if err=s.step("afterLink");err!=nil{return result,diskError(err)}
  if err=ctx.Err();err!=nil{return result,err}
  existing,e:=s.openFinal(final)
