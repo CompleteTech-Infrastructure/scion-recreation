@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -227,6 +228,7 @@ func TestChangesetExistingCorruption(t *testing.T) {
 				t.Fatal(err)
 			}
 			before, _ := os.Lstat(path)
+			original, _ := os.ReadFile(path)
 			r, err := s.Put(context.Background(), id, bytes.NewReader(frame))
 			requireStoreError(t, r, err, ErrCorruptData)
 			v, err := s.Get(context.Background(), id)
@@ -234,6 +236,10 @@ func TestChangesetExistingCorruption(t *testing.T) {
 				t.Fatal("corrupt delivery", err)
 			}
 			after, _ := os.Lstat(path)
+			now, _ := os.ReadFile(path)
+			if !bytes.Equal(original, now) {
+				t.Fatal("corrupt bytes changed")
+			}
 			if !os.SameFile(before, after) {
 				t.Fatal("corrupt destination replaced")
 			}
@@ -322,7 +328,7 @@ func TestChangesetAuthority(t *testing.T) {
 					t.Error("authority binding")
 				}
 				if calls == denyAt || action == ActionGet && denyAt == 4 && calls == 2 {
-					return errors.New("secret-provider-detail")
+					return errors.Join(context.DeadlineExceeded, errors.New("secret-provider-detail"))
 				}
 				return nil
 			})
@@ -392,5 +398,249 @@ func TestChangesetProcessCrash(t *testing.T) {
 				t.Fatal("crash retry state")
 			}
 		})
+	}
+}
+
+func TestChangesetRootConfinement(t *testing.T) {
+	for _, point := range []string{"rootMode", "rootLink", "stageMode", "stageLink", "rootSwap", "stageSwap"} {
+		t.Run(point, func(t *testing.T) {
+			root, outside := storeRoot(t), storeRoot(t)
+			sentinel := filepath.Join(outside, "sentinel")
+			if err := os.WriteFile(sentinel, []byte("untouched"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			switch point {
+			case "rootMode":
+				os.Chmod(root, 0750)
+			case "rootLink":
+				os.Remove(root)
+				os.Symlink(outside, root)
+			case "stageMode":
+				os.Mkdir(filepath.Join(root, ".staging"), 0755)
+			case "stageLink":
+				os.Symlink(outside, filepath.Join(root, ".staging"))
+			}
+			ops := diskOps{before: func(p string) error {
+				if p == "beforeLink" && (point == "rootSwap" || point == "stageSwap") {
+					path := root
+					if point == "stageSwap" {
+						path = filepath.Join(root, ".staging")
+					}
+					if err := os.Rename(path, path+".old"); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Symlink(outside, path); err != nil {
+						t.Fatal(err)
+					}
+				}
+				return nil
+			}}
+			s, err := openChangesets(root, storeOptions(), allow, ops)
+			if point != "rootSwap" && point != "stageSwap" {
+				if s != nil || err == nil {
+					t.Fatal("unsafe constructor", err)
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer s.Close()
+				if _, err := s.RecoverTemps(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+				id, frame := changesetFixture(t, "confinement")
+				r, err := s.Put(context.Background(), id, bytes.NewReader(frame))
+				requireStoreError(t, r, err, ErrUnavailable)
+			}
+			b, err := os.ReadFile(sentinel)
+			if err != nil || string(b) != "untouched" {
+				t.Fatal("outside mutated", err)
+			}
+			xs, err := os.ReadDir(outside)
+			if err != nil || len(xs) != 1 {
+				t.Fatal("escaped activation", err)
+			}
+		})
+	}
+}
+
+func TestChangesetRecoveryAndOptions(t *testing.T) {
+	for _, opts := range []Options{{}, {1 << 20, 0, 1}, {1 << 20, 1025, 1}, {1 << 20, 1, 0}, {1 << 20, 1, 1025}, {model.MaxChangesetPayload + 1, 1, 1}} {
+		if s, err := OpenChangesets(storeRoot(t), opts, allow); s != nil || !errors.Is(err, ErrInvalidArgument) {
+			t.Fatal("options", err)
+		}
+	}
+	root := storeRoot(t)
+	s, err := OpenChangesets(root, storeOptions(), allow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	id, frame := changesetFixture(t, "recovery")
+	r, err := s.Put(context.Background(), id, bytes.NewReader(frame))
+	requireStoreError(t, r, err, ErrBusy)
+	for i := range 5 {
+		name := fmt.Sprintf("%032x.tmp", i)
+		if err := os.WriteFile(filepath.Join(root, ".staging", name), frame[:10], 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for remaining := 5; remaining > 0; {
+		done, err := s.RecoverTemps(context.Background())
+		xs, readErr := os.ReadDir(filepath.Join(root, ".staging"))
+		if err != nil || readErr != nil || remaining-len(xs) > 2 || remaining == len(xs) || done {
+			t.Fatal("bounded recovery", remaining, len(xs), done, err)
+		}
+		remaining = len(xs)
+	}
+	if done, err := s.RecoverTemps(context.Background()); !done || err != nil {
+		t.Fatal("recovery EOF", err)
+	}
+	putFrame(t, s, id, frame)
+	info, err := os.Stat(objectPath(root, id))
+	if err != nil || info.Sys().(*syscall.Stat_t).Uid != uint32(os.Geteuid()) {
+		t.Fatal("object owner", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	bad := filepath.Join(root, ".staging", "00000000000000000000000000000000.tmp")
+	if err := os.Symlink(objectPath(root, id), bad); err != nil {
+		t.Fatal(err)
+	}
+	s, err = OpenChangesets(root, storeOptions(), allow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := s.RecoverTemps(context.Background()); !errors.Is(err, ErrCorruptData) {
+		t.Fatal("unsafe orphan", err)
+	}
+	if info, err := os.Lstat(bad); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("unsafe orphan removed", err)
+	}
+}
+
+type sourceFunc func([]byte) (int, error)
+
+func (f sourceFunc) Read(p []byte) (int, error) { return f(p) }
+
+func TestChangesetAdmissionClose(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	root := storeRoot(t)
+	opts := storeOptions()
+	opts.MaxConcurrentOps = 1
+	s, err := OpenChangesets(root, opts, allow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := s.RecoverTemps(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	id, frame := changesetFixture(t, "admission")
+	finished := make(chan error, 1)
+	go func() {
+		_, err := s.Put(context.Background(), id, sourceFunc(func([]byte) (int, error) { close(entered); <-release; return 0, io.ErrUnexpectedEOF }))
+		finished <- err
+	}()
+	<-entered
+	r, err := s.Put(context.Background(), id, bytes.NewReader(frame))
+	requireStoreError(t, r, err, ErrBusy)
+	if err := s.Close(); !errors.Is(err, ErrBusy) {
+		t.Fatal("closed active descriptor", err)
+	}
+	close(release)
+	if err := <-finished; !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatal(err)
+	}
+	r, err = s.Put(context.Background(), id, bytes.NewReader(frame))
+	requireStoreError(t, r, err, ErrClosed)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var nilStore *Changesets
+	if !errors.Is(nilStore.Close(), ErrInvalidArgument) {
+		t.Fatal("nil lifetime")
+	}
+}
+
+func TestChangesetSourcesCancellation(t *testing.T) {
+	id, frame := changesetFixture(t, "source-cancel")
+	for _, point := range []string{"nil", "typedNil", "sourceError", "shortWrite", "admission", "source", "beforeLink", "afterLink"} {
+		t.Run(point, func(t *testing.T) {
+			root := storeRoot(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			ops := diskOps{before: func(p string) error {
+				if p == point {
+					cancel()
+				}
+				return nil
+			}}
+			if point == "shortWrite" {
+				ops.write = func(f *os.File, p []byte) (int, error) { return f.Write(p[:len(p)/2]) }
+			}
+			s := readyStore(t, root, allow, ops)
+			var src io.Reader = bytes.NewReader(frame)
+			want := error(context.Canceled)
+			switch point {
+			case "nil":
+				src, want = nil, ErrInvalidArgument
+			case "typedNil":
+				var typed *bytes.Reader
+				src, want = typed, ErrInvalidArgument
+			case "sourceError":
+				src, want = sourceFunc(func(p []byte) (int, error) { return copy(p, frame), syscall.EIO }), syscall.EIO
+			case "shortWrite":
+				want = io.ErrShortWrite
+			case "admission":
+				cancel()
+			case "source":
+				src = sourceFunc(func(p []byte) (int, error) { cancel(); return copy(p, frame), nil })
+			}
+			r, err := s.Put(ctx, id, src)
+			requireStoreError(t, r, err, want)
+			if errors.Is(err, ErrOutcomeUnknown) != (point == "afterLink") {
+				t.Fatal("cancellation uncertainty", err)
+			}
+			_, err = os.Stat(objectPath(root, id))
+			if point == "afterLink" && err != nil || point != "afterLink" && !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("cancellation activation", err)
+			}
+			xs, err := os.ReadDir(filepath.Join(root, ".staging"))
+			if err != nil || len(xs) != 0 {
+				t.Fatal("cleanup leak", err)
+			}
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+			s = readyStore(t, root, allow, diskOps{})
+			putFrame(t, s, id, frame)
+		})
+	}
+}
+
+func TestChangesetReuseSyncFailure(t *testing.T) {
+	for _, point := range []string{"finalSync", "directorySync", "remove", "stagingSync"} {
+		root := storeRoot(t)
+		s := readyStore(t, root, allow, diskOps{})
+		id, frame := changesetFixture(t, "reuse-sync")
+		putFrame(t, s, id, frame)
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+		s = readyStore(t, root, allow, diskOps{before: func(p string) error {
+			if p == point {
+				return syscall.EIO
+			}
+			return nil
+		}})
+		r, err := s.Put(context.Background(), id, bytes.NewReader(frame))
+		requireStoreError(t, r, err, ErrOutcomeUnknown)
+		b, err := os.ReadFile(objectPath(root, id))
+		if err != nil || !bytes.Equal(b, frame) {
+			t.Fatal("reuse changed final", err)
+		}
 	}
 }
