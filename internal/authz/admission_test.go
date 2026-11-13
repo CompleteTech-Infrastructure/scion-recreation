@@ -1531,7 +1531,7 @@ type admissionWriterFunc func([]byte) (int, error)
 func (f admissionWriterFunc) Write(p []byte) (int, error) { return f(p) }
 
 func TestAdmissionCopyFinalIOCancellation(t *testing.T) {
-	for _, phase := range []string{"data_read", "final_write", "empty_eof", "object_probe", "read_error", "write_error"} {
+	for _, phase := range []string{"data_read", "data_read_no_eof", "final_write", "empty_eof", "object_probe", "read_error", "write_error"} {
 		t.Run(phase, func(t *testing.T) {
 			a := admissionTestNew(t, nil)
 			p := admissionTestAcquire(t, a, admissionTestPrincipal("issuer", phase, Human))
@@ -1549,7 +1549,7 @@ func TestAdmissionCopyFinalIOCancellation(t *testing.T) {
 				if phase == "object_probe" && reads == 1 {
 					return copy(b, data), io.EOF
 				}
-				if phase == "data_read" || phase == "empty_eof" || phase == "read_error" || phase == "object_probe" {
+				if phase == "data_read" || phase == "data_read_no_eof" || phase == "empty_eof" || phase == "read_error" || phase == "object_probe" {
 					cancel()
 				}
 				if phase == "empty_eof" || phase == "object_probe" {
@@ -1557,6 +1557,9 @@ func TestAdmissionCopyFinalIOCancellation(t *testing.T) {
 				}
 				if phase == "read_error" {
 					return 0, failure
+				}
+				if phase == "data_read_no_eof" {
+					return copy(b, data), nil
 				}
 				return copy(b, data), io.EOF
 			})
@@ -1571,7 +1574,7 @@ func TestAdmissionCopyFinalIOCancellation(t *testing.T) {
 				}
 				return len(b), nil
 			})
-			if phase == "data_read" || phase == "empty_eof" || phase == "read_error" {
+			if phase == "data_read" || phase == "data_read_no_eof" || phase == "empty_eof" || phase == "read_error" {
 				wantWritten = 0
 			}
 			if phase == "read_error" || phase == "write_error" {
@@ -1592,5 +1595,82 @@ func TestAdmissionCopyFinalIOCancellation(t *testing.T) {
 				t.Fatalf("unexpected I/O or admission leak: reads=%d writes=%d stats=%+v", reads, writes, a.Stats())
 			}
 		})
+	}
+}
+
+// A source failure alongside final data must survive cancellation and writer
+// failures, including when gzip consumes that failure with its trailer bytes.
+func TestAdmissionCopyFinalDataFailure(t *testing.T) {
+	for _, mode := range []string{"request", "raw", "gzip"} {
+		for _, phase := range []string{"source_error", "read_cancel", "write_error", "write_cancel"} {
+			t.Run(mode+"/"+phase, func(t *testing.T) {
+				a := admissionTestNew(t, nil)
+				p := admissionTestAcquire(t, a, admissionTestPrincipal("issuer", mode+phase, Human))
+				defer p.Release()
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				data := []byte{'x'}
+				if mode != "request" {
+					data = admissionTestFrame(data)
+				}
+				encoded := data
+				if mode == "gzip" {
+					var b bytes.Buffer
+					g := gzip.NewWriter(&b)
+					if _, err := g.Write(data); err != nil {
+						t.Fatal(err)
+					}
+					if err := g.Close(); err != nil {
+						t.Fatal(err)
+					}
+					encoded = b.Bytes()
+				}
+				sourceFailure, writeFailure := errors.New("final source failure"), errors.New("write failure")
+				input := &admissionDataErrorReader{data: encoded, failAt: len(encoded) - 1, err: sourceFailure}
+				src := admissionReaderFunc(func(b []byte) (int, error) {
+					n, err := input.Read(b)
+					if err == sourceFailure && phase == "read_cancel" {
+						cancel()
+					}
+					return n, err
+				})
+				var out bytes.Buffer
+				writes := 0
+				dst := admissionWriterFunc(func(b []byte) (int, error) {
+					writes++
+					if phase == "write_cancel" {
+						cancel()
+					}
+					if phase == "write_error" || phase == "write_cancel" {
+						return 0, writeFailure
+					}
+					return out.Write(b)
+				})
+				var n uint64
+				var err error
+				if mode == "request" {
+					n, err = p.CopyRequest(ctx, dst, src, AdmissionReadRequest, 1, 1, false)
+				} else {
+					compression := AdmissionRaw
+					if mode == "gzip" {
+						compression = AdmissionGZIP
+					}
+					n, err = p.CopyObject(ctx, dst, src, AdmissionObject{model.BlobKind, 1, uint64(len(encoded)), compression, true})
+				}
+				want := uint64(0)
+				if phase == "source_error" {
+					want = uint64(len(data))
+				}
+				if !errors.Is(err, sourceFailure) || n != want || uint64(out.Len()) != n || input.offset > len(encoded) {
+					t.Fatalf("lost failure or invalid bounds: n=%d out=%d input=%d err=%v", n, out.Len(), input.offset, err)
+				}
+				if phase == "read_cancel" && writes != 0 {
+					t.Fatalf("forwarded canceled data: writes=%d", writes)
+				}
+				if (phase == "write_error" || phase == "write_cancel") && !errors.Is(err, writeFailure) {
+					t.Fatalf("lost writer failure: %v", err)
+				}
+			})
+		}
 	}
 }
