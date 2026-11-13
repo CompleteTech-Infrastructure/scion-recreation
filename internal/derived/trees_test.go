@@ -921,7 +921,12 @@ func TestApplyTreeChangesetLiteralDeltas(t *testing.T) {
 		for _, e := range c.Operations { change.Operations = append(change.Operations, operation(e)) }
 		next, added, err := ApplyTreeChangeset(context.Background(), root, frames, change, budget)
 		if c.Reject != "" {
-			if err != metadata.ErrConflict || next != (TreePageID{}) || added != nil { t.Fatalf("%s did not reject atomically: %v", c.Name, err) }
+			wantErr := metadata.ErrConflict
+			if c.Name == "set-file-and-descendant-conflicts" {
+				// This delta is invalid without consulting a parent tree.
+				wantErr = metadata.ErrInvalidArgument
+			}
+			if err != wantErr || next != (TreePageID{}) || added != nil { t.Fatalf("%s did not reject atomically: %v", c.Name, err) }
 		} else {
 			want, e := ParseTreePageID(treeHex(t, c.Root))
 			if err != nil || e != nil || next != want { t.Fatalf("%s final root: %v", c.Name, err) }
