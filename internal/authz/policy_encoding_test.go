@@ -134,7 +134,7 @@ func TestPolicyEncodingVectorAndBounds(t *testing.T) {
 	if hex.EncodeToString(b) != "43414e4f505900504f4c4943592d4c4f43414c00563100000000017400000001720000000000000000000000000000000000000000" {
 		t.Fatal("independent struct vector mismatch")
 	}
-	for _, offset := range []int{32, 36, 40} {
+	for _, offset := range []int{41, 45, 49} {
 		bad := append([]byte(nil), b...)
 		for i := 0; i < 4; i++ {
 			bad[offset+i] = 255
