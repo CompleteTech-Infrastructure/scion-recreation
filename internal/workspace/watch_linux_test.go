@@ -127,9 +127,12 @@ func TestLinuxNativeKernelOverflow(t *testing.T) {
 	_, err = syscall.InotifyAddWatch(witness, root, linuxWatchMask)
 	watchOK(t, err)
 	cycles := queued/2 + 2 // create + delete alone exceed the configured queue
+	const mutationBudget = 30 * time.Second
 	losses := 0
 	var observed uint32
 	var released bool
+	phase, completed := "mutations", 0
+	var mutationElapsed, drainElapsed time.Duration
 	err = n.call(context.Background(), func() error {
 		// Production's smaller pending budget normally fails closed before it
 		// reaches the kernel overflow record. Widen only this private test
@@ -137,6 +140,9 @@ func TestLinuxNativeKernelOverflow(t *testing.T) {
 		// Single-byte root filenames keep the total decoded bytes <= 65536.
 		n.pendingCap = queued + 1
 		n.limits.Bytes = linuxWatchBytes
+		// The widened queue also needs a bounded private drain deadline under
+		// host contention, independently of the mutation workload deadline.
+		n.limits.Duration = 20 * time.Second
 		n.masks = 0
 		prior := n.observe
 		defer func() { n.observe = prior }()
@@ -151,7 +157,13 @@ func TestLinuxNativeKernelOverflow(t *testing.T) {
 		// The sole backend owner is occupied by this request: its periodic
 		// drain cannot run until all mutations are complete. At most one
 		// empty fixture file exists; storage and syscall counts are bounded.
-		deadline := time.Now().Add(10 * time.Second)
+		started := time.Now()
+		defer func() {
+			if phase == "mutations" {
+				mutationElapsed = time.Since(started)
+			}
+		}()
+		deadline := started.Add(mutationBudget)
 		for i := 0; i < cycles; i++ {
 			if time.Now().After(deadline) {
 				return context.DeadlineExceeded
@@ -166,12 +178,18 @@ func TestLinuxNativeKernelOverflow(t *testing.T) {
 			if e = syscall.Unlinkat(int(n.root.Fd()), "o"); e != nil {
 				return e
 			}
+			completed++
 		}
+		mutationElapsed = time.Since(started)
+		phase = "drain"
+		started = time.Now()
 		result := n.step(context.Background(), true)
+		drainElapsed = time.Since(started)
 		observed = n.masks
 		released = n.fd == -1 && n.root == nil && n.descriptors == 0 && len(n.watches) == 0
 		return result
 	})
+	t.Logf("overflow phases: root=%q phase=%s completed_cycles=%d/%d configured_queue=%d mutation_elapsed=%s mutation_budget=%s drain_elapsed=%s drain_budget=%s result=%v backend_masks=%#x", root, phase, completed, cycles, queued, mutationElapsed, mutationBudget, drainElapsed, n.limits.Duration, err, observed)
 	watchIs(t, err, ErrWatchStale)
 	watchCheck(t, observed&syscall.IN_Q_OVERFLOW != 0, "backend did not decode actual kernel overflow: masks=%#x", observed)
 	watchCheck(t, losses == 1 && released, "overflow losses=%d released=%v", losses, released)
