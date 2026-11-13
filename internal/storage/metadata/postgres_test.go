@@ -4,8 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"github.com/jackc/pgx/v5"
+	"io"
+	"net"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -173,5 +177,171 @@ func TestPostgresFoundationReal(t *testing.T) {
 	}
 	if err = admin.QueryRow(ctx, "SELECT count(*) FROM pg_stat_activity WHERE datname=$1", name).Scan(&count); err != nil || count != 1 {
 		t.Fatal("leaked connection", err, count)
+	}
+}
+
+func postgresRepairFixture(t *testing.T) (*Postgres, *pgx.Conn) {
+	t.Helper()
+	dsn := os.Getenv("SCION_POSTGRES_TEST_DSN")
+	if dsn == "" {
+		t.Skip("requires real isolated PostgreSQL")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	t.Cleanup(cancel)
+	admin, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal("admin connection failed")
+	}
+	name := fmt.Sprintf("scion_meta_repair_%d", time.Now().UnixNano())
+	if _, err = admin.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()); err != nil {
+		closePostgres(admin)
+		t.Fatal(err)
+	}
+	t.Log("isolated database", name, "seed schema-v1; repair regression")
+	t.Cleanup(func() {
+		cleanup, stop := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stop()
+		if _, e := admin.Exec(cleanup, "DROP DATABASE "+pgx.Identifier{name}.Sanitize()+" WITH (FORCE)"); e != nil {
+			t.Error(e)
+		}
+		closePostgres(admin)
+	})
+	trust := &pgTrust{}
+	p, err := OpenPostgres(ctx, dsn, trust, trust)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.config.Database = name
+	t.Cleanup(func() { p.Close() })
+	c, err := p.connect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { closePostgres(c) })
+	if err = p.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	return p, c
+}
+
+func TestPostgresSchemaDriftReal(t *testing.T) {
+	for _, change := range []string{
+		"DROP TABLE scion_metadata.publications",
+		"ALTER TABLE scion_metadata.mutations DROP COLUMN digest",
+		"ALTER TABLE scion_metadata.publications DROP CONSTRAINT publications_repository_check",
+		"ALTER TABLE scion_metadata.publications DISABLE TRIGGER publication_immutable",
+		"CREATE OR REPLACE FUNCTION scion_metadata.immutable() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$",
+		"ALTER TABLE scion_metadata.publications ADD COLUMN unexpected integer",
+	} {
+		t.Run(change, func(t *testing.T) {
+			p, c := postgresRepairFixture(t)
+			if _, err := c.Exec(context.Background(), change); err != nil {
+				t.Fatal(err)
+			}
+			if err := p.InitializeSchema(context.Background()); err != ErrFailedPrecondition {
+				t.Fatalf("drift accepted: %v", err)
+			}
+		})
+	}
+}
+
+func TestPostgresSchemaTransientErrorsReal(t *testing.T) {
+	p, c := postgresRepairFixture(t)
+	tx, err := c.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rollbackPostgres(tx)
+	if _, err = tx.Exec(context.Background(), "LOCK TABLE scion_metadata.schema_version IN ACCESS EXCLUSIVE MODE"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err = p.InitializeSchema(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("deadline misclassified: %v", err)
+	}
+	if err = p.InitializeSchema(context.Background()); err != ErrUnavailable {
+		t.Fatalf("lock timeout misclassified: %v", err)
+	}
+}
+
+// Real backend handshake and BEGIN, followed by a transport blackhole during
+// rollback. This fault fixture does not simulate persistence or acknowledge data.
+func TestPostgresRollbackCleanupBoundReal(t *testing.T) {
+	p, c := postgresRepairFixture(t)
+	var drop atomic.Bool
+	opened := make(chan net.Conn, 1)
+	p.config.DialFunc = func(ctx context.Context, network, address string) (net.Conn, error) {
+		server, err := (&net.Dialer{}).DialContext(ctx, network, address)
+		if err != nil {
+			return nil, err
+		}
+		client, proxy := net.Pipe()
+		opened <- client
+		go func() { defer server.Close(); defer proxy.Close(); _, _ = io.Copy(server, proxy) }()
+		go func() {
+			buf := make([]byte, 32768)
+			for {
+				n, e := server.Read(buf)
+				if n > 0 && !drop.Load() {
+					if _, e = proxy.Write(buf[:n]); e != nil {
+						return
+					}
+				}
+				if e != nil {
+					return
+				}
+			}
+		}()
+		return client, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	entered := make(chan struct{})
+	go func() {
+		done <- p.withAuthorizedTx(ctx, Scope{}, "fixture", func(pgx.Tx) error { drop.Store(true); cancel(); close(entered); return ErrConflict })
+	}()
+	var client net.Conn
+	select {
+	case client = <-opened:
+	case err := <-done:
+		t.Fatalf("connection failed before fault injection: %v", err)
+	case <-time.After(6 * time.Second):
+		t.Fatal("connection setup exceeded bound")
+	}
+	defer client.Close()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("BEGIN did not finish")
+	}
+	started := time.Now()
+	select {
+	case err := <-done:
+		if err != ErrConflict {
+			t.Fatalf("cleanup replaced original result: %v", err)
+		}
+	case <-time.After(2500 * time.Millisecond):
+		client.Close()
+		t.Fatal("rollback cleanup exceeded bound")
+	}
+	t.Log("blackholed rollback returned in", time.Since(started))
+	if len(p.slots) != 0 {
+		t.Fatal("admission slot leaked")
+	}
+	client.Close()
+	var sessions int
+	for until := time.Now().Add(time.Second); ; {
+		if err := c.QueryRow(context.Background(), "SELECT count(*) FROM pg_stat_activity WHERE datname=current_database()").Scan(&sessions); err != nil {
+			t.Fatal(err)
+		}
+		if sessions == 1 {
+			break
+		}
+		if time.Now().After(until) {
+			t.Fatal("backend connection leaked", sessions)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

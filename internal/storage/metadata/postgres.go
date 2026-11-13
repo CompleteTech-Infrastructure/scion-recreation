@@ -2,8 +2,11 @@ package metadata
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"reflect"
 	"sync/atomic"
 	"time"
@@ -68,7 +71,7 @@ func postgresError(ctx context.Context) error {
 }
 
 // OpenPostgres validates dependencies and connectivity without creating schema.
-// The returned foundation keeps only a private config; Close is consequently a
+// The returned foundation keeps only a private config. Close
 // marks it closed (there are no idle sessions). Active operations finish under
 // their own deadlines; callers own their cancellation. Later operations fail.
 // PostgreSQL 17+ is required for transaction_timeout. Fixed server-side limits
@@ -109,6 +112,25 @@ func closePostgres(c *pgx.Conn) {
 	defer cancel()
 	_ = c.Close(ctx)
 }
+
+// Cleanup never inherits a canceled caller or waits indefinitely for a server.
+// pgx closes the connection on rollback failure; the outer bounded Close still
+// runs, and the original operation/ambiguous-commit result remains unchanged.
+func rollbackPostgres(tx pgx.Tx) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_ = tx.Rollback(ctx)
+}
+func postgresSchemaError(ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	var pgerr *pgconn.PgError
+	if errors.Is(err, pgx.ErrNoRows) || errors.As(err, &pgerr) && (pgerr.Code == "42P01" || pgerr.Code == "42703" || pgerr.Code == "42883") {
+		return ErrFailedPrecondition
+	}
+	return ErrUnavailable
+}
 func (p *Postgres) connect(ctx context.Context) (*pgx.Conn, error) {
 	if p.closed.Load() {
 		return nil, ErrUnavailable
@@ -143,7 +165,7 @@ func (p *Postgres) withAuthorizedTx(ctx context.Context, s Scope, op string, fn 
 	if err != nil {
 		return postgresError(ctx)
 	}
-	defer tx.Rollback(context.Background())
+	defer rollbackPostgres(tx)
 	if err = p.auth.Recheck(ctx, tx, s, op); err != nil {
 		return err
 	}
@@ -177,7 +199,7 @@ func (p *Postgres) InitializeSchema(ctx context.Context) error {
 	if err != nil {
 		return postgresError(ctx)
 	}
-	defer tx.Rollback(context.Background())
+	defer rollbackPostgres(tx)
 	var exists bool
 	if err = tx.QueryRow(ctx, "SELECT EXISTS(SELECT FROM pg_namespace WHERE nspname='scion_metadata')").Scan(&exists); err != nil {
 		return postgresError(ctx)
@@ -186,7 +208,10 @@ func (p *Postgres) InitializeSchema(ctx context.Context) error {
 		var version int
 		var definition string
 		err = tx.QueryRow(ctx, "SELECT version, definition FROM scion_metadata.schema_version WHERE singleton").Scan(&version, &definition)
-		if err != nil || version != 1 || definition != postgresDDL {
+		if err != nil {
+			return postgresSchemaError(ctx, err)
+		}
+		if version != 1 || definition != postgresDDL {
 			return ErrFailedPrecondition
 		}
 	} else {
@@ -196,6 +221,16 @@ func (p *Postgres) InitializeSchema(ctx context.Context) error {
 		if _, err = tx.Exec(ctx, "INSERT INTO scion_metadata.schema_version VALUES(true,1,$1)", postgresDDL); err != nil {
 			return postgresError(ctx)
 		}
+	}
+	// Compare the actual catalog, never just a mutable version marker. The fixed
+	// v1 fingerprint covers tables, columns, constraints, indexes, trigger enable
+	// state and function body. Unknown catalog layouts fail closed, never migrate.
+	var catalog string
+	if err = tx.QueryRow(ctx, postgresCatalog).Scan(&catalog); err != nil {
+		return postgresSchemaError(ctx, err)
+	}
+	if fmt.Sprintf("%x", sha256.Sum256([]byte(catalog))) != postgresCatalogV1 {
+		return ErrFailedPrecondition
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return errors.Join(ErrOutcomeUnknown, postgresError(ctx))
@@ -220,3 +255,19 @@ CREATE TRIGGER publication_immutable BEFORE UPDATE OR DELETE OR TRUNCATE ON scio
  FOR EACH STATEMENT EXECUTE FUNCTION scion_metadata.immutable();
 CREATE TRIGGER mutation_immutable BEFORE UPDATE OR DELETE OR TRUNCATE ON scion_metadata.mutations
  FOR EACH STATEMENT EXECUTE FUNCTION scion_metadata.immutable();`
+
+const postgresCatalogV1 = "c755924db471580f665c6c5ff7779c7544fec03b2bd2d68d94f6443118cad896"
+const postgresCatalog = `SELECT coalesce(jsonb_agg(v ORDER BY v::text)::text,'[]') FROM (
+ SELECT jsonb_build_array('table',c.relname,c.relkind,c.relpersistence,c.relrowsecurity,c.relforcerowsecurity) AS v
+ FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='scion_metadata' AND c.relkind IN ('r','p','v','m','f')
+ UNION ALL SELECT jsonb_build_array('column',c.relname,a.attnum,a.attname,format_type(a.atttypid,a.atttypmod),a.attnotnull,a.attidentity,a.attgenerated,pg_get_expr(d.adbin,d.adrelid))
+ FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid JOIN pg_namespace n ON n.oid=c.relnamespace LEFT JOIN pg_attrdef d ON d.adrelid=c.oid AND d.adnum=a.attnum
+ WHERE n.nspname='scion_metadata' AND a.attnum>0 AND NOT a.attisdropped
+ UNION ALL SELECT jsonb_build_array('constraint',c.relname,k.conname,k.convalidated,pg_get_constraintdef(k.oid))
+ FROM pg_constraint k JOIN pg_class c ON c.oid=k.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='scion_metadata'
+ UNION ALL SELECT jsonb_build_array('index',c.relname,i.indisvalid,i.indisready,pg_get_indexdef(i.indexrelid))
+ FROM pg_index i JOIN pg_class c ON c.oid=i.indrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='scion_metadata'
+ UNION ALL SELECT jsonb_build_array('trigger',c.relname,t.tgenabled,pg_get_triggerdef(t.oid))
+ FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='scion_metadata' AND NOT t.tgisinternal
+ UNION ALL SELECT jsonb_build_array('function',pg_get_functiondef(p.oid)) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='scion_metadata'
+) s`
