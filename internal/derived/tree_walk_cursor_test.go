@@ -159,6 +159,9 @@ func TestStoredTreeCursorMatchesSmallTopologyOracle(t *testing.T) {
 			}
 			q := cursorQuantum()
 			q.Fetches = n
+			if n == 4 {
+				q.PageBytes = derived.MaxTreePageBytes
+			}
 			q.Terminals = 1
 			for i := 0; i < 100; i++ {
 				p, e := c.Advance(context.Background(), q)
@@ -225,7 +228,7 @@ func TestStoredTreeCursorEmptyDirectoryAndLongPaths(t *testing.T) {
 	}
 }
 func TestStoredTreeCursorFailuresAreStickyAndNeverComplete(t *testing.T) {
-	for _, kind := range []string{"missing", "corrupt", "denied", "cancel", "bytes", "fetches", "terminals", "depth", "oversized", "readerError", "badContext"} {
+	for _, kind := range []string{"missing", "corrupt", "denied", "cancel", "bytes", "fetches", "terminals", "depth", "oversized", "readerError", "cancelOnRead", "badContext"} {
 		t.Run(kind, func(t *testing.T) {
 			root, frames, _, _ := cursorWide(t, 2, 2)
 			a := &cursorAuthority{}
@@ -277,6 +280,8 @@ func TestStoredTreeCursorFailuresAreStickyAndNeverComplete(t *testing.T) {
 				r.get = func(context.Context, derived.TreePageID) ([]byte, error) {
 					return []byte("some data"), errors.New("backend failed")
 				}
+			case "cancelOnRead":
+				r.get = func(_ context.Context, id derived.TreePageID) ([]byte, error) { cancel(); return frames[id], nil }
 			case "badContext":
 				// A 254-byte label is valid at offset zero but cannot fit
 				// the 253-byte anchor remainder at component offset two.
