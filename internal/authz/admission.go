@@ -708,7 +708,7 @@ func (p *AdmissionPermit) CopyObject(ctx context.Context, dst io.Writer, src io.
 		}
 		return written, err
 	}
-	return written, nil
+	return written, ctx.Err()
 }
 
 // Session staging is a retained reservation, not an ingress credit. A retry
@@ -835,6 +835,13 @@ func admissionCopy(ctx context.Context, dst io.Writer, decoded io.Reader, frame 
 			if e != io.EOF {
 				return written, e
 			}
+		}
+		// A successful final read/write may itself cancel the context. Do not
+		// turn that cancellation into success merely because it also ends input.
+		if err = ctx.Err(); err != nil {
+			return written, err
+		}
+		if e == io.EOF {
 			break
 		}
 		if n == 0 {

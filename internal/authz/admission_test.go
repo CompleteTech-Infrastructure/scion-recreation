@@ -1521,3 +1521,76 @@ func TestAdmissionGZIPPreservesDataErrors(t *testing.T) {
 		})
 	}
 }
+
+type admissionReaderFunc func([]byte) (int, error)
+
+func (f admissionReaderFunc) Read(p []byte) (int, error) { return f(p) }
+
+type admissionWriterFunc func([]byte) (int, error)
+
+func (f admissionWriterFunc) Write(p []byte) (int, error) { return f(p) }
+
+func TestAdmissionCopyFinalIOCancellation(t *testing.T) {
+	for _, phase := range []string{"data_read", "final_write", "empty_eof", "object_probe", "read_error", "write_error"} {
+		t.Run(phase, func(t *testing.T) {
+			a := admissionTestNew(t, nil)
+			p := admissionTestAcquire(t, a, admissionTestPrincipal("issuer", phase, Human))
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			failure := errors.New("I/O failure alongside cancellation")
+			data := []byte{'x'}
+			if phase == "object_probe" {
+				data = admissionTestFrame([]byte{'x'})
+			}
+			wantWritten, wantErr := uint64(len(data)), error(context.Canceled)
+			reads, writes := 0, 0
+			src := admissionReaderFunc(func(b []byte) (int, error) {
+				reads++
+				if phase == "object_probe" && reads == 1 {
+					return copy(b, data), io.EOF
+				}
+				if phase == "data_read" || phase == "empty_eof" || phase == "read_error" || phase == "object_probe" {
+					cancel()
+				}
+				if phase == "empty_eof" || phase == "object_probe" {
+					return 0, io.EOF
+				}
+				if phase == "read_error" {
+					return 0, failure
+				}
+				return copy(b, data), io.EOF
+			})
+			dst := admissionWriterFunc(func(b []byte) (int, error) {
+				writes++
+				if phase == "object_probe" {
+					return len(b), nil
+				}
+				cancel()
+				if phase == "write_error" {
+					return len(b), failure
+				}
+				return len(b), nil
+			})
+			if phase == "data_read" || phase == "empty_eof" || phase == "read_error" {
+				wantWritten = 0
+			}
+			if phase == "read_error" || phase == "write_error" {
+				wantErr = failure
+			}
+			var n uint64
+			var err error
+			if phase == "object_probe" {
+				n, err = p.CopyObject(ctx, dst, src, AdmissionObject{model.BlobKind, 1, uint64(len(data)), AdmissionRaw, true})
+			} else {
+				n, err = p.CopyRequest(ctx, dst, src, AdmissionReadRequest, uint64(len(data)), 1, false)
+			}
+			p.Release()
+			if n != wantWritten || !errors.Is(err, wantErr) {
+				t.Fatalf("n=%d err=%v; want n=%d err=%v", n, err, wantWritten, wantErr)
+			}
+			if (wantWritten == 0 && writes != 0) || reads > 2 || a.Stats() != (AdmissionStats{}) {
+				t.Fatalf("unexpected I/O or admission leak: reads=%d writes=%d stats=%+v", reads, writes, a.Stats())
+			}
+		})
+	}
+}
