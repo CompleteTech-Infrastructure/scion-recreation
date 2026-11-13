@@ -222,7 +222,8 @@ func TestHarnessIntegration(t *testing.T) {
 		if err := os.Symlink(python, configured); err != nil {
 			t.Fatal(err)
 		}
-		t.Setenv("PYTHON", configured)
+		t.Chdir(filepath.Dir(configured))
+		t.Setenv("PYTHON", "./"+filepath.Base(configured))
 		runEventMutation(t, "pass", "")
 	})
 	t.Run("BuildReplay", func(t *testing.T) {
@@ -515,6 +516,10 @@ func eventProxy(t *testing.T, realGo, mutation string) string {
 		pythonName = "python3"
 	}
 	python, err := exec.LookPath(pythonName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	python, err = filepath.Abs(python)
 	if err != nil {
 		t.Fatal(err)
 	}
