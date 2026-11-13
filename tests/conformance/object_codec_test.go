@@ -19,9 +19,10 @@ import (
 	"canopy.local/canopy/internal/model"
 )
 
-// Expected frames and digests are frozen independently of the product. The
-// accepted literals are copied from OBJ-01-A; the additional seeded fixtures
-// were serialized with Python struct/hashlib, never with model methods.
+// Expected frames and digests are checked-in literals. Their historical source
+// references remain unavailable/unverified in canonical_v1.json. The standalone
+// oracle.py freshly checks all vectors against the candidate contract using
+// Python struct/hashlib without product code; this is not historical approval.
 type codecFixtures struct {
 	SchemaVersion int           `json:"schema_version"`
 	Literals      []codecVector `json:"accepted_literals"`
