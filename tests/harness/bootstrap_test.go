@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -51,7 +52,7 @@ func planFor(t *testing.T) Plan {
 	if contract == "" {
 		contract = strings.Repeat("0", 64)
 	}
-	return Plan{Root: dir, GoBinary: "/Users/completetech/github/.scion-run/toolchains/go/bin/go", SourceRevision: source, ContractSHA256: contract, Cases: []Case{{Unit, "./.", fixtureImport, "TestPass"}}, Suite: Unit, Seed: 20261015, Timeout: 20 * time.Second, Limits: DefaultLimits()}
+	return Plan{Root: dir, GoBinary: filepath.Join(runtime.GOROOT(), "bin", "go"), SourceRevision: source, ContractSHA256: contract, Cases: []Case{{Unit, "./.", fixtureImport, "TestPass"}}, Suite: Unit, Seed: 20261015, Timeout: 20 * time.Second, Limits: DefaultLimits()}
 }
 
 func record(t *testing.T, v any) {
@@ -208,6 +209,27 @@ func eventResult(body string) Result {
 }
 
 func TestHarnessIntegration(t *testing.T) {
+	t.Run("ConfiguredPythonPath", func(t *testing.T) {
+		pythonName := os.Getenv("PYTHON")
+		if pythonName == "" {
+			pythonName = "python3"
+		}
+		python, err := exec.LookPath(pythonName)
+		if err != nil {
+			t.Fatal(err)
+		}
+		python, err = filepath.Abs(python)
+		if err != nil {
+			t.Fatal(err)
+		}
+		configured := filepath.Join(t.TempDir(), "python space'quote")
+		if err := os.Symlink(python, configured); err != nil {
+			t.Fatal(err)
+		}
+		t.Chdir(filepath.Dir(configured))
+		t.Setenv("PYTHON", "./"+filepath.Base(configured))
+		runEventMutation(t, "pass", "")
+	})
 	t.Run("BuildReplay", func(t *testing.T) {
 		p := planFor(t)
 		var sums [][32]byte
@@ -493,9 +515,20 @@ func runEventMutation(t *testing.T, mutation, wantError string) {
 // events and real exit status are forwarded; exactly one pass must be targeted.
 func eventProxy(t *testing.T, realGo, mutation string) string {
 	t.Helper()
+	pythonName := os.Getenv("PYTHON")
+	if pythonName == "" {
+		pythonName = "python3"
+	}
+	python, err := exec.LookPath(pythonName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	python, err = filepath.Abs(python)
+	if err != nil {
+		t.Fatal(err)
+	}
 	path := filepath.Join(t.TempDir(), "go-event-proxy")
-	source := `#!/opt/homebrew/bin/python3
-import json, subprocess, sys
+	source := `import json, subprocess, sys
 p = subprocess.run([` + strconv.Quote(realGo) + `] + sys.argv[1:], capture_output=True)
 if sys.argv[1:] == ["version"]:
  sys.stdout.buffer.write(p.stdout)
@@ -512,7 +545,11 @@ for line in p.stdout.splitlines(keepends=True):
 sys.stderr.buffer.write(p.stderr)
 sys.exit(p.returncode if p.returncode or changed == 1 else 12)
 `
-	if err := os.WriteFile(path, []byte(source), 0700); err != nil {
+	// A shell wrapper preserves executable paths containing spaces or quotes;
+	// putting the configured Python path in a shebang would not.
+	quote := func(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'" }
+	script := "#!/bin/sh\nexec " + quote(python) + " -c " + quote(source) + " \"$@\"\n"
+	if err := os.WriteFile(path, []byte(script), 0700); err != nil {
 		t.Fatal(err)
 	}
 	return path
