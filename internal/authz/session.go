@@ -131,7 +131,7 @@ func (v *SessionVerifier) VerifySession(ctx context.Context, credential *Identit
 		return deny, ErrUnauthenticated
 	}
 	identity, err := v.identity.Resolve(ctx, credential)
-	if err != nil || identity.Principal != c.Principal || c.NotBeforeUnix < credential.Claims.NotBeforeUnix || c.ExpiresAtUnix > credential.Claims.ExpiresAtUnix {
+	if err != nil || identity.Principal != c.Principal || identity.Audience != c.Audience || c.NotBeforeUnix < credential.Claims.NotBeforeUnix || c.ExpiresAtUnix > credential.Claims.ExpiresAtUnix {
 		return deny, ErrUnauthenticated
 	}
 	h := sha256.New()

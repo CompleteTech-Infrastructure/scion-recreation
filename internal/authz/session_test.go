@@ -192,3 +192,32 @@ func TestSessionClockAndKeySnapshot(t *testing.T) {
 	var zero SessionVerifier
 	sessionDenied(t, &zero, context.Background(), c, p)
 }
+
+func TestSessionSnapshotsBeforeIdentityCallback(t *testing.T) {
+	v, c, p, _ := sessionFixture(t)
+	original := p.Claims
+	v.identity.check = func(context.Context, IdentityClaims) (RevocationState, error) {
+		c.Claims.Subject = "substituted"
+		c.Signature[0] ^= 1
+		p.Claims.Tenant = "substituted"
+		p.Signature[0] ^= 1
+		return RevocationActive, nil
+	}
+	got, err := v.VerifySession(context.Background(), c, p)
+	if err != nil || got.Claims() != original {
+		t.Fatal("callback changed verified input snapshot", err)
+	}
+}
+
+func TestSessionRejectsCrossAudienceIdentity(t *testing.T) {
+	v, c, p, k := sessionFixture(t)
+	v.identity = vectorResolver(t, "regional")
+	c.Claims.Audience = "regional"
+	c.Signature = ed25519.Sign(vectorKey(), vectorTranscript(c.Claims))
+	h := sha256.New()
+	h.Write(vectorTranscript(c.Claims))
+	h.Write(c.Signature)
+	copy(p.Claims.CredentialHash[:], h.Sum(nil))
+	p.Signature = ed25519.Sign(k, sessionVector(p.Claims))
+	sessionDenied(t, v, context.Background(), c, p)
+}
