@@ -1,7 +1,7 @@
-"""Generate/check the accepted common, control and object Go bindings offline.
+"""Generate/check the accepted native and companion workflow Go bindings offline.
 
 Run with the locked Python, Go and protoc (overrides: --go / --protoc).
-`generate` publishes only the five declared files after staging and compilation;
+`generate` publishes only the seven declared files after staging and compilation;
 `check` never writes the source tree. Neither command implements RPC behavior.
 Schema changes require a separately reviewed update to ACCEPTED, not auto-acceptance.
 """
@@ -21,16 +21,20 @@ ACCEPTED = {
     "grants": "1c967ca1e7298fc0459059fc02cd7531faff1e1529be13faea2c10b32b55ac8c",
     "control": "50a0b0fd5c8de31e444afb4d605a67bb83681e2dea8f2e6ca09982df68c19d2e",
     "objects": "4383168af354606172fe8b7126b3b8d75391757bca356130df406af116871338",
+    "workflows": "b561481181853f8e6a5c474314a01eeb131647fd3eadf2754ae460d803d4a7ed",
 }
 PACKAGES = {"grants": ("common", "commonv1"),
             "control": ("control", "controlv1"),
-            "objects": ("objects", "objectsv1")}
+            "objects": ("objects", "objectsv1"),
+            "workflows": ("workflows", "workflowsv1")}
 OUTPUTS = (
     "api/gen/common/v1/grants.pb.go",
     "api/gen/control/v1/control.pb.go",
     "api/gen/control/v1/control_grpc.pb.go",
     "api/gen/objects/v1/objects.pb.go",
     "api/gen/objects/v1/objects_grpc.pb.go",
+    "api/gen/workflows/v1/workflows.pb.go",
+    "api/gen/workflows/v1/workflows_grpc.pb.go",
 )
 
 # Separate protoc descriptor-set production is compared with Go runtime
@@ -44,6 +48,7 @@ import (
     common "canopy.local/canopy/api/gen/common/v1"
     control "canopy.local/canopy/api/gen/control/v1"
     objects "canopy.local/canopy/api/gen/objects/v1"
+    workflows "canopy.local/canopy/api/gen/workflows/v1"
     "google.golang.org/protobuf/proto"
     "google.golang.org/protobuf/reflect/protodesc"
     "google.golang.org/protobuf/reflect/protoreflect"
@@ -54,7 +59,8 @@ func main() {
     data, err := os.ReadFile(os.Args[1]); must(err)
     set := new(descriptorpb.FileDescriptorSet); must(proto.Unmarshal(data, set))
     files := []protoreflect.FileDescriptor{common.File_api_proto_grants_proto,
-        control.File_api_proto_control_proto, objects.File_api_proto_objects_proto}
+        control.File_api_proto_control_proto, objects.File_api_proto_objects_proto,
+        workflows.File_api_proto_workflows_proto}
     if len(set.File) != len(files) { panic("descriptor file count") }
     messages, fields, services, methods, shared := 0, 0, 0, 0, 0
     var walk func(protoreflect.MessageDescriptors)
@@ -63,10 +69,10 @@ func main() {
             m := ms.Get(i); messages++
             for j := 0; j < m.Fields().Len(); j++ {
                 f := m.Fields().Get(j); fields++
-                if f.Message() != nil && f.Message().ParentFile() == files[0] {
+                if f.Message() != nil && f.Message().ParentFile() != m.ParentFile() {
                     d, e := protoregistry.GlobalFiles.FindDescriptorByName(f.Message().FullName())
                     must(e)
-                    if d != f.Message() { panic("shared grant descriptor identity") }
+                    if d != f.Message() { panic("shared descriptor identity") }
                     shared++
                 }
             }
@@ -83,7 +89,7 @@ func main() {
         for i := 0; i < f.Services().Len(); i++ { methods += f.Services().Get(i).Methods().Len() }
     }
     if shared == 0 || methods == 0 { panic("missing shared references or RPCs") }
-    fmt.Printf("reflected %d messages, %d fields, %d services, %d methods, %d common references\n",
+    fmt.Printf("reflected %d messages, %d fields, %d services, %d methods, %d shared references\n",
         messages, fields, services, methods, shared)
 }
 func must(err error) { if err != nil { panic(err) } }
