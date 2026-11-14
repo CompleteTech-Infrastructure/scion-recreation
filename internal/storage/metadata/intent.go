@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"hash"
+	"strings"
 
 	"canopy.local/canopy/internal/model"
 	"github.com/jackc/pgx/v5"
@@ -150,7 +151,7 @@ func publicationIntent(ctx context.Context, s Scope, r PublishRequest) (Operatio
 	if err = ctx.Err(); err != nil {
 		return zero, err
 	}
-	return OperationIntent{kind: IntentPublication, repository: s.Repository, id: r.ID, key: r.Mutation.Key, event: r.Event, canonicalHash: canonical, canonicalLength: w.n, digest: sha256.Sum256(b)}, nil
+	return OperationIntent{kind: IntentPublication, repository: s.Repository, id: r.ID, key: strings.Clone(r.Mutation.Key), event: EventID(strings.Clone(string(r.Event))), canonicalHash: canonical, canonicalLength: w.n, digest: sha256.Sum256(b)}, nil
 }
 
 // PublicationRequestDigest computes the service-side immutable retry digest.
@@ -207,5 +208,5 @@ func NewPublicationStatusIntent(ctx context.Context, s Scope, key string) (Opera
 	if err := ctx.Err(); err != nil {
 		return OperationIntent{}, err
 	}
-	return OperationIntent{kind: IntentPublicationStatus, repository: s.Repository, key: key, digest: sha256.Sum256(b)}, nil
+	return OperationIntent{kind: IntentPublicationStatus, repository: s.Repository, key: strings.Clone(key), digest: sha256.Sum256(b)}, nil
 }
