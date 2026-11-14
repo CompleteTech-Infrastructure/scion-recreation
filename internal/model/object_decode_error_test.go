@@ -14,6 +14,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"canopy.local/canopy/internal/model"
 	"canopy.local/canopy/internal/storage/blob"
@@ -28,6 +29,104 @@ type causeReader struct {
 	err            error
 	cancel         context.CancelFunc
 	fired          bool
+}
+
+func TestDecodeReadCancellationAliases(t *testing.T) {
+	blobID, blobFrame, payload := causeBlob(t)
+	value, err := model.NewChangeset(model.ChangesetInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	changesetID, err := model.HashChangeset(context.Background(), value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var encoded bytes.Buffer
+	if err = model.EncodeChangeset(context.Background(), &encoded, value); err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{"blob", "changeset"} {
+		frame := blobFrame
+		if kind == "changeset" {
+			frame = encoded.Bytes()
+		}
+		for _, at := range []int{0, 22, len(frame)} {
+			for _, count := range []int{0, -2} {
+				for _, deadline := range []bool{false, true} {
+					t.Run(fmt.Sprintf("%s/at=%d/count=%d/deadline=%t", kind, at, count, deadline), func(t *testing.T) {
+						ctx, cancel := context.WithCancel(context.Background())
+						if deadline {
+							cancel()
+							ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+						}
+						defer cancel()
+						r := &causeReader{data: frame, at: at, count: count}
+						src := causeReaderFunc(func(p []byte) (int, error) {
+							n, e := r.Read(p)
+							if !r.fired {
+								return n, e
+							}
+							if deadline {
+								<-ctx.Done()
+							} else {
+								cancel()
+							}
+							return n, ctx.Err()
+						})
+						var staged bytes.Buffer
+						if kind == "blob" {
+							n, e := model.DecodeBlob(ctx, src, blobID, &staged, uint64(len(payload)))
+							err = e
+							want := 0
+							if at == len(frame) {
+								want = len(payload)
+							}
+							if n != 0 || staged.Len() != want {
+								t.Fatalf("canceled bytes escaped: %d staged=%d", n, staged.Len())
+							}
+						} else {
+							got, e := model.DecodeChangeset(ctx, src, changesetID, model.MaxChangesetPayload)
+							err = e
+							if !reflect.DeepEqual(got, model.Changeset{}) {
+								t.Fatal("canceled changeset escaped")
+							}
+						}
+						if !r.fired || err != ctx.Err() {
+							t.Fatalf("alias identity changed: fired=%t got=%T %v want=%v", r.fired, err, err, ctx.Err())
+						}
+					})
+				}
+			}
+		}
+	}
+}
+
+type sliceCause []byte
+
+func (sliceCause) Error() string { return "context canceled" }
+
+type nestedCause struct{ value any }
+
+func (nestedCause) Error() string { return "context canceled" }
+
+func TestDecodeReadDistinctCancellationCauses(t *testing.T) {
+	id, frame, payload := causeBlob(t)
+	for _, source := range []error{sliceCause{1}, nestedCause{[]byte{1}}, errors.New(context.Canceled.Error()), fmt.Errorf("%w", context.Canceled)} {
+		for _, at := range []int{0, 22, len(frame)} {
+			ctx, cancel := context.WithCancel(context.Background())
+			r := &causeReader{data: frame, at: at, count: -2, err: source, cancel: cancel}
+			n, err := model.DecodeBlob(ctx, r, id, io.Discard, uint64(len(payload)))
+			cancel()
+			joined, ok := err.(interface{ Unwrap() []error })
+			if n != 0 || !ok {
+				t.Fatalf("distinct cause lost: %T %v", err, err)
+			}
+			causes := joined.Unwrap()
+			if len(causes) != 2 || !reflect.DeepEqual(causes[0], source) || causes[1] != context.Canceled {
+				t.Fatalf("distinct causes changed: %v", causes)
+			}
+		}
+	}
 }
 
 func (r *causeReader) Read(p []byte) (int, error) {

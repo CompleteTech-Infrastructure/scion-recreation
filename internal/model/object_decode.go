@@ -7,6 +7,7 @@ import (
 	"errors"
 	"hash"
 	"io"
+	"reflect"
 	"sort"
 	"strings"
 )
@@ -163,6 +164,12 @@ func (d *decodeReader) read(b []byte) error {
 // a lone error exactly, including sentinel identity used by existing callers.
 func decodeReadFailure(rejection, source, cancellation error) error {
 	if source == io.EOF {
+		source = nil
+	}
+	// A cancellation-aware source can return the very same error as ctx.Err.
+	// Compare values only when both are comparable, including nested interfaces.
+	// The decoder's separately constructed rejection is always independent.
+	if source != nil && cancellation != nil && reflect.ValueOf(source).Comparable() && reflect.ValueOf(cancellation).Comparable() && source == cancellation {
 		source = nil
 	}
 	switch {
