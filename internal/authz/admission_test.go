@@ -1674,3 +1674,56 @@ func TestAdmissionCopyFinalDataFailure(t *testing.T) {
 		}
 	}
 }
+
+// Regression from the independent overflow-probe finding.
+func TestAdmissionOverflowProbePreservesSourceFailure(t *testing.T) {
+	for _, mode := range []string{"request", "raw", "gzip"} {
+		for _, cancelProbe := range []bool{false, true} {
+			t.Run(mode+map[bool]string{false: "/live", true: "/canceled"}[cancelProbe], func(t *testing.T) {
+				data := []byte("x")
+				if mode != "request" {
+					data = admissionTestFrame(data)
+				}
+				encoded := data
+				if mode == "gzip" {
+					encoded = admissionTestGZIP(t, data)
+				}
+				declared := len(encoded)
+				encoded = append(append([]byte(nil), encoded...), byte('!'))
+				failure := errors.New("independent probe source failure")
+				reader := &admissionDataErrorReader{data: encoded, failAt: declared, err: failure}
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				src := admissionReaderFunc(func(b []byte) (int, error) {
+					n, e := reader.Read(b)
+					if e == failure && cancelProbe {
+						cancel()
+					}
+					return n, e
+				})
+				a := admissionTestNew(t, nil)
+				p := admissionTestAcquire(t, a, admissionTestPrincipal("review", "overflow", Human))
+				var dst bytes.Buffer
+				var n uint64
+				var err error
+				if mode == "request" {
+					n, err = p.CopyRequest(ctx, &dst, src, AdmissionReadRequest, uint64(declared), 1, false)
+				} else {
+					codec := AdmissionRaw
+					if mode == "gzip" {
+						codec = AdmissionGZIP
+					}
+					n, err = p.CopyObject(ctx, &dst, src, AdmissionObject{model.BlobKind, 1, uint64(declared), codec, true})
+				}
+				p.Release()
+				t.Logf("n=%d out=%d source=%d/%d sourceCause=%v limit=%v error=%v", n, dst.Len(), reader.offset, declared+1, errors.Is(err, failure), errors.Is(err, ErrAdmissionLimit), err)
+				if !errors.Is(err, ErrAdmissionLimit) || n != uint64(len(data)) || n != uint64(dst.Len()) || reader.offset != declared+1 || a.Stats() != (AdmissionStats{}) {
+					t.Fatal("invalid overflow budgets or resource lifecycle")
+				}
+				if !errors.Is(err, failure) {
+					t.Error("real nonEOF data-bearing probe failure lost")
+				}
+			})
+		}
+	}
+}
