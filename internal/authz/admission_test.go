@@ -1670,6 +1670,9 @@ func TestAdmissionCopyFinalDataFailure(t *testing.T) {
 				if (phase == "write_error" || phase == "write_cancel") && !errors.Is(err, writeFailure) {
 					t.Fatalf("lost writer failure: %v", err)
 				}
+				if (phase == "read_cancel" || phase == "write_cancel") && !errors.Is(err, context.Canceled) {
+					t.Fatalf("lost cancellation: %v", err)
+				}
 			})
 		}
 	}
