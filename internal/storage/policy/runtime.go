@@ -104,7 +104,7 @@ func open(ctx context.Context, c OpenConfig, role string) (*Store, error) {
 	}
 	cfg.Tracer = nil
 	cfg.ConnectTimeout = time.Second
-	for k, v := range map[string]string{"statement_timeout": "2000", "lock_timeout": "1000", "idle_in_transaction_session_timeout": "5000", "transaction_timeout": "5000", "search_path": "pg_catalog,pg_temp"} {
+	for k, v := range map[string]string{"statement_timeout": "2000", "lock_timeout": "1000", "idle_in_transaction_session_timeout": "5000", "transaction_timeout": "5000", "search_path": "pg_catalog,pg_temp", "synchronous_commit": "on"} {
 		cfg.RuntimeParams[k] = v
 	}
 	s := &Store{config: cfg, binding: c.Binding, roles: c.Roles, role: role, now: c.Trust.Now, clockError: c.Trust.ClockError, slots: make(chan struct{}, n)}
@@ -191,6 +191,12 @@ func (s *Store) runTx(ctx context.Context, fn func(context.Context, pgx.Tx) erro
 		return failure(ctx)
 	}
 	defer closeConnection(conn)
+	// DSN options (including options=-c...) and role/database defaults are not
+	// authority to weaken acknowledgement durability. Override them on this
+	// private connection before any transaction or application mutation.
+	if _, err = conn.Exec(ctx, `SET synchronous_commit = on`); err != nil {
+		return failure(ctx)
+	}
 	var sessionUser, currentUser, statement, lock, idle, total string
 	err = conn.QueryRow(ctx, `SELECT session_user,current_user,current_setting('statement_timeout'),current_setting('lock_timeout'),current_setting('idle_in_transaction_session_timeout'),current_setting('transaction_timeout')`).Scan(&sessionUser, &currentUser, &statement, &lock, &idle, &total)
 	if err != nil {
@@ -214,7 +220,16 @@ func (s *Store) runTx(ctx context.Context, fn func(context.Context, pgx.Tx) erro
 	if err = verifyPolicyCatalog(ctx, tx, s.binding, s.roles, s.role); err != nil {
 		return err
 	}
+	if err = durableSettings(ctx, tx); err != nil {
+		return err
+	}
 	if err = fn(ctx, tx); err != nil {
+		return err
+	}
+	// Recheck after application work as well. Deployment administrators must
+	// preserve these settings throughout service; checks cannot fence a hostile
+	// superuser or make broken storage honor its flush acknowledgements.
+	if err = durableSettings(ctx, tx); err != nil {
 		return err
 	}
 	if err = ctx.Err(); err != nil {
@@ -284,14 +299,42 @@ func (s *Store) credentialCheck(ctx context.Context, c authz.IdentityClaims) (au
 	return authz.RevocationActive, nil
 }
 
+// durableSettings verifies effective settings on every operation, including
+// reads and retries, before application work and again before sending COMMIT.
+// on requires a local WAL flush; remote replication is not established here.
+func durableSettings(ctx context.Context, tx pgx.Tx) error {
+	var fsync, fullPage, synchronous string
+	if err := tx.QueryRow(ctx, `SELECT current_setting('fsync'),current_setting('full_page_writes'),current_setting('synchronous_commit')`).Scan(&fsync, &fullPage, &synchronous); err != nil {
+		return failure(ctx)
+	}
+	if fsync != "on" || fullPage != "on" || synchronous != "on" {
+		return metadata.ErrFailedPrecondition
+	}
+	return nil
+}
+
 // safeTime is a conservative final-admission check. It does not prove the
 // physical WAL commit instant precedes expiry or establish a freshness lease.
 func (s *Store) safeTime(ctx context.Context, c authz.SessionClaims) bool {
-	now, err := s.now()
-	if err != nil || now.IsZero() || now.Unix() <= 0 || now.Unix() > 253402300799 || ctx.Err() != nil {
+	return s.timeWithin(ctx, c, transactionBudget)
+}
+
+// The entire possible actual-time interval [now-error,now+error] must lie in
+// the signed half-open interval. Admission also reserves the transaction budget
+// at expiry. Bounds precede time arithmetic, including for failed clocks.
+// Session verification separately enforces containment in the identity interval.
+func (s *Store) timeWithin(ctx context.Context, c authz.SessionClaims, remaining time.Duration) bool {
+	const maxUnix = int64(253402300799)
+	if s == nil || s.now == nil || ctx == nil || ctx.Err() != nil || s.clockError < 0 || s.clockError > time.Second ||
+		remaining < 0 || remaining > transactionBudget || c.NotBeforeUnix <= 0 || c.ExpiresAtUnix <= c.NotBeforeUnix || c.ExpiresAtUnix > maxUnix {
 		return false
 	}
-	return !now.Before(time.Unix(c.NotBeforeUnix, 0)) && now.Before(time.Unix(c.ExpiresAtUnix, 0).Add(-s.clockError-transactionBudget))
+	now, err := s.now()
+	if err != nil || now.IsZero() || now.Unix() <= 0 || now.Unix() > maxUnix || ctx.Err() != nil {
+		return false
+	}
+	return !now.Add(-s.clockError).Before(time.Unix(c.NotBeforeUnix, 0)) &&
+		now.Add(s.clockError).Before(time.Unix(c.ExpiresAtUnix, 0).Add(-remaining))
 }
 
 // verifyInTx is private composition for authenticated reads and the separately

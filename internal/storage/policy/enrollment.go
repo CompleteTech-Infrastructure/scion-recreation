@@ -262,9 +262,7 @@ func recordResult(ctx context.Context, tx pgx.Tx, actor authz.VerifiedSession, t
 // transaction's remaining budget. Failure cannot undo a sent commit: callers
 // receive an unknown outcome and zero receipt, never an assertion of rollback.
 func committedTime(ctx context.Context, s *Store, c authz.SessionClaims) bool {
-	now, err := s.now()
-	return err == nil && !now.IsZero() && now.Unix() > 0 && now.Unix() <= 253402300799 && ctx.Err() == nil &&
-		!now.Before(time.Unix(c.NotBeforeUnix, 0)) && now.Before(time.Unix(c.ExpiresAtUnix, 0).Add(-s.clockError))
+	return s.timeWithin(ctx, c, 0)
 }
 
 // Bootstrap is a trusted offline action under the separately provisioned DB
