@@ -892,8 +892,14 @@ func (r *admissionInput) Read(b []byte) (int, error) {
 	if r.remaining == 0 {
 		var extra [1]byte
 		n, err := r.src.Read(extra[:])
+		if err != nil && err != io.EOF {
+			r.failure = err
+		}
 		if n != 0 {
-			return 0, ErrAdmissionLimit
+			// Preserve both the limit violation and any original probe error.
+			// Make rejection sticky so retries cannot read another sentinel.
+			r.failure = errors.Join(ErrAdmissionLimit, r.failure)
+			return 0, r.failure
 		}
 		if err == nil {
 			return 0, io.ErrNoProgress
