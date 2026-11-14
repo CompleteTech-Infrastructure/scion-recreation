@@ -689,6 +689,9 @@ func (p *AdmissionPermit) CopyObject(ctx context.Context, dst io.Writer, src io.
 		if in.failure != nil && !errors.Is(err, in.failure) {
 			err = errors.Join(err, in.failure)
 		}
+		if canceled := ctx.Err(); canceled != nil && !errors.Is(err, canceled) {
+			err = errors.Join(err, canceled)
+		}
 	}()
 	var decoded io.Reader = in
 	if spec.Compression == AdmissionGZIP {
@@ -813,6 +816,9 @@ func admissionCopy(ctx context.Context, dst io.Writer, decoded io.Reader, frame 
 		if readFailure != nil && !errors.Is(err, readFailure) {
 			err = errors.Join(err, readFailure)
 		}
+		if canceled := ctx.Err(); canceled != nil && !errors.Is(err, canceled) {
+			err = errors.Join(err, canceled)
+		}
 	}()
 	for {
 		if err = ctx.Err(); err != nil {
@@ -892,8 +898,14 @@ func (r *admissionInput) Read(b []byte) (int, error) {
 	if r.remaining == 0 {
 		var extra [1]byte
 		n, err := r.src.Read(extra[:])
+		if err != nil && err != io.EOF {
+			r.failure = err
+		}
 		if n != 0 {
-			return 0, ErrAdmissionLimit
+			// Preserve both the limit violation and any original probe error.
+			// Make rejection sticky so retries cannot read another sentinel.
+			r.failure = errors.Join(ErrAdmissionLimit, r.failure)
+			return 0, r.failure
 		}
 		if err == nil {
 			return 0, io.ErrNoProgress
