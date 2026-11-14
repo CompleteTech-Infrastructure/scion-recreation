@@ -128,10 +128,10 @@ func (d *decodeReader) read(b []byte) error {
 		}
 		n, err := d.src.Read(b)
 		if n < 0 || n > len(b) {
-			return errors.New("invalid reader count")
+			return decodeReadFailure(errors.New("invalid reader count"), err, d.ctx.Err())
 		}
 		if cancel := d.ctx.Err(); cancel != nil {
-			return cancel
+			return decodeReadFailure(nil, err, cancel)
 		}
 		d.digest.Write(b[:n])
 		d.remaining -= uint64(n)
@@ -157,6 +157,25 @@ func (d *decodeReader) read(b []byte) error {
 	return d.ctx.Err()
 }
 
+// A read can fail for several independent reasons. EOF is normal framing
+// information, but every other source error remains discoverable even when
+// cancellation or invalid counts prevent consuming the returned bytes. Preserve
+// a lone error exactly, including sentinel identity used by existing callers.
+func decodeReadFailure(rejection, source, cancellation error) error {
+	if source == io.EOF {
+		source = nil
+	}
+	switch {
+	case rejection == nil && source == nil:
+		return cancellation
+	case rejection == nil && cancellation == nil:
+		return source
+	case source == nil && cancellation == nil:
+		return rejection
+	}
+	return errors.Join(rejection, source, cancellation)
+}
+
 func (d *decodeReader) finish(expected TypedID) error {
 	if d.remaining != 0 {
 		return errors.New("trailing canonical payload bytes")
@@ -168,12 +187,13 @@ func (d *decodeReader) finish(expected TypedID) error {
 		}
 		n, err := d.src.Read(extra[:])
 		if n != 0 {
-			return errors.New("trailing canonical frame bytes or invalid reader count")
+			return decodeReadFailure(errors.New("trailing canonical frame bytes or invalid reader count"), err, d.ctx.Err())
+		}
+		if failure := decodeReadFailure(nil, err, d.ctx.Err()); failure != nil {
+			return failure
 		}
 		if err == io.EOF {
 			d.eof = true
-		} else if err != nil {
-			return err
 		} else if idle == 99 {
 			return io.ErrNoProgress
 		}
