@@ -159,10 +159,19 @@ func (d *decodeReader) read(b []byte) error {
 
 // A read can fail for several independent reasons. EOF is normal framing
 // information, but every other source error remains discoverable even when
-// cancellation or invalid counts prevent consuming the returned bytes.
+// cancellation or invalid counts prevent consuming the returned bytes. Preserve
+// a lone error exactly, including sentinel identity used by existing callers.
 func decodeReadFailure(rejection, source, cancellation error) error {
 	if source == io.EOF {
 		source = nil
+	}
+	switch {
+	case rejection == nil && source == nil:
+		return cancellation
+	case rejection == nil && cancellation == nil:
+		return source
+	case source == nil && cancellation == nil:
+		return rejection
 	}
 	return errors.Join(rejection, source, cancellation)
 }

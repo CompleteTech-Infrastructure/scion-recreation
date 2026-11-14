@@ -145,6 +145,9 @@ func TestDecodeReadCauses(t *testing.T) {
 					if errors.Is(err, context.Canceled) != cancelled {
 						t.Fatalf("cancellation cause: %v", err)
 					}
+					if !cancelled && (stage == "header" || stage == "payload" || stage == "final") && err != syscall.EIO {
+						t.Fatalf("lone source error identity changed: %T %v", err, err)
+					}
 					if (stage == "negativeCount" || stage == "oversizeCount") && !strings.Contains(err.Error(), "invalid reader count") {
 						t.Fatalf("count rejection lost: %v", err)
 					}
@@ -190,6 +193,9 @@ func TestDecodeReadEOFAndCancellation(t *testing.T) {
 						}
 						if cancelled && !errors.Is(err, context.Canceled) {
 							t.Fatalf("cancel lost: %v", err)
+						}
+						if cancelled && (cause == nil || cause == io.EOF) && err != context.Canceled {
+							t.Fatalf("lone cancellation identity changed: %T %v", err, err)
 						}
 						if errors.Is(cause, syscall.EIO) && !errors.Is(err, syscall.EIO) {
 							t.Fatalf("wrapped source lost: %v", err)
@@ -350,5 +356,53 @@ func TestDecodeReadWorkBounds(t *testing.T) {
 	n, err := model.DecodeBlob(ctx, r, largeID, &staged, uint64(len(large)))
 	if n != 0 || !errors.Is(err, syscall.EIO) || !errors.Is(err, context.Canceled) || !bytes.Equal(staged.Bytes(), large[:32768]) {
 		t.Fatalf("later canceled chunk: n=%d staged=%d err=%v", n, staged.Len(), err)
+	}
+}
+
+func TestDecodeChangesetCancellationIdentity(t *testing.T) {
+	value, err := model.NewChangeset(model.ChangesetInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := model.HashChangeset(context.Background(), value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var frame bytes.Buffer
+	if err = model.EncodeChangeset(context.Background(), &frame, value); err != nil {
+		t.Fatal(err)
+	}
+	for _, at := range []int{0, 22, frame.Len()} {
+		for _, cause := range []error{nil, io.EOF} {
+			ctx, cancel := context.WithCancel(context.Background())
+			r := &causeReader{data: frame.Bytes(), at: at, count: -2, err: cause, cancel: cancel}
+			got, err := model.DecodeChangeset(ctx, r, id, model.MaxChangesetPayload)
+			cancel()
+			if err != context.Canceled || !reflect.DeepEqual(got, model.Changeset{}) {
+				t.Fatalf("at=%d cause=%v: got=%+v err=%T %v", at, cause, got, err, err)
+			}
+		}
+	}
+}
+
+func TestDecodeReadLoneRejectionUnwrapped(t *testing.T) {
+	id, frame, payload := causeBlob(t)
+	for _, at := range []int{0, len(frame)} {
+		data := append(append([]byte(nil), frame...), 0x7f)
+		count := -1
+		if at != 0 {
+			count = 1
+		}
+		r := &causeReader{data: data, at: at, count: count}
+		n, err := model.DecodeBlob(context.Background(), r, id, io.Discard, uint64(len(payload)))
+		if n != 0 || err == nil {
+			t.Fatalf("rejection escaped: %d %v", n, err)
+		}
+		if _, wrapped := err.(interface{ Unwrap() []error }); wrapped {
+			t.Fatalf("lone rejection wrapped: %T %v", err, err)
+		}
+		if errors.Unwrap(err) != nil {
+			t.Fatalf("lone rejection wrapped: %v", err)
+		}
 	}
 }
