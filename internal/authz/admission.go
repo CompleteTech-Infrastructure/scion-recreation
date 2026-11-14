@@ -683,6 +683,16 @@ func (p *AdmissionPermit) CopyObject(ctx context.Context, dst io.Writer, src io.
 		}
 	}
 	in := &admissionInput{ctx: ctx, src: src, remaining: spec.InputBytes}
+	defer func() {
+		// A decoder may consume the bytes accompanying a source failure and
+		// report cancellation or another error instead. Preserve both causes.
+		if in.failure != nil && !errors.Is(err, in.failure) {
+			err = errors.Join(err, in.failure)
+		}
+		if canceled := ctx.Err(); canceled != nil && !errors.Is(err, canceled) {
+			err = errors.Join(err, canceled)
+		}
+	}()
 	var decoded io.Reader = in
 	if spec.Compression == AdmissionGZIP {
 		g, e := gzip.NewReader(in)
@@ -799,6 +809,17 @@ func (p *AdmissionPermit) admissionFinish() {
 }
 func admissionCopy(ctx context.Context, dst io.Writer, decoded io.Reader, frame uint64) (written uint64, err error) {
 	var buffer [32768]byte
+	var readFailure error
+	defer func() {
+		// Preserve a failed read even when its data cannot be forwarded due to
+		// cancellation, or the subsequent write also fails.
+		if readFailure != nil && !errors.Is(err, readFailure) {
+			err = errors.Join(err, readFailure)
+		}
+		if canceled := ctx.Err(); canceled != nil && !errors.Is(err, canceled) {
+			err = errors.Join(err, canceled)
+		}
+	}()
 	for {
 		if err = ctx.Err(); err != nil {
 			return written, err
@@ -809,6 +830,9 @@ func admissionCopy(ctx context.Context, dst io.Writer, decoded io.Reader, frame 
 			size = remaining + 1
 		}
 		n, e := decoded.Read(buffer[:int(size)])
+		if e != nil && e != io.EOF {
+			readFailure = e
+		}
 		if n < 0 || n > int(size) {
 			return written, ErrAdmissionInvalid
 		}
@@ -862,11 +886,11 @@ type admissionInput struct {
 }
 
 func (r *admissionInput) Read(b []byte) (int, error) {
-	if err := r.ctx.Err(); err != nil {
-		return 0, err
-	}
 	if r.failure != nil {
 		return 0, r.failure
+	}
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
 	}
 	if len(b) == 0 {
 		return 0, nil
@@ -874,8 +898,14 @@ func (r *admissionInput) Read(b []byte) (int, error) {
 	if r.remaining == 0 {
 		var extra [1]byte
 		n, err := r.src.Read(extra[:])
+		if err != nil && err != io.EOF {
+			r.failure = err
+		}
 		if n != 0 {
-			return 0, ErrAdmissionLimit
+			// Preserve both the limit violation and any original probe error.
+			// Make rejection sticky so retries cannot read another sentinel.
+			r.failure = errors.Join(ErrAdmissionLimit, r.failure)
+			return 0, r.failure
 		}
 		if err == nil {
 			return 0, io.ErrNoProgress
