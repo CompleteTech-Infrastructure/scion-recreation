@@ -8,10 +8,12 @@ import (
  "context"
  "encoding/binary"
  "errors"
+ "fmt"
  "io"
  "os"
  "os/exec"
  "path/filepath"
+ "reflect"
  "sync"
  "syscall"
  "testing"
@@ -403,5 +405,209 @@ func TestStoreShortPayloadAndEnvelopeWrites(t *testing.T) {
    if _,err:=os.Stat(filepath.Join(root,blobName(id)));!errors.Is(err,os.ErrNotExist) { t.Fatal("short write activated an object",err) }
    noTemps(t,root)
   })
+ }
+}
+
+// Real files plus injected EIO/cancellation; this does not simulate power loss.
+// Seed: REVIEW-BLOB-REUSE-UNKNOWN-v1.
+func TestStoreUncertainActivationRetry(t *testing.T) {
+ for _,reuse:=range []bool{false,true} {
+  for _,point:=range []string{"afterLink","finalSync","remove","directorySync","stagingSync","cancelAfterLink"} {
+   t.Run(fmt.Sprintf("reused=%t/%s",reuse,point),func(t *testing.T){
+    root:=privateDir(t)
+    payload:=[]byte("REVIEW-BLOB-REUSE-UNKNOWN-v1")
+    id,frame:=fixture(t,payload)
+    final:=filepath.Join(root,blobName(id))
+    var before os.FileInfo
+    if reuse {
+     first:=ready(t,root,options(),diskOps{before:func(p string)error{
+      if p=="afterLink"{return syscall.EIO};return nil
+     }})
+     result,err:=first.Put(context.Background(),id,uint64(len(payload)),bytes.NewReader(frame))
+     requireError(t,err,ErrOutcomeUnknown);requireError(t,err,syscall.EIO)
+     if result!=(PutResult{}){t.Fatal("uncertain first activation reported success")}
+     if err=first.Close();err!=nil{t.Fatal(err)}
+     before,err=os.Stat(final);if err!=nil{t.Fatal(err)}
+    }
+    ctx,cancel:=context.WithCancel(context.Background());defer cancel()
+    reached:=false
+    s:=ready(t,root,options(),diskOps{before:func(p string)error{
+     if point=="cancelAfterLink" && p=="afterLink"{reached=true;cancel();return nil}
+     if p==point{reached=true;return syscall.EIO};return nil
+    }})
+    result,err:=s.Put(ctx,id,uint64(len(payload)),bytes.NewReader(frame))
+    if !reached{t.Fatal("fault boundary not reached")}
+    if result!=(PutResult{}){t.Fatal("unconfirmed operation reported success")}
+    requireError(t,err,ErrOutcomeUnknown)
+    if point=="cancelAfterLink"{requireError(t,err,context.Canceled)}else{
+     requireError(t,err,ErrUnavailable);requireError(t,err,syscall.EIO)
+    }
+    noTemps(t,root)
+    if err=s.Close();err!=nil{t.Fatal(err)}
+    after,err:=os.Stat(final);if err!=nil{t.Fatal(err)}
+    if reuse && !os.SameFile(before,after){t.Fatal("retry replaced original object")}
+    reopened:=ready(t,root,options(),diskOps{})
+    reader,err:=reopened.OpenCanonical(context.Background(),id);if err!=nil{t.Fatal(err)}
+    got,readErr:=io.ReadAll(reader);closeErr:=reader.Close()
+    if readErr!=nil || closeErr!=nil || !bytes.Equal(got,frame){
+     t.Fatalf("invalid activated content: read=%v close=%v",readErr,closeErr)
+    }
+    // Only a retry completing every barrier may acknowledge reuse.
+    if !put(t,reopened,id,frame,uint64(len(payload))).Reused{t.Fatal("retry did not reuse")}
+    noTemps(t,root)
+   })
+  }
+ }
+}
+
+func TestStoreUncertainReuseRejectsCorruption(t *testing.T) {
+ root:=privateDir(t);payload:=[]byte("REVIEW-BLOB-REUSE-UNKNOWN-v1")
+ id,frame:=fixture(t,payload)
+ first:=ready(t,root,options(),diskOps{before:func(p string)error{
+  if p=="afterLink"{return syscall.EIO};return nil
+ }})
+ result,err:=first.Put(context.Background(),id,uint64(len(payload)),bytes.NewReader(frame))
+ requireError(t,err,ErrOutcomeUnknown)
+ if result!=(PutResult{}){t.Fatal("uncertain first activation reported success")}
+ if err=first.Close();err!=nil{t.Fatal(err)}
+ path:=filepath.Join(root,blobName(id));data,err:=os.ReadFile(path);if err!=nil{t.Fatal(err)}
+ data[len(data)-1]^=1
+ if err=os.Chmod(path,0600);err!=nil{t.Fatal(err)}
+ if err=os.WriteFile(path,data,0600);err!=nil{t.Fatal(err)}
+ if err=os.Chmod(path,0400);err!=nil{t.Fatal(err)}
+ s:=ready(t,root,options(),diskOps{})
+ result,err=s.Put(context.Background(),id,uint64(len(payload)),bytes.NewReader(frame))
+ requireError(t,err,ErrCorruptData);requireError(t,err,ErrOutcomeUnknown)
+ if result!=(PutResult{}){t.Fatal("corrupt existing object acknowledged")}
+ current,err:=os.ReadFile(path);if err!=nil{t.Fatal(err)}
+ if !bytes.Equal(current,data){t.Fatal("corrupt existing object replaced")}
+ noTemps(t,root)
+}
+
+// Failure fixture seed: OBJ02-TEE-CAUSE-v1. All writes use real staged files;
+// diskOps interrupts one partial compressed write and then permits retry.
+type teeCauseReader struct {
+ r *bytes.Reader
+ calls, at, invalid int
+ cause error
+ after func()
+}
+func (r *teeCauseReader) Read(p []byte) (int,error) {
+ r.calls++;n,err:=r.r.Read(p)
+ if r.calls==r.at {
+  if r.after!=nil {r.after()}
+  if r.invalid!=0 {n=r.invalid;if n>0 {n+=len(p)}}
+  return n,r.cause
+ }
+ return n,err
+}
+type teeSliceError []int
+func (teeSliceError) Error() string {return "noncomparable source"}
+type teeInterfaceError struct { value any }
+func (teeInterfaceError) Error() string {return "interface source"}
+
+func TestStagingTeeCauseIdentity(t *testing.T) {
+ a,b:=errors.New("same message"),errors.New("same message")
+ for _,cause:=range []error{a,context.Canceled,teeSliceError{1},teeInterfaceError{[]int{1}}} {
+  if got:=streamCauses(nil,cause,nil);reflect.ValueOf(cause).Comparable() && got!=cause {t.Fatal("singleton identity changed")}
+  // This must also be safe when the same struct type holds different dynamic
+  // interface values, only one of which is comparable.
+  _=streamCauses(cause,teeInterfaceError{1},nil)
+ }
+ if got:=streamCauses(context.Canceled,nil,context.Canceled);got!=context.Canceled {t.Fatal("alias lost identity")}
+ got:=streamCauses(a,b,nil)
+ if !errors.Is(got,a)||!errors.Is(got,b) {t.Fatal("distinct same-message causes merged")}
+ for _,cause:=range []error{a,context.Canceled} {
+  r:=&stagingTee{ctx:context.Background(),src:&teeCauseReader{r:bytes.NewReader([]byte("abc")),at:1,cause:cause},dst:io.Discard}
+  n,err:=r.Read(make([]byte,3));if n!=3 || err!=cause {t.Fatalf("singleton %d %v",n,err)}
+ }
+}
+
+func TestStoreTeeReadFailures(t *testing.T) {
+ for _,mode:=range []string{"source", "noncomparable", "enospc", "shortwrite", "diskCancel", "readCancel", "cancelAlias", "invalidNegative", "invalidOversized", "eofDisk"} {
+  t.Run(mode,func(t *testing.T){
+   root:=privateDir(t);ctx,cancel:=context.WithCancel(context.Background());defer cancel()
+   source:=error(errors.New("independent source failure"))
+   if mode=="noncomparable" {source=teeSliceError{1}}
+   if mode=="cancelAlias" {source=context.Canceled}
+   if mode=="eofDisk" {source=io.EOF}
+   reached:=false
+   diskMode:=mode=="enospc" || mode=="diskCancel" || mode=="shortwrite" || mode=="eofDisk"
+   partial:=partialDiskWrite("partialPayload",&reached,func()error{
+    if mode=="diskCancel" {cancel()}
+    if mode=="shortwrite" {return nil}
+    return syscall.ENOSPC
+   })
+   s:=ready(t,root,options(),diskOps{write:func(f *os.File,p []byte,offset int64)(int,error){
+    if diskMode {return partial(f,p,offset)}
+    if offset>=0 {return f.WriteAt(p,offset)}
+    return f.Write(p)
+   }})
+   payload:=bytes.Repeat([]byte("OBJ02-TEE-CAUSE-v1"),10000);id,frame:=fixture(t,payload)
+   r:=&teeCauseReader{r:bytes.NewReader(frame),at:2,cause:source}
+   if mode=="readCancel" || mode=="cancelAlias" || mode=="invalidOversized" {
+    r.after=cancel
+   }
+   if mode=="invalidNegative" {r.invalid=-1}
+   if mode=="invalidOversized" {r.invalid=1}
+   result,err:=s.Put(ctx,id,uint64(len(payload)),r)
+   if err==nil || result!=(PutResult{}) {t.Fatalf("false success: %+v %v",result,err)}
+   if mode=="noncomparable" {var got teeSliceError;if !errors.As(err,&got){t.Fatalf("source lost: %v",err)}} else if source!=io.EOF {requireError(t,err,source)}
+   if errors.Is(err,io.EOF) {t.Fatal("normal EOF retained as failure cause")}
+   if diskMode {
+    if !reached {t.Fatal("compressed disk boundary not reached")}
+    if mode=="shortwrite" {requireError(t,err,io.ErrShortWrite)} else {requireError(t,err,syscall.ENOSPC);requireError(t,err,ErrResourceExhausted)}
+   }
+   if mode=="readCancel" || mode=="cancelAlias" || mode=="invalidOversized" || mode=="diskCancel" {requireError(t,err,context.Canceled)}
+   noTemps(t,root)
+   if s.active!=0 {t.Fatal("operation slot leaked")}
+   if _,err:=os.Stat(filepath.Join(root,blobName(id)));!errors.Is(err,os.ErrNotExist){t.Fatalf("failed object visible: %v",err)}
+   if err:=s.Close();err!=nil {t.Fatal(err)}
+   retry:=ready(t,root,options(),diskOps{})
+   result=put(t,retry,id,frame,uint64(len(payload)));if result.Reused {t.Fatal("failed attempt activated object")}
+   raw,err:=retry.OpenCanonical(context.Background(),id);if err!=nil {t.Fatal(err)}
+   got,err:=io.ReadAll(raw);closeErr:=raw.Close()
+   if err!=nil || closeErr!=nil || !bytes.Equal(got,frame) {t.Fatalf("retry bytes: %v %v",err,closeErr)}
+  })
+ }
+}
+
+func TestStagingTeeDoesNotForwardCanceledOrInvalidRead(t *testing.T) {
+ for _,invalid:=range []int{0,-1,1} {
+  ctx,cancel:=context.WithCancel(context.Background())
+  var forwarded bytes.Buffer
+  r:=&stagingTee{ctx:ctx,src:&teeCauseReader{r:bytes.NewReader([]byte("private")),at:1,invalid:invalid,cause:errors.New("source"),after:cancel},dst:&forwarded}
+  n,err:=r.Read(make([]byte,7))
+  if n!=0 || forwarded.Len()!=0 || !errors.Is(err,context.Canceled) {t.Fatalf("forwarded rejected read: n=%d bytes=%d err=%v",n,forwarded.Len(),err)}
+ }
+}
+
+func TestStagingTeeInvalidCountsWithoutCancellation(t *testing.T) {
+ for _,invalid:=range []int{-1,1} {
+  source:=errors.New("invalid reader source")
+  var forwarded bytes.Buffer
+  r:=&stagingTee{ctx:context.Background(),src:&teeCauseReader{r:bytes.NewReader([]byte("private")),at:1,invalid:invalid,cause:source},dst:&forwarded}
+  n,err:=r.Read(make([]byte,7))
+  if n!=0 || forwarded.Len()!=0 {t.Fatal("forwarded invalid read")}
+  requireError(t,err,source);requireError(t,err,ErrInvalidArgument)
+ }
+ ctx,cancel:=context.WithCancel(context.Background())
+ r:=&stagingTee{ctx:ctx,src:&teeCauseReader{r:bytes.NewReader([]byte("private")),at:1,cause:context.Canceled,after:cancel},dst:io.Discard}
+ if n,err:=r.Read(make([]byte,7));n!=0 || err!=context.Canceled {t.Fatalf("canceled alias identity: n=%d err=%v",n,err)}
+}
+
+func TestStoreTeeLegalDataEOFBytes(t *testing.T) {
+ for _,payload:=range [][]byte{nil,[]byte("OBJ02-TEE-EOF-v1")} {
+  root:=privateDir(t);s:=ready(t,root,options(),diskOps{});id,frame:=fixture(t,payload)
+  at:=2;if len(payload)==0 {at=1}
+  r:=&teeCauseReader{r:bytes.NewReader(frame),at:at,cause:io.EOF}
+  result,err:=s.Put(context.Background(),id,uint64(len(payload)),r)
+  if err!=nil || result.ID!=id || result.PayloadBytes!=uint64(len(payload)) {t.Fatalf("data EOF: %+v %v",result,err)}
+  var compressed bytes.Buffer;z,_:=gzip.NewWriterLevel(&compressed,gzip.HuffmanOnly)
+  z.Write(frame[:22]);if len(frame)>22 {z.Write(frame[22:])};if err:=z.Close();err!=nil {t.Fatal(err)}
+  actual,err:=os.ReadFile(filepath.Join(root,blobName(id)));if err!=nil {t.Fatal(err)}
+  expected:=append(envelope(1,uint64(len(payload)),uint64(compressed.Len())),compressed.Bytes()...)
+  if !bytes.Equal(actual,expected) {t.Fatal("successful envelope/compressed bytes changed")}
+  noTemps(t,root)
  }
 }

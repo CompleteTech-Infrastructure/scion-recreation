@@ -18,6 +18,7 @@ import (
  "io"
  "math"
  "os"
+ "reflect"
  "strings"
  "sync"
  "syscall"
@@ -258,6 +259,44 @@ func (s *Filesystem) OpenCanonical(ctx context.Context,id model.BlobID) (io.Read
  r.release=s.release;ok=true
  return r,nil
 }
+// streamCauses retains singleton identity and only deduplicates exact aliases.
+// Comparable checks avoid panicking on user-defined error values with slices.
+func streamCauses(source, storage, cancellation error) error {
+ var kept [3]error
+ count:=0
+ for _,cause:=range [3]error{source,storage,cancellation} {
+  if cause==nil || cause==io.EOF {continue}
+  duplicate:=false
+  if reflect.ValueOf(cause).Comparable() {
+   for _,previous:=range kept[:count] {if reflect.ValueOf(previous).Comparable() && cause==previous {duplicate=true;break}}
+  }
+  if !duplicate {kept[count]=cause;count++}
+ }
+ if count==0{return nil}
+ if count==1{return kept[0]}
+ return errors.Join(kept[:count]...)
+}
+
+// stagingTee composes untrusted reader results with private compression writes.
+// It uses only the decoder's bounded buffer and never forwards a read whose
+// cancellation has already been observed. Reader callbacks must provide their
+// own deadlines; this does not recover arbitrary callback panics.
+type stagingTee struct { ctx context.Context; src io.Reader; dst io.Writer }
+func (r *stagingTee) Read(p []byte) (int,error) {
+ if err:=r.ctx.Err();err!=nil{return 0,err}
+ n,source:=r.src.Read(p)
+ cancel:=r.ctx.Err()
+ if n<0 || n>len(p) {return 0,streamCauses(ErrInvalidArgument,source,cancel)}
+ if cancel!=nil {return 0,streamCauses(source,nil,cancel)}
+ var storage error
+ if n>0 {
+  written,err:=r.dst.Write(p[:n]);storage=err
+  if written<0 || written>n {storage=streamCauses(ErrInvalidArgument,storage,nil)} else if written!=n && storage==nil {storage=io.ErrShortWrite}
+ }
+ if err:=streamCauses(source,storage,r.ctx.Err());err!=nil{return n,err}
+ return n,source // Preserve legal data+EOF framing.
+}
+
 type cappedWriter struct { s *Filesystem; f *os.File; n uint64 }
 func (w *cappedWriter) Write(p []byte) (int,error) {
  if uint64(len(p))>w.s.opts.MaxEncodedBytes-w.n{return 0,ErrResourceExhausted}
@@ -301,7 +340,7 @@ func (s *Filesystem) Put(ctx context.Context,id model.BlobID,declaredPayload uin
  w:=&cappedWriter{s:s,f:f}
  if _,err=w.Write(make([]byte,28));err!=nil{return result,err}
  z,_:=gzip.NewWriterLevel(w,gzip.HuffmanOnly)
- n,e:=model.DecodeBlob(ctx,io.TeeReader(canonicalFrame,z),id,io.Discard,declaredPayload);ze:=z.Close()
+ n,e:=model.DecodeBlob(ctx,&stagingTee{ctx:ctx,src:canonicalFrame,dst:z},id,io.Discard,declaredPayload);ze:=z.Close()
  if e!=nil{return result,errors.Join(ErrInvalidArgument,e,ze)}
  if ze!=nil{return result,ze}
  if n!=declaredPayload{return result,ErrInvalidArgument}
@@ -332,7 +371,9 @@ func (s *Filesystem) Put(ctx context.Context,id model.BlobID,declaredPayload uin
  if err==nil{err=s.root.Link(".staging/"+name,final)}
  reused:=errors.Is(err,os.ErrExist)
  if err!=nil && !reused{return result,diskError(err)}
- activated=!reused
+ // EEXIST proves presence, not that a previous activation completed its syncs.
+ // Both paths remain uncertain until this call completes every durability barrier.
+ activated=true
  if err=s.step("afterLink");err!=nil{return result,diskError(err)}
  if err=ctx.Err();err!=nil{return result,err}
  existing,e:=s.openFinal(final)
