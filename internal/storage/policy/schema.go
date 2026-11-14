@@ -35,7 +35,7 @@ func Provision(ctx context.Context, config ProvisionConfig) (DatabaseBinding, er
 	}
 	cfg.Tracer = nil
 	cfg.ConnectTimeout = time.Second
-	for k, v := range map[string]string{"search_path": "pg_catalog,pg_temp", "statement_timeout": "2000", "lock_timeout": "1000", "transaction_timeout": "5000", "idle_in_transaction_session_timeout": "5000"} {
+	for k, v := range map[string]string{"search_path": "pg_catalog,pg_temp", "statement_timeout": "2000", "lock_timeout": "1000", "transaction_timeout": "5000", "idle_in_transaction_session_timeout": "5000", "synchronous_commit": "on"} {
 		cfg.RuntimeParams[k] = v
 	}
 	conn, err := pgx.ConnectConfig(ctx, cfg)
@@ -56,6 +56,15 @@ func Provision(ctx context.Context, config ProvisionConfig) (DatabaseBinding, er
 		defer stop()
 		_ = tx.Rollback(cleanup)
 	}()
+	// Provision is a separate trusted offline path, but its returned binding
+	// must have the same local durability preconditions as runtime receipts.
+	// SET LOCAL also overrides options=-c and database/role defaults before DDL.
+	if _, err = tx.Exec(ctx, `SET LOCAL synchronous_commit = on`); err != nil {
+		return zero, policyFailure(ctx, metadata.ErrUnavailable)
+	}
+	if err = durableSettings(ctx, tx); err != nil {
+		return zero, err
+	}
 	id, err := metadata.VerifyPostgresDatabase(ctx, tx)
 	if err != nil {
 		return zero, err
@@ -159,6 +168,9 @@ func Provision(ctx context.Context, config ProvisionConfig) (DatabaseBinding, er
 	}
 	binding.CatalogFingerprint, err = policyCatalogHash(ctx, tx, config.Roles)
 	if err != nil {
+		return zero, err
+	}
+	if err = durableSettings(ctx, tx); err != nil {
 		return zero, err
 	}
 	if err = tx.Commit(ctx); err != nil {

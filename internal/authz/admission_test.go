@@ -1670,7 +1670,87 @@ func TestAdmissionCopyFinalDataFailure(t *testing.T) {
 				if (phase == "write_error" || phase == "write_cancel") && !errors.Is(err, writeFailure) {
 					t.Fatalf("lost writer failure: %v", err)
 				}
+				if (phase == "read_cancel" || phase == "write_cancel") && !errors.Is(err, context.Canceled) {
+					t.Fatalf("lost cancellation: %v", err)
+				}
 			})
 		}
+	}
+}
+
+// Regression from the independent overflow-probe finding.
+func TestAdmissionOverflowProbePreservesSourceFailure(t *testing.T) {
+	for _, mode := range []string{"request", "raw", "gzip"} {
+		for _, cancelProbe := range []bool{false, true} {
+			t.Run(mode+map[bool]string{false: "/live", true: "/canceled"}[cancelProbe], func(t *testing.T) {
+				data := []byte("x")
+				if mode != "request" {
+					data = admissionTestFrame(data)
+				}
+				encoded := data
+				if mode == "gzip" {
+					encoded = admissionTestGZIP(t, data)
+				}
+				declared := len(encoded)
+				encoded = append(append([]byte(nil), encoded...), byte('!'))
+				failure := errors.New("independent probe source failure")
+				reader := &admissionDataErrorReader{data: encoded, failAt: declared, err: failure}
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				src := admissionReaderFunc(func(b []byte) (int, error) {
+					n, e := reader.Read(b)
+					if e == failure && cancelProbe {
+						cancel()
+					}
+					return n, e
+				})
+				a := admissionTestNew(t, nil)
+				p := admissionTestAcquire(t, a, admissionTestPrincipal("review", "overflow", Human))
+				var dst bytes.Buffer
+				var n uint64
+				var err error
+				if mode == "request" {
+					n, err = p.CopyRequest(ctx, &dst, src, AdmissionReadRequest, uint64(declared), 1, false)
+				} else {
+					codec := AdmissionRaw
+					if mode == "gzip" {
+						codec = AdmissionGZIP
+					}
+					n, err = p.CopyObject(ctx, &dst, src, AdmissionObject{model.BlobKind, 1, uint64(declared), codec, true})
+				}
+				p.Release()
+				t.Logf("n=%d out=%d source=%d/%d sourceCause=%v limit=%v error=%v", n, dst.Len(), reader.offset, declared+1, errors.Is(err, failure), errors.Is(err, ErrAdmissionLimit), err)
+				if !errors.Is(err, ErrAdmissionLimit) || n != uint64(len(data)) || n != uint64(dst.Len()) || reader.offset != declared+1 || a.Stats() != (AdmissionStats{}) {
+					t.Fatal("invalid overflow budgets or resource lifecycle")
+				}
+				if !errors.Is(err, failure) {
+					t.Error("real nonEOF data-bearing probe failure lost")
+				}
+			})
+		}
+	}
+}
+
+func TestAdmissionOverflowRejectionIsSticky(t *testing.T) {
+	failure := errors.New("overflow source failure")
+	for i, cause := range []error{nil, io.EOF, failure} {
+		t.Run([]string{"no_error", "eof", "source_error"}[i], func(t *testing.T) {
+			reads := 0
+			input := &admissionInput{ctx: context.Background(), src: admissionReaderFunc(func(b []byte) (int, error) {
+				reads++
+				b[0] = '!'
+				return 1, cause
+			})}
+			for range 3 {
+				var b [1]byte
+				n, err := input.Read(b[:])
+				if n != 0 || !errors.Is(err, ErrAdmissionLimit) || errors.Is(err, io.EOF) || (cause == failure && !errors.Is(err, failure)) {
+					t.Fatalf("n=%d err=%v cause=%v", n, err, cause)
+				}
+			}
+			if reads != 1 {
+				t.Fatalf("repeated sentinel reads: %d", reads)
+			}
+		})
 	}
 }
