@@ -689,6 +689,9 @@ func (p *AdmissionPermit) CopyObject(ctx context.Context, dst io.Writer, src io.
 		if in.failure != nil && !errors.Is(err, in.failure) {
 			err = errors.Join(err, in.failure)
 		}
+		if canceled := ctx.Err(); canceled != nil && !errors.Is(err, canceled) {
+			err = errors.Join(err, canceled)
+		}
 	}()
 	var decoded io.Reader = in
 	if spec.Compression == AdmissionGZIP {
@@ -812,6 +815,9 @@ func admissionCopy(ctx context.Context, dst io.Writer, decoded io.Reader, frame 
 		// cancellation, or the subsequent write also fails.
 		if readFailure != nil && !errors.Is(err, readFailure) {
 			err = errors.Join(err, readFailure)
+		}
+		if canceled := ctx.Err(); canceled != nil && !errors.Is(err, canceled) {
+			err = errors.Join(err, canceled)
 		}
 	}()
 	for {
