@@ -1730,8 +1730,8 @@ func TestAdmissionOverflowProbePreservesSourceFailure(t *testing.T) {
 
 func TestAdmissionOverflowRejectionIsSticky(t *testing.T) {
 	failure := errors.New("overflow source failure")
-	for _, cause := range []error{nil, io.EOF, failure} {
-		t.Run(fmt.Sprint(cause), func(t *testing.T) {
+	for i, cause := range []error{nil, io.EOF, failure} {
+		t.Run([]string{"no_error", "eof", "source_error"}[i], func(t *testing.T) {
 			reads := 0
 			input := &admissionInput{ctx: context.Background(), src: admissionReaderFunc(func(b []byte) (int, error) {
 				reads++
