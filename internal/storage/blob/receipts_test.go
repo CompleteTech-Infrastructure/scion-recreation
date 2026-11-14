@@ -6,9 +6,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -340,4 +342,113 @@ func TestIngestRecordBlobFailureCannotMint(t *testing.T) {
 	requireError(t, e, sentinel)
 	_, e = s.Lookup(context.Background(), id)
 	requireError(t, e, ErrNotFound)
+}
+
+func TestIngestRecordStartupNamespace(t *testing.T) {
+	id, _ := fixture(t, []byte("startup-repair-304"))
+	typed, _ := id.TypedID().MarshalBinary()
+	suffix := hex.EncodeToString(typed)
+	cases := map[string]string{"prefixOnly": "", "junk": "junk", "shortDigest": suffix[:len(suffix)-2], "longDigest": suffix + "00", "nonhex": suffix[:len(suffix)-1] + "z", "uppercase": strings.ToUpper(suffix), "version": "0002" + suffix[4:], "changeset": suffix[:4] + "02" + suffix[6:], "unknownKind": suffix[:4] + "03" + suffix[6:], "trailing": suffix + ".tmp"}
+	for _, ns := range []struct{ dir, prefix string }{{".", "blob-v1-"}, {".records-v1", "record-"}} {
+		for name, bad := range cases {
+			t.Run(ns.prefix+name, func(t *testing.T) {
+				root, g, a := receiptFixture(t)
+				s := receiptOpen(t, root, g, receiptOpts(), a, nil)
+				requireError(t, s.Close(), nil)
+				requireError(t, os.WriteFile(filepath.Join(root, ns.dir, ns.prefix+bad), []byte("foreign"), 0400), nil)
+				next, e := OpenIngestStore(context.Background(), root, g, receiptOpts(), a)
+				if next != nil {
+					next.Close()
+					t.Fatal("accepted malformed final")
+				}
+				requireError(t, e, ErrCorruptData)
+			})
+		}
+	}
+	// A valid typed suffix in the wrong filename domain is still unknown.
+	for _, name := range []string{"record-" + suffix, "blob-v2-" + suffix, "blob-v1-" + suffix + "x"} {
+		t.Run(name[:9], func(t *testing.T) {
+			root, g, a := receiptFixture(t)
+			requireError(t, os.WriteFile(filepath.Join(root, name), nil, 0400), nil)
+			next, e := OpenIngestStore(context.Background(), root, g, receiptOpts(), a)
+			if next != nil {
+				next.Close()
+				t.Fatal("accepted foreign domain")
+			}
+			requireError(t, e, ErrCorruptData)
+		})
+	}
+}
+func TestIngestRecordStartupModesAndTemps(t *testing.T) {
+	for _, kind := range []string{"blob", "record", "generation"} {
+		t.Run(kind, func(t *testing.T) {
+			root, g, a := receiptFixture(t)
+			s := receiptOpen(t, root, g, receiptOpts(), a, nil)
+			id, _ := receiptPut(t, s, []byte("startup-final"))
+			requireError(t, s.Close(), nil)
+			name := blobName(id)
+			if kind == "record" {
+				name = filepath.Join(".records-v1", recordName(id))
+			}
+			if kind == "generation" {
+				name = generationName
+			}
+			requireError(t, os.Chmod(filepath.Join(root, name), 0600), nil)
+			next, e := OpenIngestStore(context.Background(), root, g, receiptOpts(), a)
+			if next != nil {
+				next.Close()
+				t.Fatal("accepted writable final")
+			}
+			if e == nil {
+				t.Fatal("missing error")
+			}
+		})
+	}
+	for _, mode := range []os.FileMode{0400, 0600} {
+		t.Run(mode.String(), func(t *testing.T) {
+			root, g, a := receiptFixture(t)
+			s := receiptOpen(t, root, g, receiptOpts(), a, nil)
+			id, r := receiptPut(t, s, []byte("valid-final"))
+			requireError(t, s.Close(), nil)
+			temp := "00112233445566778899aabbccddeeff.tmp"
+			for _, dir := range []string{".staging", ".records-v1"} {
+				requireError(t, os.WriteFile(filepath.Join(root, dir, temp), []byte("orphan"), mode), nil)
+			}
+			// Recovery may delete blob temps, but their pre-recovery charge is not free.
+			o := receiptOpts()
+			o.MaxObjects = 1
+			next, e := OpenIngestStore(context.Background(), root, g, o, a)
+			if next != nil {
+				next.Close()
+				t.Fatal("unaccounted blob temp")
+			}
+			requireError(t, e, ErrResourceExhausted)
+			o = receiptOpts()
+			o.MaxRecords = 1
+			next, e = OpenIngestStore(context.Background(), root, g, o, a)
+			if next != nil {
+				next.Close()
+				t.Fatal("unaccounted record temp")
+			}
+			requireError(t, e, ErrResourceExhausted)
+			s = receiptOpen(t, root, g, receiptOpts(), a, nil)
+			got, e := s.Lookup(context.Background(), id)
+			if e != nil || got != r {
+				t.Fatal("valid reopen", e)
+			}
+			if _, e = os.Lstat(filepath.Join(root, ".staging", temp)); !errors.Is(e, os.ErrNotExist) {
+				t.Fatal("blob temp recovery", e)
+			}
+			info, e := os.Lstat(filepath.Join(root, ".records-v1", temp))
+			if e != nil || info.Mode().Perm() != mode {
+				t.Fatal("record temp preserved", e)
+			}
+			requireError(t, s.Close(), nil)
+			s = receiptOpen(t, root, g, receiptOpts(), a, nil)
+			got, e = s.Lookup(context.Background(), id)
+			if e != nil || got != r {
+				t.Fatal("second reopen", e)
+			}
+		})
+	}
 }

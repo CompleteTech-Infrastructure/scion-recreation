@@ -265,6 +265,23 @@ func openIngestStore(ctx context.Context, path string, pin Generation, o Receipt
 	}
 	return s, nil
 }
+
+// finalBlobName accepts only the exact lowercase kind01 writer namespace.
+func finalBlobName(name, prefix string) bool {
+	if !strings.HasPrefix(name, prefix) {
+		return false
+	}
+	suffix := strings.TrimPrefix(name, prefix)
+	if len(suffix) != 2*model.TypedIDSize {
+		return false
+	}
+	raw, e := hex.DecodeString(suffix)
+	if e != nil || hex.EncodeToString(raw) != suffix {
+		return false
+	}
+	id, e := model.ParseTypedID(raw)
+	return e == nil && id.Kind() == model.BlobKind
+}
 func (s *IngestStore) scan(ctx context.Context, dir string) error {
 	f, e := openAt(s.fs.root, dir, os.O_RDONLY|syscall.O_DIRECTORY, 0)
 	if e != nil {
@@ -288,17 +305,11 @@ func (s *IngestStore) scan(ctx context.Context, dir string) error {
 			if e != nil {
 				return diskError(e)
 			}
-			if !secure(info, 0400, false) && !secure(info, 0600, false) {
-				return ErrCorruptData
-			}
-			if info.Size() < 0 || uint64(info.Size()) > s.opts.MaxStoredBytes-s.bytes {
-				return ErrResourceExhausted
-			}
-			s.bytes += uint64(info.Size())
+			temporary := false
 			switch dir {
 			case ".":
 				if name != generationName {
-					if !strings.HasPrefix(name, "blob-v1-") {
+					if !finalBlobName(name, "blob-v1-") {
 						return ErrCorruptData
 					}
 					s.objects++
@@ -307,13 +318,22 @@ func (s *IngestStore) scan(ctx context.Context, dir string) error {
 				if !tempName(name) {
 					return ErrCorruptData
 				}
+				temporary = true
 				s.objects++
 			case ".records-v1":
-				if !strings.HasPrefix(name, "record-") && !tempName(name) {
+				temporary = tempName(name)
+				if !temporary && !finalBlobName(name, "record-") {
 					return ErrCorruptData
 				}
 				s.count++
 			}
+			if !secure(info, 0400, false) && !(temporary && secure(info, 0600, false)) {
+				return ErrCorruptData
+			}
+			if info.Size() < 0 || uint64(info.Size()) > s.opts.MaxStoredBytes-s.bytes {
+				return ErrResourceExhausted
+			}
+			s.bytes += uint64(info.Size())
 			if s.bytes > s.opts.MaxStoredBytes || s.objects > s.opts.MaxObjects || s.count > s.opts.MaxRecords {
 				return ErrResourceExhausted
 			}
