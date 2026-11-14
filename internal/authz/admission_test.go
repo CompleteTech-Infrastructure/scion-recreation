@@ -1727,3 +1727,27 @@ func TestAdmissionOverflowProbePreservesSourceFailure(t *testing.T) {
 		}
 	}
 }
+
+func TestAdmissionOverflowRejectionIsSticky(t *testing.T) {
+	failure := errors.New("overflow source failure")
+	for _, cause := range []error{nil, io.EOF, failure} {
+		t.Run(fmt.Sprint(cause), func(t *testing.T) {
+			reads := 0
+			input := &admissionInput{ctx: context.Background(), src: admissionReaderFunc(func(b []byte) (int, error) {
+				reads++
+				b[0] = '!'
+				return 1, cause
+			})}
+			for range 3 {
+				var b [1]byte
+				n, err := input.Read(b[:])
+				if n != 0 || !errors.Is(err, ErrAdmissionLimit) || errors.Is(err, io.EOF) || (cause == failure && !errors.Is(err, failure)) {
+					t.Fatalf("n=%d err=%v cause=%v", n, err, cause)
+				}
+			}
+			if reads != 1 {
+				t.Fatalf("repeated sentinel reads: %d", reads)
+			}
+		})
+	}
+}
