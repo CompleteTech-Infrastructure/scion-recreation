@@ -251,9 +251,10 @@ type credentialLookup struct {
 }
 type authenticatedKey struct{}
 type authenticated struct {
-	owner   *Store
-	session authz.VerifiedSession
-	binding DatabaseBinding
+	owner      *Store
+	session    authz.VerifiedSession
+	credential authz.IdentityClaims
+	binding    DatabaseBinding
 }
 
 // snapshot performs bounded structural validation before copying signatures.
@@ -398,5 +399,5 @@ func (s *Store) Authenticate(ctx context.Context, c *authz.IdentityCredential, p
 	if err != nil || !s.verifier.Owns(verified) || !s.safeTime(ctx, verified.Claims()) {
 		return nil, authz.ErrUnauthenticated
 	}
-	return context.WithValue(ctx, authenticatedKey{}, authenticated{s, verified, s.binding}), nil
+	return context.WithValue(ctx, authenticatedKey{}, authenticated{owner: s, session: verified, credential: credential.Claims, binding: s.binding}), nil
 }
